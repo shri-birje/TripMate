@@ -1,0 +1,116 @@
+/**
+ * Checks that TripMate is correctly connected to Supabase.
+ *
+ *   npm run verify:supabase
+ *
+ * SAFETY: this script only ever uses the PUBLISHABLE key (the same key the
+ * app uses). It never prints the key. It refuses to run if it finds a secret
+ * key. It makes no changes to your data.
+ */
+import { readSupabaseConfig } from '../apps/app/src/lib/supabaseConfig';
+
+const TIMEOUT_MS = 10_000;
+let failures = 0;
+let warnings = 0;
+
+const ok = (msg: string) => console.log(`  OK    ${msg}`);
+const warn = (msg: string) => {
+  warnings++;
+  console.log(`  WARN  ${msg}`);
+};
+const fail = (msg: string) => {
+  failures++;
+  console.log(`  FAIL  ${msg}`);
+};
+
+async function call(url: string, key: string, init: RequestInit = {}) {
+  const res = await fetch(url, {
+    ...init,
+    headers: { apikey: key, Authorization: `Bearer ${key}`, ...(init.headers as Record<string, string> | undefined) },
+    signal: AbortSignal.timeout(TIMEOUT_MS),
+  });
+  let body: unknown = null;
+  try {
+    body = await res.json();
+  } catch {
+    /* some responses have no JSON body */
+  }
+  return { status: res.status, body: body as Record<string, any> | null };
+}
+
+async function main() {
+  console.log('\n1. Configuration (apps/app/.env)');
+  const cfg = readSupabaseConfig({
+    EXPO_PUBLIC_SUPABASE_URL: process.env.EXPO_PUBLIC_SUPABASE_URL,
+    EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY: process.env.EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY,
+  });
+  if (!cfg.ok) {
+    fail(cfg.message);
+    return;
+  }
+  ok(`URL looks right: ${new URL(cfg.url).host}`);
+  ok(`Key type: ${cfg.keyKind === 'publishable' ? 'publishable (correct)' : 'legacy anon (works, but prefer the new publishable key)'}`);
+
+  console.log('\n2. Reaching Supabase Auth');
+  try {
+    const health = await call(`${cfg.url}/auth/v1/health`, cfg.key);
+    if (health.status === 200) ok('Auth service is up and accepted the key');
+    else if (health.status === 401 || health.status === 403) fail(`Auth service rejected the key (HTTP ${health.status}). Check you copied the PUBLISHABLE key from the right project.`);
+    else fail(`Auth health returned HTTP ${health.status}`);
+
+    const settings = await call(`${cfg.url}/auth/v1/settings`, cfg.key);
+    if (settings.status === 200 && settings.body) {
+      const s = settings.body;
+      const emailOn = s.external?.email !== false;
+      emailOn ? ok('Email sign-up/sign-in is enabled') : fail('Email provider is disabled (Authentication -> Sign In / Providers -> Email)');
+      s.disable_signup ? fail('New sign-ups are disabled in your project') : ok('New sign-ups are allowed');
+      if (s.mailer_autoconfirm) {
+        warn('Email confirmation is OFF: anyone can sign up with any email without proving they own it. Fine for early testing; turn it on before real users.');
+      } else {
+        ok('Email confirmation is ON (users must click the link in their email)');
+      }
+      ok(`Google sign-in: ${s.external?.google ? 'enabled' : 'not enabled (not needed for M2)'}`);
+    } else {
+      warn(`Could not read auth settings (HTTP ${settings.status})`);
+    }
+  } catch (e) {
+    fail(`Could not reach Supabase: ${e instanceof Error ? e.name : 'error'} (check your internet connection and the project URL)`);
+    return;
+  }
+
+  console.log('\n3. Database: profiles table and its security rules');
+  try {
+    const read = await call(`${cfg.url}/rest/v1/profiles?select=id&limit=1`, cfg.key);
+    const code = (read.body?.code as string | undefined) ?? '';
+    if (read.status === 404 || code === 'PGRST205' || code === '42P01') {
+      warn('The profiles table does not exist yet. Run supabase/migrations/20261118000000_profiles.sql in the Supabase SQL Editor (see docs).');
+      return;
+    }
+    if (read.status === 200 && Array.isArray(read.body) && read.body.length === 0) {
+      ok('profiles exists and a signed-out visitor sees no rows');
+    } else if (read.status === 200) {
+      fail('A signed-out visitor can READ profile rows. Row-level security is not set up correctly!');
+    } else if (read.status === 401 || read.status === 403 || code === '42501') {
+      ok('profiles exists and signed-out visitors are denied access');
+    } else {
+      warn(`Unexpected answer reading profiles (HTTP ${read.status}, code ${code || 'none'})`);
+    }
+
+    const write = await call(`${cfg.url}/rest/v1/profiles`, cfg.key, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Prefer: 'return=minimal' },
+      body: JSON.stringify({ id: '00000000-0000-0000-0000-000000000000', display_name: 'probe' }),
+    });
+    if (write.status >= 200 && write.status < 300) fail('A signed-out visitor could INSERT a profile row. Security rules are wrong!');
+    else ok(`Signed-out visitors cannot create profiles (HTTP ${write.status})`);
+  } catch (e) {
+    fail(`Database check failed: ${e instanceof Error ? e.name : 'error'}`);
+  }
+}
+
+main()
+  .catch((e) => fail(`Unexpected error: ${e instanceof Error ? e.message : 'unknown'}`))
+  .finally(() => {
+    console.log(`\nResult: ${failures === 0 ? 'PASSED' : 'FAILED'} (${failures} failure(s), ${warnings} warning(s))\n`);
+    process.exit(failures === 0 ? 0 : 1);
+  });

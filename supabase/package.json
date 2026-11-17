@@ -1,0 +1,13 @@
+{
+  "name": "@tripmate/db",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "TripMate database migrations and their tests",
+  "scripts": {
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.5.16"
+  }
+}

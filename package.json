@@ -1,0 +1,31 @@
+{
+  "name": "tripmate",
+  "private": true,
+  "version": "0.0.0",
+  "description": "TripMate - group travel and shared expense management",
+  "workspaces": [
+    "apps/*",
+    "packages/*",
+    "supabase"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "api:dev": "npm run dev --workspace @tripmate/api",
+    "app:web": "npm run web --workspace @tripmate/app",
+    "app:start": "npm run start --workspace @tripmate/app",
+    "verify:supabase": "tsx --env-file-if-exists=apps/app/.env scripts/verify-supabase.ts",
+    "ui:check": "tsx scripts/ui-check.ts",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "playwright-core": "^1.65.1",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0",
+    "vite": "^8.3.8",
+    "vitest": "^5.1.0"
+  }
+}

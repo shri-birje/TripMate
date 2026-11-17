@@ -1,0 +1,44 @@
+# dependencies
+node_modules/
+
+# environment files (secrets) - only *.example files are committed
+.env
+.env.*
+!.env.example
+
+# build output
+dist/
+.expo/
+web-build/
+*.tsbuildinfo
+coverage/
+
+# logs and OS files
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
+
+# editor
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+
+# UI check output
+ui-check-screenshots/
+
+# keys, certificates and credentials - never commit these
+*.pem
+*.key
+*.p12
+*.p8
+*.jks
+*.keystore
+*.mobileprovision
+service-account*.json
+google-services.json
+GoogleService-Info.plist
+
+# Supabase CLI local state (if the CLI is ever used)
+supabase/.temp/
+supabase/.branches/

@@ -94,6 +94,24 @@ Open http://localhost:8081 and walk through:
 7. Open the app in a **second browser** and sign in: your theme choice appears there too.
 8. **Sign out.** Typing `http://localhost:8081/profile` now sends you to sign-in.
 
+## Step 9 - Trips (added with Milestone M3.1)
+
+M3.1 adds a second database update. **Run it after Step 4** (it needs the profiles table).
+
+1. In VS Code open `supabase/migrations/20261118100000_trips_and_members.sql`, select all, copy.
+2. Supabase dashboard -> **SQL Editor -> New query**, paste, **Run**. Expect "Success. No rows returned". It is safe to run again.
+3. Check it from the outside:
+
+   ```powershell
+   npm run verify:supabase
+   ```
+
+   Section 4 should now show `OK` for: trips and members exist and signed-out visitors are denied, nobody can insert a trip directly, and `create_trip()` cannot be run by signed-out visitors.
+4. Try it: `npm run app:web`, sign in, **Create a trip** (for example *Goa Trip 2026*, *Goa, India*, start `27/12/2026`, end `30/12/2026`, budget `60000`). It should appear on Home under **Upcoming** with "1 person".
+5. Privacy check: sign in as a **different** account in another browser. It must **not** see the first account's trip.
+
+If you create a trip *before* running this update, the app says "Trips aren't set up on the server yet" instead of failing mysteriously.
+
 ## Troubleshooting
 
 | You see | Meaning and fix |

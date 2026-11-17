@@ -48,8 +48,29 @@ The project folder was empty when this work began. The three briefs (Product Vis
 | ADR-029 | **(M2)** TanStack Query added now; React Hook Form deferred (forms use plain state + the shared Zod rules in `packages/core`) | Two small forms do not justify another dependency yet; revisit at expenses | Applied in M2 |
 | ADR-030 | **(M2)** Database rules are tested by running the real migration in PGlite (Postgres inside Node) with a stand-in for Supabase's `auth` schema; UI flows are tested with Playwright + Edge against simulated Supabase answers. Both are supplements to, not replacements for, a live check against the real project | No Docker available; free-only rule | Applied in M2 |
 | ADR-031 | **(M2)** Deferred from M2: avatar upload, forgot-password, account deletion, Google sign-in, phone deep links | Outside the M2 scope you listed; needed before public launch | Open (see progress doc) |
+| ADR-032 | **(M3, APPROVED 2026-11-18 with the conditions listed below)** Trip and member changes are **database functions that check `auth.uid()`** and are callable by signed-in users (e.g. `create_trip`), not an API using Supabase's secret key. Clients still have SELECT only on the tables. This changes the "write functions callable only by the service credential" part of ADR-004 for trips and members. | Atomic and tested like profiles; **no secret key needed anywhere**. An API becomes necessary at M5 (the money engine's TypeScript must run server-side) and can then forward the user's own login, so a secret key may never be needed. | **Approved and applied** (M3.1). Conditions enforced automatically by `supabase/tests/security-audit.test.ts` |
+| ADR-033 | **(M3.1)** Trip dates are typed as `DD/MM/YYYY` (also `DD-MM-YYYY`, `DD.MM.YYYY`, `YYYY-MM-DD`; day first) and stored as plain calendar dates; no date picker yet | A native date picker needs extra libraries and differs on web; Indian format is what users type | Applied; date picker deferred to the polish milestone |
+| ADR-034 | **(M3.1)** A trip's Upcoming / Ongoing / Completed state is derived from its dates and today, never stored; only `active` / `archived` is stored | A stored phase would go stale overnight | Applied |
+| ADR-035 | **(M3.1)** `create_trip` uses a server-generated id (not a client UUID) and the screen locks the button while saving | Simpler for MVP; client-generated ids matter for money records and offline entry | Applied; revisit with offline mode |
 
 ---
+
+### ADR-032: conditions approved by the project owner (2026-11-18)
+
+Use authenticated Supabase database functions instead of a Supabase secret / service-role key for normal signed-in operations, **provided all of the following hold**. Each is checked automatically by the audit test, so a future migration that breaks one fails the test suite.
+
+| # | Condition | How it is met and enforced |
+|---|---|---|
+| 1 | Identify the signed-in user with `auth.uid()` | Every function a signed-in user can run reads the caller from `auth.uid()` and never from a parameter (`create_trip` has no "creator" argument). **Audit test 6** fails if such a function does not use `auth.uid()`. |
+| 2 | Check authorization and ownership on every operation | Each function checks who is allowed before acting (`create_trip`: caller must be signed in and have a profile; reads: must be an active member). **Rule for every future function:** membership/role/ownership checks are written inside the function and covered by tests for the allowed and the forbidden caller. |
+| 3 | Row-Level Security enforced | RLS is on for every table; direct writes are not granted to anyone. **Audit tests 1, 2, 3, 3b.** |
+| 4 | Restrict function execution to the right roles | Functions are revoked from `PUBLIC` and `anon` and granted only to `authenticated`; internal helpers are callable by nobody from the app. **Audit tests 5 and 7** (7 is an explicit allow-list: adding a function means consciously editing the list, i.e. a security review). |
+| 5 | Safe `search_path` in security-definer functions | Every function pins `set search_path = ''`. **Audit tests 4 and 4b.** |
+| 6 | Never expose a secret / service-role key in the frontend, mobile app, public repository or client-side environment variables | The app refuses to start if it detects a secret key (ADR-025); only the publishable key is used; `.env` files and key/certificate files are git-ignored; every commit is secret-scanned; the built website is checked for secret-type strings; `npm run verify:supabase` checks the setup. The repository is public. |
+| 7 | Use a secret key only for trusted backend operations that genuinely need elevated privileges | **No secret key is used anywhere today.** Introducing one requires a written justification of the specific operation, an ADR, and your approval first. |
+| 8 | No unnecessary elevated privileges | `SECURITY DEFINER` is used only where required: `is_trip_member` (to read membership without the security rules recursing) and `create_trip` (callers deliberately have no insert permission). Reads use plain RLS with no elevated function. |
+
+**Checklist for every new database function** (review before adding it to the allow-list): Who may call it? Where does it get the caller (`auth.uid()`)? What does it verify before changing data? Is `search_path` pinned? Is execute revoked from `PUBLIC` and `anon`? Is there a test for an allowed caller, a signed-in stranger and a signed-out visitor? Is it atomic? Does it need `SECURITY DEFINER` at all?
 
 ## 3. Assumptions
 

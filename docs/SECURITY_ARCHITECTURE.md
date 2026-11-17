@@ -75,6 +75,17 @@ Three layers, so one mistake cannot expose data:
 
 ---
 
+### 3.4 Database functions (ADR-032, approved 2026-11-18)
+
+For ordinary signed-in operations (creating trips, and later changing members, edits and so on) TripMate uses **database functions that run inside Postgres and decide for themselves who is calling**, instead of a server holding a Supabase secret key. This supersedes the "write functions callable only by the service credential" wording in §3 and §3.2 for trips and members. The layers are now:
+
+1. **Row-Level Security** on every table (reads limited to what a person may see).
+2. **No direct write permissions** for signed-in users (and none at all for signed-out visitors).
+3. **Functions** callable only by signed-in users that identify the caller with `auth.uid()`, check membership/role/ownership, pin `search_path`, and make each change atomically.
+4. **An automatic audit** (`supabase/tests/security-audit.test.ts`) that fails if any migration breaks these rules, including an explicit allow-list of functions a signed-in user may run.
+
+The service-role / secret key is **not used anywhere**. It may be introduced only for a specific trusted backend operation that genuinely needs elevated privileges, with a written justification and the owner's approval (see the ADR-032 conditions and checklist in the decisions log). It must never appear in the frontend, mobile app, public repository or any `EXPO_PUBLIC_` variable.
+
 ## 4. Input validation and sanitisation
 
 - Every request body/query is validated by a strict Zod schema (types, lengths, ranges, enums, safe-integer money, UUID format). Unknown fields are rejected.
@@ -101,7 +112,7 @@ Three layers, so one mistake cannot expose data:
 | Secret | Where it lives | Never in |
 |---|---|---|
 | Supabase URL + anon key | Public client config (safe by design; protected by RLS) | — |
-| Supabase **service-role key** | Edge Function secrets (per environment) | Client code, Git, logs |
+| Supabase **service-role / secret key** | **Not used.** If ever needed (ADR-032 condition 7): a trusted backend's own secret store only | Client code, Git, logs, `EXPO_PUBLIC_` variables, chat |
 | Google OAuth client secret | Supabase Auth config | Git |
 | Sentry DSN | Public-ish client config; auth token only in CI | Git |
 | AI / OCR API keys (later) | Edge Function secrets | Client code |

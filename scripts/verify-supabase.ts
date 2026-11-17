@@ -84,6 +84,7 @@ async function main() {
     const code = (read.body?.code as string | undefined) ?? '';
     if (read.status === 404 || code === 'PGRST205' || code === '42P01') {
       warn('The profiles table does not exist yet. Run supabase/migrations/20261118000000_profiles.sql in the Supabase SQL Editor (see docs).');
+      await checkTrips(cfg.url, cfg.key);
       return;
     }
     if (read.status === 200 && Array.isArray(read.body) && read.body.length === 0) {
@@ -103,8 +104,52 @@ async function main() {
     });
     if (write.status >= 200 && write.status < 300) fail('A signed-out visitor could INSERT a profile row. Security rules are wrong!');
     else ok(`Signed-out visitors cannot create profiles (HTTP ${write.status})`);
+    await checkTrips(cfg.url, cfg.key);
   } catch (e) {
     fail(`Database check failed: ${e instanceof Error ? e.name : 'error'}`);
+  }
+}
+
+/** Section 4: the trips tables and create_trip(), checked from the outside as a signed-out visitor. */
+async function checkTrips(url: string, key: string) {
+  console.log('\n4. Database: trips, members and create_trip()');
+  const MIGRATION = 'supabase/migrations/20261118100000_trips_and_members.sql';
+  try {
+    for (const table of ['trips', 'trip_members']) {
+      const read = await call(`${url}/rest/v1/${table}?select=id&limit=1`, key);
+      const code = (read.body?.code as string | undefined) ?? '';
+      if (read.status === 404 || code === 'PGRST205' || code === '42P01') {
+        warn(`The ${table} table does not exist yet. Run ${MIGRATION} in the Supabase SQL Editor.`);
+        return;
+      }
+      if (read.status === 200 && Array.isArray(read.body) && read.body.length === 0) ok(`${table} exists and a signed-out visitor sees no rows`);
+      else if (read.status === 200) fail(`A signed-out visitor can READ ${table} rows. Row-level security is wrong!`);
+      else if (read.status === 401 || read.status === 403 || code === '42501') ok(`${table} exists and signed-out visitors are denied access`);
+      else warn(`Unexpected answer reading ${table} (HTTP ${read.status}, code ${code || 'none'})`);
+    }
+
+    const insert = await call(`${url}/rest/v1/trips`, key, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Prefer: 'return=minimal' },
+      body: JSON.stringify({ name: 'probe', destination: 'probe', start_date: '2030-01-01', end_date: '2030-01-02', created_by: '00000000-0000-0000-0000-000000000000' }),
+    });
+    if (insert.status >= 200 && insert.status < 300) fail('A signed-out visitor could INSERT a trip directly. Security rules are wrong!');
+    else ok(`Nobody can insert a trip directly (HTTP ${insert.status})`);
+
+    // The function must refuse a signed-out caller. It cannot create anything even if it ran (no signed-in user),
+    // so this probe is safe. The best answer is "permission denied" (42501): the function is not even callable.
+    const rpc = await call(`${url}/rest/v1/rpc/create_trip`, key, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ p_name: 'probe', p_destination: 'probe', p_start_date: '2030-01-01', p_end_date: '2030-01-02' }),
+    });
+    const rpcCode = (rpc.body?.code as string | undefined) ?? '';
+    if (rpc.status >= 200 && rpc.status < 300) fail('A signed-out visitor could RUN create_trip. Security rules are wrong!');
+    else if (rpc.status === 404 || rpcCode === 'PGRST202') warn(`create_trip() does not exist yet. Run ${MIGRATION} in the Supabase SQL Editor.`);
+    else if (rpcCode === '42501') ok('create_trip() cannot be run by signed-out visitors (permission denied)');
+    else warn(`create_trip() refused a signed-out visitor, but with an unexpected code (HTTP ${rpc.status}, ${rpcCode || 'none'})`);
+  } catch (e) {
+    fail(`Trips check failed: ${e instanceof Error ? e.name : 'error'}`);
   }
 }
 

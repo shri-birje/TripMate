@@ -17,6 +17,7 @@ interface Props
     | 'onSubmitEditing'
     | 'editable'
     | 'maxLength'
+    | 'multiline'
   > {
   label: string;
   error?: string | undefined;
@@ -57,8 +58,10 @@ export function TextField({ label, error, helper, placeholder, secret = false, t
           autoCorrect={false}
           style={{
             flex: 1,
-            minHeight: 46,
+            minHeight: input.multiline ? 96 : 46,
             paddingHorizontal: spacing.md,
+            paddingVertical: input.multiline ? spacing.sm : 0,
+            textAlignVertical: input.multiline ? 'top' : 'center',
             color: colors.textPrimary,
             fontSize: fontSize.body,
           }}

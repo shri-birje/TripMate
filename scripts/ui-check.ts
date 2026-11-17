@@ -23,6 +23,7 @@ import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { chromium, type BrowserContext, type Page, type Request, type Route } from 'playwright-core';
+import { formatDateRange } from '../packages/core/src/trip';
 
 const PORT = 8099;
 const BASE = `http://localhost:${PORT}`;
@@ -97,6 +98,12 @@ interface FakeBackend {
   /** What the sign-in endpoint should answer. */
   signIn: 'ok' | 'invalid_credentials';
   unexpected: string[];
+  /** The trips this person belongs to (what the trips list returns). */
+  trips: Record<string, any>[];
+  /** How the create_trip function should behave. */
+  createMode: 'ok' | 'slow' | 'dates_error' | 'missing_function';
+  /** Set to make the trips list fail like a dropped connection. */
+  failTripsList: boolean;
 }
 
 const USER = { id: '11111111-2222-3333-4444-555555555555', email: 'asha@example.com', aud: 'authenticated', role: 'authenticated' };
@@ -127,8 +134,43 @@ function newBackend(): FakeBackend {
     failProfileWrites: false,
     signIn: 'ok',
     unexpected: [],
+    trips: [],
+    createMode: 'ok',
+    failTripsList: false,
   };
 }
+
+/** A trip row exactly as the database would return it, with its member list for the trips query. */
+function tripRow(over: Record<string, any>): Record<string, any> {
+  return {
+    id: `trip-${Math.random().toString(36).slice(2, 10)}`,
+    name: 'Trip',
+    destination: 'Somewhere',
+    start_date: '2030-01-01',
+    end_date: '2030-01-03',
+    description: null,
+    budget_minor: null,
+    currency: 'INR',
+    cover_image_path: null,
+    status: 'active',
+    created_by: USER.id,
+    created_at: '2026-11-18T00:00:00Z',
+    updated_at: '2026-11-18T00:00:00Z',
+    version: 1,
+    members: [{ id: 'member-1', status: 'active' }],
+    ...over,
+  };
+}
+
+/** Calendar day relative to today, as YYYY-MM-DD in the browser's (local) calendar. */
+function dayFromToday(offset: number): string {
+  const d = new Date();
+  d.setDate(d.getDate() + offset);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+/** The same day written the way people type it in India: DD/MM/YYYY. */
+const asDmy = (iso: string) => iso.split('-').reverse().join('/');
 
 async function installFakeSupabase(context: BrowserContext, backend: FakeBackend) {
   await context.route(/supabase\.co/, async (route: Route, request: Request) => {
@@ -163,6 +205,31 @@ async function installFakeSupabase(context: BrowserContext, backend: FakeBackend
       if (backend.failProfileWrites) return route.abort('connectionfailed');
       backend.profile = { ...backend.profile, ...body, updated_at: new Date().toISOString() };
       return json(200, backend.profile);
+    }
+    if (url.pathname === '/rest/v1/trips' && method === 'GET') {
+      if (backend.failTripsList) return route.abort('connectionfailed');
+      return json(200, backend.trips);
+    }
+    if (url.pathname === '/rest/v1/rpc/create_trip' && method === 'POST') {
+      if (backend.createMode === 'dates_error') {
+        return json(400, { code: '23514', message: 'new row for relation "trips" violates check constraint "trips_dates_order"' });
+      }
+      if (backend.createMode === 'missing_function') {
+        return json(404, { code: 'PGRST202', message: 'Could not find the function public.create_trip(p_name) in the schema cache' });
+      }
+      if (backend.createMode === 'slow') await new Promise((r) => setTimeout(r, 900));
+      const created = tripRow({
+        name: body.p_name,
+        destination: body.p_destination,
+        start_date: body.p_start_date,
+        end_date: body.p_end_date,
+        description: body.p_description,
+        budget_minor: body.p_budget_minor,
+        currency: body.p_currency,
+      });
+      backend.trips.unshift(created);
+      const { members: _members, ...plain } = created;
+      return json(200, plain);
     }
     backend.unexpected.push(`${method} ${url.pathname}`);
     return route.abort('blockedbyclient');
@@ -441,12 +508,155 @@ async function signedInFlows(browser: Awaited<ReturnType<typeof chromium.launch>
   }
 }
 
+async function tripFlows(browser: Awaited<ReturnType<typeof chromium.launch>>) {
+  console.log('\nE. Trips: your list and creating a trip');
+  const site = await startWebsite({ EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY: DUMMY_PUBLISHABLE_KEY, EXPO_PUBLIC_SUPABASE_URL: SUPABASE_URL });
+  try {
+    const context = await browser.newContext();
+    const backend = newBackend();
+    await installFakeSupabase(context, backend);
+    await sessionInStorage(context);
+    const page = await context.newPage();
+    const rpcCalls = () => backend.requests.filter((r) => r.method === 'POST' && r.path.startsWith('/rest/v1/rpc/create_trip'));
+
+    // ---- empty state
+    await page.goto(BASE);
+    const empty = await byId(page, 'empty-title').waitFor({ timeout: 20000 }).then(() => true, () => false);
+    check('a person with no trips sees "Your next adventure starts here."', empty);
+    check('...with a "Create a trip" button', await byId(page, 'create-trip').isVisible());
+    const listReq = backend.requests.find((r) => r.method === 'GET' && r.path.startsWith('/rest/v1/trips'));
+    check('the trip list is requested together with each trip\'s members', !!listReq && decodeURIComponent(listReq.path).includes('trip_members'), listReq?.path);
+    await shot(page, 'home-empty');
+
+    // ---- form validation
+    await byId(page, 'create-trip').click();
+    await byId(page, 'trip-name').waitFor({ timeout: 8000 });
+    check('"Create a trip" opens the form', pathOf(page) === '/trips/new', pathOf(page));
+    await byId(page, 'create-trip-submit').click();
+    const nameErr = await vis(page, 'Enter a trip name').waitFor({ timeout: 5000 }).then(() => true, () => false);
+    check('an empty form lists every missing field', nameErr && (await vis(page, 'Enter a destination').isVisible()) && (await vis(page, 'Enter the start date like 27/12/2026').isVisible()) && (await vis(page, 'Enter the end date like 27/12/2026').isVisible()));
+    check('...and sends nothing to the server', rpcCalls().length === 0);
+
+    await byId(page, 'trip-name').fill('Goa Trip 2026');
+    await byId(page, 'trip-destination').fill('Goa, India');
+    await byId(page, 'trip-start').fill(asDmy(dayFromToday(10)));
+    await byId(page, 'trip-end').fill(asDmy(dayFromToday(5)));
+    await byId(page, 'trip-budget').fill('lots');
+    await byId(page, 'create-trip-submit').click();
+    const orderErr = await vis(page, 'The end date must be on or after the start date').waitFor({ timeout: 5000 }).then(() => true, () => false);
+    check('an end date before the start date is rejected', orderErr);
+    check('a nonsense budget is rejected', await vis(page, 'Enter a budget like 60000').isVisible());
+    await byId(page, 'trip-start').fill('30/02/2026');
+    await byId(page, 'create-trip-submit').click();
+    check('an impossible date (30 February) is rejected', await vis(page, 'Enter the start date like 27/12/2026').waitFor({ timeout: 5000 }).then(() => true, () => false));
+    check('nothing was sent while the form was invalid', rpcCalls().length === 0);
+    check('the person\'s typing is kept after errors', (await byId(page, 'trip-name').inputValue()) === 'Goa Trip 2026');
+
+    // ---- currency defaults to the profile's
+    check('currency starts as INR (from the profile)', (await byId(page, 'trip-currency-INR').getAttribute('aria-checked')) === 'true');
+
+    // ---- successful create; also seed other trips so grouping is exercised
+    backend.trips = [
+      tripRow({ id: 'trip-ongoing', name: 'Ongoing Manali', destination: 'Manali', start_date: dayFromToday(-1), end_date: dayFromToday(2), members: [{ id: 'a', status: 'active' }, { id: 'b', status: 'active' }, { id: 'c', status: 'removed' }] }),
+      tripRow({ id: 'trip-old', name: 'Old Jaipur', destination: 'Jaipur', start_date: dayFromToday(-60), end_date: dayFromToday(-57) }),
+      tripRow({ id: 'trip-archived', name: 'Archived Secret', destination: 'Nowhere', start_date: dayFromToday(-1), end_date: dayFromToday(2), status: 'archived' }),
+    ];
+    const startIso = dayFromToday(30);
+    const endIso = dayFromToday(33);
+    await byId(page, 'trip-start').fill(asDmy(startIso));
+    await byId(page, 'trip-end').fill(asDmy(endIso));
+    await byId(page, 'trip-budget').fill('60,000');
+    await byId(page, 'create-trip-submit').click();
+    const home = await byId(page, 'greeting').waitFor({ timeout: 10000 }).then(() => true, () => false);
+    check('a valid trip is created and the person returns to Home', home && pathOf(page) === '/', pathOf(page));
+    const call = rpcCalls().at(-1);
+    check('exactly one create request was sent', rpcCalls().length === 1, String(rpcCalls().length));
+    check('it carries cleaned values: ISO dates, budget in paise, no description', !!call && call.body.p_name === 'Goa Trip 2026' && call.body.p_destination === 'Goa, India' && call.body.p_start_date === startIso && call.body.p_end_date === endIso && call.body.p_budget_minor === 6_000_000 && call.body.p_description === null && call.body.p_currency === 'INR', JSON.stringify(call?.body));
+    check('...and nothing that could set the creator, id or status', !!call && JSON.stringify(Object.keys(call.body).sort()) === JSON.stringify(['p_budget_minor', 'p_currency', 'p_description', 'p_destination', 'p_end_date', 'p_name', 'p_start_date']), JSON.stringify(Object.keys(call?.body ?? {})));
+    check('the request carries the user\'s login, not a secret key', !!call?.auth?.startsWith('Bearer ') && !call.auth.includes('sb_secret'));
+
+    await byId(page, 'section-upcoming').waitFor({ timeout: 8000 });
+    const text = async (id: string) => (await byId(page, id).innerText().catch(() => ''));
+    check('the new trip appears under Upcoming', (await text('section-upcoming')).includes('Goa Trip 2026'));
+    check('a trip happening today is under Ongoing', (await text('section-ongoing')).includes('Ongoing Manali'));
+    check('a finished trip is under Completed', (await text('section-completed')).includes('Old Jaipur'));
+    check('an archived trip is not shown', !(await page.locator('body').innerText()).includes('Archived Secret'));
+    const goa = await text(`trip-card-${backend.trips[0]!.id}`);
+    check('the card shows place, dates and budget', goa.includes('Goa, India') && goa.includes(formatDateRange(startIso, endIso)) && goa.includes('Budget ₹60,000'), goa.replace(/\n/g, ' | '));
+    check('the card counts only people still on the trip', (await text('trip-card-trip-ongoing')).includes('2 people'));
+    check('a single member reads "1 person"', goa.includes('1 person'));
+    await shot(page, 'home-trips-light');
+
+    // ---- double tap while saving
+    backend.createMode = 'slow';
+    const before = rpcCalls().length;
+    await byId(page, 'create-trip').click();
+    await byId(page, 'trip-name').waitFor();
+    await byId(page, 'trip-name').fill('Double Tap Trip');
+    await byId(page, 'trip-destination').fill('Gokarna');
+    await byId(page, 'trip-start').fill(asDmy(dayFromToday(40)));
+    await byId(page, 'trip-end').fill(asDmy(dayFromToday(42)));
+    await byId(page, 'create-trip-submit').click();
+    await byId(page, 'create-trip-submit').click({ timeout: 800, force: true }).catch(() => {});
+    await byId(page, 'greeting').waitFor({ timeout: 10000 });
+    check('tapping Create twice sends only one request', rpcCalls().length === before + 1, `${rpcCalls().length - before} sent`);
+    backend.createMode = 'ok';
+
+    // ---- server rejects (rule the form could not catch)
+    backend.createMode = 'dates_error';
+    await byId(page, 'create-trip').click();
+    await byId(page, 'trip-name').waitFor();
+    await byId(page, 'trip-name').fill('Rejected Trip');
+    await byId(page, 'trip-destination').fill('Somewhere');
+    await byId(page, 'trip-start').fill(asDmy(dayFromToday(50)));
+    await byId(page, 'trip-end').fill(asDmy(dayFromToday(52)));
+    await byId(page, 'create-trip-submit').click();
+    const serverMsg = await vis(page, 'The end date must be on or after the start date').waitFor({ timeout: 8000 }).then(() => true, () => false);
+    check('a rule the server enforces is shown next to the right field in plain words', serverMsg && !(await page.locator('body').innerText()).includes('violates check constraint'));
+    check('the form stays open with the typing kept', pathOf(page) === '/trips/new' && (await byId(page, 'trip-name').inputValue()) === 'Rejected Trip');
+
+    // ---- database update not applied yet
+    backend.createMode = 'missing_function';
+    await byId(page, 'create-trip-submit').click();
+    const setup = await byId(page, 'form-error').waitFor({ timeout: 8000 }).then(() => true, () => false);
+    check('if the database update is missing, the person is told clearly', setup && /database update/.test(await byId(page, 'form-error').innerText()));
+    backend.createMode = 'ok';
+
+    // ---- currency follows the profile
+    backend.profile = { ...backend.profile, preferred_currency: 'USD' };
+    await page.goto(`${BASE}/trips/new`);
+    await byId(page, 'trip-name').waitFor({ timeout: 15000 });
+    check('a USD profile starts the form on USD', await waitFor(async () => (await byId(page, 'trip-currency-USD').getAttribute('aria-checked')) === 'true'));
+    backend.profile = { ...backend.profile, preferred_currency: 'INR' };
+
+    // ---- the list fails to load, then recovers
+    backend.failTripsList = true;
+    const failCtx = await browser.newContext();
+    await installFakeSupabase(failCtx, backend);
+    await sessionInStorage(failCtx);
+    const failPage = await failCtx.newPage();
+    await failPage.goto(BASE);
+    const errShown = await byId(failPage, 'trips-error').waitFor({ timeout: 20000 }).then(() => true, () => false);
+    check('if trips cannot be loaded the person sees a clear message and a retry button', errShown && (await byId(failPage, 'trips-retry').isVisible()));
+    backend.failTripsList = false;
+    await byId(failPage, 'trips-retry').click();
+    check('"Try again" recovers and shows the trips', await byId(failPage, 'section-upcoming').waitFor({ timeout: 10000 }).then(() => true, () => false));
+    await failCtx.close();
+
+    check('no unexpected network calls in the trips run', backend.unexpected.length === 0, backend.unexpected.join(', '));
+    await context.close();
+  } finally {
+    site.stop();
+  }
+}
+
 async function main() {
   const browser = await chromium.launch({ channel: 'msedge', headless: true });
   try {
     await setupScreens(browser);
     await accountFlows(browser);
     await signedInFlows(browser);
+    await tripFlows(browser);
   } finally {
     await browser.close();
   }

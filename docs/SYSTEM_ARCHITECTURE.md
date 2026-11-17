@@ -62,6 +62,8 @@ Why not let clients write straight to tables under RLS? RLS alone cannot compute
 
 ---
 
+> **Update (ADR-032, approved 2026-11-18):** for accounts, profiles, trips and members the "write" path is a database function called through Supabase (RPC) that checks `auth.uid()`, not an API using a service credential. The API described here remains the plan for expenses and money (M5 onward), where the money engine must run on a server, and it should forward the signed-in user's own login. No secret key is used anywhere today.
+
 ## 4. Request lifecycle (generic write)
 
 ```

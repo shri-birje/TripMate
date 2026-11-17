@@ -12,8 +12,8 @@ Rule: a feature is **Complete** only when it works **and has been tested**. "Cod
 |---|---|
 | **M0 — Project foundation** | ✅ **Complete (approved 2026-11-17)** |
 | **M1 — Core money engine (`packages/core`)** | ✅ **Complete (approved 2026-11-17)** |
-| **M2 — Accounts, profiles, theme** | 🟡 **Built and tested with simulated Supabase answers — awaiting (a) your live check against your real Supabase project and (b) your approval.** See the M2 section. |
-| M3 — Trips + members | Not started |
+| **M2 — Accounts, profiles, theme** | ✅ **Complete** (live check passed and approved 2026-11-18; committed and pushed as `f90d1a6`) |
+| **M3 — Trips and members** | 🔵 **In progress, 5 small features** (see M3 plan): **M3.1 Create a trip ✅ complete (approved 2026-11-18)**; **M3.2 View trip details: plan presented, awaiting your approval of the plan (no code written)**; M3.3-M3.5 not started |
 | M4 — Invites + guest claim | Not started |
 | M5 — Expenses + split types | Not started |
 | M6 — Balances + settlement plan | Not started |
@@ -153,7 +153,7 @@ Wiring into the API and database happens in M5 (expenses) and M6 (balances/settl
 
 ## M2 — Accounts, profiles and themes
 
-**Status: built and tested with simulated Supabase answers. Not yet checked against your real Supabase project** (that needs your publishable key and the SQL step in [SUPABASE_SETUP.md](SUPABASE_SETUP.md)). It is not complete until you have done that live check.
+**Status: complete.** Built and tested; you completed the live check against your real Supabase project and approved it on 2026-11-18. Committed and pushed to GitHub as `f90d1a6` (104 files; a secret scan of the commit found no keys or `.env` files).
 
 ### What was built
 - **Safe Supabase configuration.** The app reads only the PUBLISHABLE key from `apps/app/.env` (git-ignored). A secret/service-role key is detected and refused (the app shows a setup screen and never prints the key). `npm run verify:supabase` checks the connection without printing anything secret.
@@ -226,6 +226,155 @@ npm run app:web           # the real app at http://localhost:8081
 Avatar upload, forgot-password, account deletion, Google sign-in, phone deep links, then a live check on a real phone.
 
 ### Next recommended milestone
-Once you have (1) done the live check in SUPABASE_SETUP.md and (2) approved M2: **M3 - Trips and members** (create/edit trips, member list, roles, with database security rules tested the same way as profiles). I have not started it.
+Superseded: M2 is approved, M0-M2 are committed and pushed (`f90d1a6`), and M3 has begun. See the M3 sections below.
 
-**Also ready when you want it:** committing M0-M2 to your GitHub repository (it is empty and the remote is already connected locally; nothing has been pushed).
+
+---
+
+## M3 — Trips and members (plan)
+
+M3 is delivered as five small features, one at a time, each ending with your approval.
+
+| # | Feature | Status |
+|---|---|---|
+| **M3.1** | **Create a trip** (+ your trips on Home) | ✅ Complete (live-verified and approved 2026-11-18) |
+| M3.2 | View trip details (dates, budget, members list) | 📝 Plan below; awaiting your approval of the plan |
+| M3.3 | Edit and archive a trip (admin only, conflict-safe) | Not started |
+| M3.4 | Members and roles: add guest members, remove, make/remove admin, leave, last-admin protection | Not started |
+| M3.5 | Invitation links: create, revoke, preview, join | Not started |
+
+**Design decision for M3 (recorded as ADR-032):** trip and member changes are **database functions that check who is calling** (`auth.uid()`), not an API using Supabase's secret key. Each is atomic and tested with the same real-Postgres method as profiles. This means **no secret key is needed anywhere**. The original plan (API + secret key, ADR-004) only becomes necessary at expenses (M5) where the money engine must run on a server, and even then the server can forward the user's own login. **ADR-032 was approved by you on 2026-11-18, with eight security conditions** (listed in the decisions log). They are enforced by an automatic audit test (`supabase/tests/security-audit.test.ts`) that runs against every migration.
+
+Dependencies: M3.2 needs M3.1; M3.3 and M3.4 need M3.2 (they live on the trip screen); M3.5 needs M3.4 (joining creates a member).
+
+---
+
+## M3.1 — Create a trip
+
+**Status: complete.** Approved 2026-11-18.
+- **Implementation:** built and tested (database rules on a real Postgres engine; screens in a real browser against simulated Supabase answers).
+- **Live migration:** you applied `20261118100000_trips_and_members.sql` to your real Supabase project.
+- **Live verification:** `npm run verify:supabase` passes in all four sections. I re-ran it myself on 2026-11-18 after you applied the migration: 0 failures, 0 warnings. It confirms from the outside that the trips and members tables exist and signed-out visitors are denied, nobody can insert a trip directly, and `create_trip()` cannot be run by signed-out visitors.
+- **Trip creation in the live app:** tested by you and reported working. (I have not seen your live data, only the checks above.)
+- **Not yet committed to git:** M3.1 and the close-out work are in your working folder; the last commit is still `f90d1a6` (M0-M2).
+- **Close-out addition:** `supabase/tests/security-audit.test.ts` (12 tests) turns the ADR-032 conditions into automatic checks. Five deliberate violations (lost `search_path`, function open to signed-out users, RLS switched off, a new function that skips `auth.uid()`, a direct INSERT grant) were each caught and then removed. Database tests are now 82; the whole repo has 416.
+
+### What was built
+- **Database** (`supabase/migrations/20261118100000_trips_and_members.sql`):
+  - `trips` and `trip_members` tables as in the approved schema.
+  - Row-level security: you can see a trip and its members only while you are an **active member** of it. Removed or departed members lose access.
+  - **No one can insert, edit or delete trips or members directly** (not even a trip's own admin). Everything goes through functions.
+  - `create_trip()`: creates the trip **and** makes the caller its administrator in one step (both or neither). The creator comes from the login, never from a parameter. Signed-out callers cannot run it.
+  - `is_trip_member()` helper used by the security rules.
+- **Shared rules** (`packages/core/src/trip.ts`): the form validation, date reading (`27/12/2026`, `27-12-2026`, `2026-12-27`; day first; impossible dates rejected), budget conversion to paise using the approved M1 `parseRupees`, trip phase (Upcoming / Ongoing / Completed, derived from dates), date-range formatting, Home grouping.
+- **App:** Home now lists your trips grouped Ongoing / Upcoming / Completed, with an empty state ("Your next adventure starts here.") and a **New trip** button; a **Create trip** screen (name, destination, start and end dates, optional description and budget, currency defaulting to your profile's). Error messages are friendly, including a clear message if the database update has not been applied yet.
+
+### What was tested (all run; results observed)
+| Check | Result |
+|---|---|
+| Type-check, all packages | Clean |
+| Whole repo | **404 tests pass**: API 17, app 107, core 210, database 70 |
+| Database (real Postgres engine) | 47 new tests: creating a trip makes the admin; atomicity (a forced failure halfway leaves nothing behind); every invalid input is rejected and leaves nothing behind; members see only their trips; strangers, removed and departed members see nothing; signed-out visitors denied; **nobody can write directly**; one membership per person; guests allowed; cascade delete. **6 deliberate breaks of the SQL were each caught**, then restored byte-for-byte. |
+| Real-browser run (Edge, `npm run ui:check`) | **86 checks pass** (54 earlier + 32 new): empty state; every validation message; nothing sent while invalid; successful create with the exact request checked (ISO dates, budget in paise, no creator/id/status); grouping and ordering of Ongoing/Upcoming/Completed; archived trips hidden; member counts; double-tap sends one request; server rule shown next to the right field; "database update missing" message; currency from profile; load failure then Try again |
+| Live project check (`npm run verify:supabase`) | Before the migration: sections 1-3 PASS and section 4 correctly reported "not applied yet". **After you applied it: all four sections PASS (0 failures, 0 warnings).** |
+
+**Limit of the browser run:** Supabase's answers are simulated. It proves the app sends the right requests and shows the right screens given correct answers. The database tests prove the SQL is right. Only your live check proves your project has the update applied.
+
+### Bugs found by testing and fixed
+1. When the name or budget was also wrong, the "end before start" error was not shown (the form library skips whole-form checks if a field failed). Now every problem shows at once; the check was hardened so malformed input cannot crash it.
+2. A test I wrote first expected a database error message that PostgREST words differently; the service maps by constraint name instead.
+
+### Files created or changed
+- `supabase/migrations/20261118100000_trips_and_members.sql`; `supabase/tests/harness.ts` (shared test set-up), `supabase/tests/trips.test.ts`
+- `packages/core/src/trip.ts`, `trip.test.ts`; `index.ts` (+1 export line). **M1 money engine files untouched.**
+- `apps/app/src/features/trips/`: `tripService.ts` (+ test), `tripApi.ts`, `TripCard.tsx` (the card is covered by the browser run, not a unit test)
+- `apps/app/src/lib/`: `format.ts`, `today.ts` (+ test)
+- `apps/app/src/app/(app)/index.tsx` (Home rewritten), `(app)/trips/new.tsx` (new)
+- `apps/app/src/components/TextField.tsx`: added optional multi-line support only. **M2 authentication code untouched.**
+- `scripts/ui-check.ts` (trip scenarios), `scripts/verify-supabase.ts` (section 4)
+- Docs: this file, `SUPABASE_SETUP.md` (step 9), decisions log, schema/API notes
+
+### Key decisions
+- Writes via database functions (ADR-032); date text input in Indian format instead of a date picker for now (ADR-033); trip phase derived from dates (ADR-034); server-generated trip id with a button lock against double-taps (ADR-035).
+
+### How to test it yourself
+1. Do **Step 9** in [SUPABASE_SETUP.md](SUPABASE_SETUP.md) (run the second SQL file), then `npm run verify:supabase` (expect `PASSED` with section 4 all `OK`).
+2. `npm run app:web`, sign in, tap **Create a trip**, enter e.g. *Goa Trip 2026 / Goa, India / 27/12/2026 / 30/12/2026 / 60000*, press **Create trip**. The trip appears on Home under Upcoming with "1 person" and "Budget ₹60,000".
+3. Create a second account in another browser: it must **not** see your trip.
+4. Try an end date before the start date, and 30/02/2026: both show clear messages.
+5. Automated: `npm test` and `npm run ui:check`.
+
+### Known limitations (deliberate, for later M3 features)
+- Trip cards are not tappable yet (details screen is M3.2).
+- No editing, archiving, members, roles or invitations yet (M3.3 to M3.5).
+- Dates are typed as DD/MM/YYYY (no date picker yet; polish milestone).
+- No cover photos, no budget progress bar (needs expenses).
+- Not tested on a phone or emulator; web only.
+- `create_trip` is not idempotent across network retries (the screen prevents double-taps; revisit with offline entry).
+- Trip creation fails with a clear message for an account that somehow lacks a profile.
+
+### Remaining work for M3
+M3.2 to M3.5 as listed above.
+
+### Next recommended step
+M3.1 is closed. Next is **M3.2 - View trip details**; its plan is in the next section and nothing has been built.
+
+
+---
+
+## M3.2 — View trip details (PLAN ONLY: awaiting your approval; nothing has been built)
+
+### Goal
+Tap a trip card on Home to open that trip's details page showing: name, destination, dates, description (if any), budget and currency (if any), who created it, and the people currently on the trip.
+
+### What I inspected (facts, not assumptions)
+- The `trips` row already holds everything except the people; `trip_members` already holds each person's name (a snapshot, so no other table is needed), role, status and join date. Members can read both tables through the existing security rules.
+- **No database change is needed.** The existing rules already limit both tables to active members of the trip. No new function, table, permission or migration, and no secret key.
+- For a trip you cannot see, the database returns **zero rows with no error** (confirmed in the installed library's code). It cannot, and should not, say whether the trip exists.
+- Home's trip card is currently not interactive; the router has `(app)/trips/new.tsx` and will gain `(app)/trips/[tripId].tsx` (the fixed `new` route takes priority over the variable one).
+
+### Decisions I need from you
+1. **Not found vs access denied: one combined state (recommended).** Telling "this trip doesn't exist" apart from "it exists but isn't yours" would let anyone test which trip IDs exist, which is an information leak. So an unknown trip, a trip you're not on, a trip you were removed from, and a malformed link all show the same message: *"We couldn't open this trip. It may have been removed, or you may not be a member."* with a button back to Home. Genuine connection problems are a separate state with **Try again**. This slightly differs from your request for separate states because separating them would weaken security. If you disagree, tell me.
+2. **People list shows only current members** (active). People who left or were removed appear in M3.4 (member management).
+3. **Archived trips** can still be opened by members, with an "Archived" notice (the archive action itself is M3.3).
+
+### What will change
+| Area | Change |
+|---|---|
+| Database | **None.** (No migration, no function, no new permission.) Only new tests. |
+| Shared rules (`packages/core`, **new file only**) | `tripDetails.ts`: trip + member types and mapping; people sorted (admins first, then by join date); creator's name found from the member list; "is this a valid trip link" check. **M1 money engine untouched.** |
+| App data layer (**new files**) | `tripDetailsService.ts`, `tripDetailsApi.ts`. One query asking for the trip and its members, with an explicit list of columns (no `*`, so future columns can never leak accidentally); the id filter is checked client-side first. `tripService.ts` and `tripApi.ts` from M3.1 are **not touched**. |
+| Screens | **New:** `(app)/trips/[tripId].tsx`. **Small edits to two M3.1 files, nothing else:** `TripCard.tsx` becomes tappable (optional `onPress`), `(app)/index.tsx` passes the handler. |
+| Not touched | M1 engine, M2 authentication, profile, theme, storage, migrations. |
+
+### The screen
+- Header: "← Home", trip name, destination, a phase badge (Upcoming / Ongoing / Completed), "Archived" notice if archived.
+- **When:** date range and length ("4 days").
+- **About:** description (or "No description"), budget with currency (or "No budget set").
+- **People (N):** each person's name, an **Admin** tag, and "You" next to yourself; "Created by <name>".
+- States: loading, details, **not available** (combined state above), **connection problem with Try again**, and a clear message if the database update were missing.
+- Works as a direct web address (`/trips/<id>`) and after a reload. Opening it signed out sends you to sign-in (returning you to that exact trip afterwards is **not** built; it lands on Home).
+- Light and Dark themes, accessible roles and labels, same components as the rest of the app.
+
+### Security (how each requirement is met)
+- Access is decided by the database's security rules, not by the screen; the screen only reflects the answer.
+- No other person's private trip data can be returned: a stranger's query yields nothing, and the message does not reveal existence.
+- Only names and roles of fellow members are shown. No emails, no UPI IDs (not even requested).
+- No secret key; no new privileges; the ADR-032 audit test still must pass unchanged (it would catch accidental new functions or grants).
+
+### Tests I will write
+- **Shared rules:** member sorting, creator lookup, "you" detection, removed members excluded, odd inputs, valid/invalid trip ids.
+- **Data layer (fake client):** exact query shape; zero rows becomes "not available"; malformed id never sent; network, setup and unexpected errors mapped; raw database text never shown.
+- **Database (real Postgres engine):** the exact read the screen performs, as a member, as a stranger, as a removed member, as a member who left, signed out; one trip's members never appear when reading another trip; the embedded members query respects the same rules.
+- **Real browser (about 25 checks):** tapping a card opens the details; every field shown, with and without description and budget; Admin and You tags; removed members hidden; Back works; direct address and reload work; stranger and malformed address show the combined message and **no trip data**; connection failure then Try again; loading state visible; archived notice; signed-out visit goes to sign-in; request carries the user's login (never a secret key) and asks only for the listed columns; no unexpected network calls; Light and Dark screenshots. The fake server will answer in the same array form as the real one.
+- **Security checks:** full audit test, secret scan of the build and of what would be committed, `verify:supabase`.
+
+### Not in M3.2
+Editing or archiving (M3.3), adding, removing or re-roling members (M3.4), invitations (M3.5), budget progress, expenses, cover photos, pull-to-refresh, returning to a deep link after sign-in.
+
+### Known limitations to expect
+- Web only; not tested on a phone or emulator.
+- Real-browser tests use simulated Supabase answers; the live check for M3.2 is yours (open a trip from Home; open that trip's address as a second account and confirm you get the combined message).
+
+### Risks
+Low. No database change; additive code; the main risk is the "embedded members" query interacting with the security rules, which the database tests cover directly.

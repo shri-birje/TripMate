@@ -1,6 +1,6 @@
 # TripMate — Database Schema
 
-Status: **Proposed (v0.1) — pending approval.** No SQL has been written or run. This document describes the design; migrations are created later, one milestone at a time.
+Status: **Design v0.1, being implemented one milestone at a time.** Implemented so far: `profiles` (migration `20261118000000`) and `trips` + `trip_members` (migration `20261118100000`). Everything else is still design. Where the migrations differ from this document, the migrations and the decisions log win. One difference so far: trips and members are written by `create_trip()`-style database functions that check `auth.uid()` (ADR-032) rather than by an API using the service credential.
 
 Database: PostgreSQL (managed by Supabase). See [TECH_STACK_DECISIONS.md](TECH_STACK_DECISIONS.md) and [ARCHITECTURE_DECISIONS_LOG.md](ARCHITECTURE_DECISIONS_LOG.md).
 

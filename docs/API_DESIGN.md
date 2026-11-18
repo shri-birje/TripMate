@@ -4,7 +4,7 @@ Status: **Proposed (v0.1) — pending approval.** No endpoints are implemented.
 
 See [SYSTEM_ARCHITECTURE.md §3](SYSTEM_ARCHITECTURE.md) for why the API is split into direct reads and API writes.
 
-> **Update (M3.1):** no REST API exists yet for accounts, profiles or trips. Those are served directly by Supabase (Auth, row-level-secured reads, and database functions such as `create_trip` called through PostgREST), see ADR-032. `POST /trips` below therefore corresponds to the `create_trip` function for now. The REST API described here is still the plan for expenses and money (M5 onward), where the money engine must run on a server.
+> **Update (M3.1):** no REST API exists yet for accounts, profiles or trips. Those are served directly by Supabase (Auth, row-level-secured reads, and database functions such as `create_trip` called through PostgREST), see ADR-032. `POST /trips` below therefore corresponds to the `create_trip` function for now; `PATCH /trips/:tripId` is the `update_trip` function (`expectedVersion` is its `p_expected_version`; a stale one is `version_conflict`, the 409 of this document) and `POST /trips/:tripId/archive` is `set_trip_archived` (archive and restore, safe to repeat). The REST API described here is still the plan for expenses and money (M5 onward), where the money engine must run on a server.
 
 ---
 

@@ -1,7 +1,7 @@
 import { useRouter } from 'expo-router';
-import { useMemo } from 'react';
-import { View } from 'react-native';
-import { groupTripsByPhase } from '@tripmate/core';
+import { useMemo, useState } from 'react';
+import { Pressable, View } from 'react-native';
+import { archivedTrips, groupTripsByPhase } from '@tripmate/core';
 import { AppText } from '../../components/AppText';
 import { Banner } from '../../components/Banner';
 import { Button } from '../../components/Button';
@@ -25,6 +25,10 @@ export default function HomeScreen() {
 
   const groups = useMemo(() => (trips ? groupTripsByPhase(trips, todayIso()) : null), [trips]);
   const visibleCount = groups ? groups.ongoing.length + groups.upcoming.length + groups.completed.length : 0;
+  // Archived trips are kept apart from the three active groups. The count is the archived trips the database
+  // actually returned for THIS person (it never includes trips they cannot access).
+  const archived = useMemo(() => (trips ? archivedTrips(trips) : []), [trips]);
+  const [showArchived, setShowArchived] = useState(false);
   const newTrip = () => router.push('/trips/new');
   const openTrip = (tripId: string) => router.push(`/trips/${tripId}`);
 
@@ -76,6 +80,24 @@ export default function HomeScreen() {
           <Section title="Upcoming" trips={groups.upcoming} onOpen={openTrip} />
           <Section title="Completed" trips={groups.completed} onOpen={openTrip} />
         </>
+      )}
+
+      {archived.length > 0 && (
+        <View style={{ gap: spacing.sm }} testID="section-archived">
+          <Pressable
+            testID="archived-toggle"
+            onPress={() => setShowArchived((v) => !v)}
+            role="button"
+            aria-expanded={showArchived}
+            aria-label={`Archived trips, ${archived.length}. ${showArchived ? 'Hide' : 'Show'}`}
+            style={{ minHeight: 44, justifyContent: 'center' }}
+          >
+            <AppText variant="small" tone="secondary" style={{ fontWeight: '600' }}>
+              {`${showArchived ? '▾' : '▸'} Archived (${archived.length})`}
+            </AppText>
+          </Pressable>
+          {showArchived && archived.map((t) => <TripCard key={t.id} trip={t} onPress={() => openTrip(t.id)} />)}
+        </View>
       )}
 
       <Button testID="open-profile" variant="secondary" label="Profile and settings" onPress={() => router.push('/profile')} />

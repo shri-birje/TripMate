@@ -112,6 +112,24 @@ M3.1 adds a second database update. **Run it after Step 4** (it needs the profil
 
 If you create a trip *before* running this update, the app says "Trips aren't set up on the server yet" instead of failing mysteriously.
 
+## Step 10 - Edit and archive trips (added with Milestone M3.3)
+
+M3.3 adds a third database update. **Run it after Steps 4 and 9** (it needs the trips tables).
+
+1. In VS Code open `supabase/migrations/20261118200000_trip_edit_archive.sql`, select all, copy.
+2. Supabase dashboard -> **SQL Editor -> New query**, paste, **Run**. Expect "Success. No rows returned". It is safe to run again.
+3. Check it from the outside:
+
+   ```powershell
+   npm run verify:supabase
+   ```
+
+   Expect `PASSED` with **0 warnings**. Section 4 now also confirms that `update_trip()`, `set_trip_archived()` and the internal helper `trip_role_of()` cannot be run by signed-out visitors. (Before this step you will see three "not available yet" warnings, which is expected.)
+4. Try it: `npm run app:web`, sign in, open a trip you created, then **Edit trip** (change the name and budget, **Save changes**), then **Archive trip** (read the confirmation, confirm). Home now shows **Archived (1)**; expand it, open the trip and **Restore trip**.
+5. Privacy check: in a second browser as another account, open that trip's address and its `/edit` address. Both must say "Trip not available".
+
+If you try to edit or archive *before* running this update, the app says "Editing trips isn't set up on the server yet" instead of failing mysteriously.
+
 ## Troubleshooting
 
 | You see | Meaning and fix |

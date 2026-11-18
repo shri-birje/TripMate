@@ -1,15 +1,15 @@
 import { Link, useRouter } from 'expo-router';
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { View } from 'react-native';
-import { SUPPORTED_CURRENCIES, TRIP_DESCRIPTION_MAX, type CurrencyCode } from '@tripmate/core';
+import { SUPPORTED_CURRENCIES, type CurrencyCode, type TripFormValues } from '@tripmate/core';
 import { AppText } from '../../../components/AppText';
 import { Banner } from '../../../components/Banner';
 import { Button } from '../../../components/Button';
 import { Card } from '../../../components/Card';
 import { Screen } from '../../../components/Screen';
 import { SegmentedControl } from '../../../components/SegmentedControl';
-import { TextField } from '../../../components/TextField';
 import { useProfile } from '../../../features/profile/profileApi';
+import { TripFormFields } from '../../../features/trips/TripFormFields';
 import { useCreateTrip } from '../../../features/trips/tripApi';
 import { TripError } from '../../../features/trips/tripService';
 import { spacing } from '../../../theme/tokens';
@@ -21,6 +21,9 @@ export default function NewTripScreen() {
   const router = useRouter();
   const { data: profile } = useProfile();
   const create = useCreateTrip();
+  // Guards against two taps landing before `create.isPending` has re-rendered the button
+  // disabled: a ref updates immediately, a render does not.
+  const submitting = useRef(false);
 
   const [name, setName] = useState('');
   const [destination, setDestination] = useState('');
@@ -38,8 +41,15 @@ export default function NewTripScreen() {
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
   const [formError, setFormError] = useState<string | null>(null);
 
+  // The six shared fields are drawn by <TripFormFields>; this maps each one back to its own state.
+  const values: TripFormValues = { name, destination, startDate, endDate, description, budget };
+  const setters: Record<keyof TripFormValues, (v: string) => void> = {
+    name: setName, destination: setDestination, startDate: setStartDate, endDate: setEndDate, description: setDescription, budget: setBudget,
+  };
+
   async function submit() {
-    if (create.isPending) return; // ignore a second tap while saving
+    if (submitting.current) return; // ignore a second tap while saving
+    submitting.current = true;
     setFieldErrors({});
     setFormError(null);
     try {
@@ -52,6 +62,8 @@ export default function NewTripScreen() {
       } else {
         setFormError('Something went wrong. Please try again.');
       }
+    } finally {
+      submitting.current = false;
     }
   }
 
@@ -73,71 +85,7 @@ export default function NewTripScreen() {
             {formError}
           </Banner>
         )}
-        <TextField
-          testID="trip-name"
-          label="Trip name"
-          value={name}
-          onChangeText={setName}
-          error={fieldErrors.name}
-          placeholder="Goa Trip 2026"
-          autoCapitalize="words"
-          returnKeyType="next"
-          maxLength={120}
-        />
-        <TextField
-          testID="trip-destination"
-          label="Destination"
-          value={destination}
-          onChangeText={setDestination}
-          error={fieldErrors.destination}
-          placeholder="Goa, India"
-          autoCapitalize="words"
-          returnKeyType="next"
-          maxLength={120}
-        />
-        <TextField
-          testID="trip-start"
-          label="Start date"
-          value={startDate}
-          onChangeText={setStartDate}
-          error={fieldErrors.startDate}
-          helper="Day / month / year"
-          placeholder="27/12/2026"
-          autoCapitalize="none"
-          keyboardType="numbers-and-punctuation"
-          returnKeyType="next"
-        />
-        <TextField
-          testID="trip-end"
-          label="End date"
-          value={endDate}
-          onChangeText={setEndDate}
-          error={fieldErrors.endDate}
-          placeholder="30/12/2026"
-          autoCapitalize="none"
-          keyboardType="numbers-and-punctuation"
-          returnKeyType="next"
-        />
-        <TextField
-          testID="trip-description"
-          label="Description (optional)"
-          value={description}
-          onChangeText={setDescription}
-          error={fieldErrors.description}
-          multiline
-          maxLength={TRIP_DESCRIPTION_MAX + 50}
-        />
-        <TextField
-          testID="trip-budget"
-          label="Estimated budget (optional)"
-          value={budget}
-          onChangeText={setBudget}
-          error={fieldErrors.budget}
-          helper={`For the whole group, in ${currency}. For example 60000.`}
-          placeholder="60000"
-          autoCapitalize="none"
-          keyboardType="numbers-and-punctuation"
-        />
+        <TripFormFields values={values} onChange={(field, value) => setters[field](value)} errors={fieldErrors} currency={currency} />
         <View style={{ gap: spacing.sm }}>
           <AppText variant="small" tone="secondary" style={{ fontWeight: '600' }}>
             Currency

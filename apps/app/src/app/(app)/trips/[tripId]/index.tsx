@@ -1,18 +1,22 @@
 import { Link, useLocalSearchParams, useRouter } from 'expo-router';
+import { useRef, useState } from 'react';
 import { View } from 'react-native';
-import { daysLabel, formatDateRange, tripPhase, type TripDetails } from '@tripmate/core';
-import { AppText } from '../../../components/AppText';
-import { Banner } from '../../../components/Banner';
-import { Button } from '../../../components/Button';
-import { Card } from '../../../components/Card';
-import { Screen } from '../../../components/Screen';
-import { useUserId } from '../../../features/auth/AuthProvider';
-import { PhaseBadge } from '../../../features/trips/PhaseBadge';
-import { useTripDetails } from '../../../features/trips/tripDetailsApi';
-import { formatMoney } from '../../../lib/format';
-import { todayIso } from '../../../lib/today';
-import { useTheme } from '../../../theme/ThemeProvider';
-import { spacing } from '../../../theme/tokens';
+import { daysLabel, formatDateRange, isTripAdmin, tripPhase, type TripDetails } from '@tripmate/core';
+import { AppText } from '../../../../components/AppText';
+import { Banner } from '../../../../components/Banner';
+import { Button } from '../../../../components/Button';
+import { Card } from '../../../../components/Card';
+import { ConfirmDialog } from '../../../../components/ConfirmDialog';
+import { Screen } from '../../../../components/Screen';
+import { useUserId } from '../../../../features/auth/AuthProvider';
+import { PhaseBadge } from '../../../../features/trips/PhaseBadge';
+import { useTripDetails } from '../../../../features/trips/tripDetailsApi';
+import { useSetTripArchived } from '../../../../features/trips/tripEditApi';
+import { TripEditError } from '../../../../features/trips/tripEditService';
+import { formatMoney } from '../../../../lib/format';
+import { todayIso } from '../../../../lib/today';
+import { useTheme } from '../../../../theme/ThemeProvider';
+import { spacing } from '../../../../theme/tokens';
 
 /**
  * Trip Details: what you know about a trip you are on.
@@ -21,6 +25,9 @@ import { spacing } from '../../../theme/tokens';
  * were removed from it or left it, the database returns nothing and this screen shows ONE
  * combined "not available" message, so it never reveals whether a trip exists. Only genuine
  * connection problems get a different message (with Try again).
+ *
+ * Administrators also see Edit / Archive / Restore here. Hiding these from other people is a
+ * convenience only: the database refuses the actions unless the caller is an active administrator.
  */
 export default function TripDetailsScreen() {
   const params = useLocalSearchParams<{ tripId?: string | string[] }>();
@@ -63,18 +70,66 @@ export default function TripDetailsScreen() {
         </Card>
       )}
 
-      {data && <Details details={data} />}
+      {data && <Details details={data} reload={() => void refetch()} />}
     </Screen>
   );
 }
 
-function Details({ details }: { details: TripDetails }) {
+type Pending = 'archive' | 'restore' | null;
+
+function Details({ details, reload }: { details: TripDetails; reload: () => void }) {
   const { trip, members, creatorName, lengthDays } = details;
+  const router = useRouter();
   const userId = useUserId();
   const { colors } = useTheme();
   // "Today" and the trip's dates are both plain calendar days, so this comparison has no time-zone surprises.
   const phase = tripPhase(trip.startDate, trip.endDate, todayIso());
   const creatorIsMe = userId !== null && members.some((m) => m.userId === userId && m.userId === trip.createdBy);
+  const isAdmin = isTripAdmin(details, userId);
+  const archived = trip.status === 'archived';
+
+  const setArchived = useSetTripArchived(trip.id);
+  // Guards against two taps landing before `setArchived.isPending` has re-rendered the button
+  // disabled: a ref updates immediately, a render does not.
+  const submitting = useRef(false);
+  const [pending, setPending] = useState<Pending>(null);
+  const [dialogError, setDialogError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<TripEditError | null>(null);
+
+  function openDialog(which: Exclude<Pending, null>) {
+    setDialogError(null);
+    setNotice(null);
+    setActionError(null);
+    setPending(which);
+  }
+
+  function confirm() {
+    if (!pending || submitting.current) return; // ignore a second tap while saving
+    submitting.current = true;
+    const doing = pending;
+    setArchived.mutate(
+      { tripId: trip.id, archived: doing === 'archive', expectedVersion: trip.version },
+      {
+        onSuccess: () => {
+          submitting.current = false;
+          setPending(null);
+          setNotice(doing === 'archive' ? 'Trip archived.' : 'Trip restored.');
+        },
+        onError: (e) => {
+          submitting.current = false;
+          // A connection problem can simply be retried from the same dialog. Everything else
+          // (someone changed the trip, your rights changed...) closes it and explains on the page.
+          if (e.kind === 'network' || e.kind === 'unknown') {
+            setDialogError(e.message);
+          } else {
+            setPending(null);
+            setActionError(e);
+          }
+        },
+      },
+    );
+  }
 
   return (
     <>
@@ -88,10 +143,43 @@ function Details({ details }: { details: TripDetails }) {
         <PhaseBadge phase={phase} />
       </View>
 
-      {trip.status === 'archived' && (
+      {archived && (
         <Banner kind="info" testID="trip-archived">
           This trip is archived.
         </Banner>
+      )}
+
+      {notice && (
+        <Banner kind="success" testID="trip-notice">
+          {notice}
+        </Banner>
+      )}
+
+      {actionError && (
+        <Card>
+          <Banner kind="error" testID="trip-action-error">
+            {actionError.message}
+          </Banner>
+          <Button testID="trip-reload" label="Reload latest" variant="secondary" onPress={() => { setActionError(null); reload(); }} />
+        </Card>
+      )}
+
+      {isAdmin ? (
+        <Card>
+          <AppText variant="heading">Manage trip</AppText>
+          {!archived ? (
+            <>
+              <Button testID="trip-edit" label="Edit trip" onPress={() => router.push(`/trips/${trip.id}/edit`)} />
+              <Button testID="trip-archive" label="Archive trip" variant="secondary" onPress={() => openDialog('archive')} />
+            </>
+          ) : (
+            <Button testID="trip-restore" label="Restore trip" onPress={() => openDialog('restore')} />
+          )}
+        </Card>
+      ) : (
+        <AppText variant="small" tone="secondary" testID="trip-members-note">
+          Only trip admins can edit, archive or restore this trip.
+        </AppText>
       )}
 
       <Card>
@@ -136,6 +224,21 @@ function Details({ details }: { details: TripDetails }) {
           ))}
         </View>
       </Card>
+
+      <ConfirmDialog
+        visible={pending !== null}
+        title={pending === 'restore' ? 'Restore this trip?' : 'Archive this trip?'}
+        message={
+          pending === 'restore'
+            ? `Restore "${trip.name}"? It returns to your active trips, in the group its dates belong to. Nothing else about the trip changes.`
+            : `Archive "${trip.name}"? It leaves your active trips. Nothing is deleted: history and expenses are kept, and you can restore it later.`
+        }
+        confirmLabel={pending === 'restore' ? 'Restore trip' : 'Archive trip'}
+        busy={setArchived.isPending}
+        error={dialogError}
+        onConfirm={confirm}
+        onCancel={() => setPending(null)}
+      />
     </>
   );
 }

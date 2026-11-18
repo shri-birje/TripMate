@@ -13,9 +13,9 @@ Rule: a feature is **Complete** only when it works **and has been tested**. "Cod
 | **M0 — Project foundation** | ✅ **Complete (approved 2026-11-17)** |
 | **M1 — Core money engine (`packages/core`)** | ✅ **Complete (approved 2026-11-17)** |
 | **M2 — Accounts, profiles, theme** | ✅ **Complete** (live check passed and approved 2026-11-18; committed and pushed as `f90d1a6`) |
-| **M3 — Trips and members** | 🔵 **In progress, 5 small features** (see M3 plan): **M3.1 Create a trip ✅ complete (approved 2026-11-18)**; **M3.2 View trip details ✅ complete (live-verified and approved 2026-11-18)**; M3.3-M3.5 not started |
+| **M3 — Trips and members** | 🔵 **In progress, 5 small features** (see M3 plan): **M3.1 Create a trip ✅ complete (approved 2026-11-18)**; **M3.2 View trip details ✅ complete (live-verified and approved 2026-11-18)**; **M3.3 Edit and archive: built and tested, plus a date input and calendar refinement requested in review; awaiting your review (migration not yet applied to your live project, nothing committed)**; M3.4-M3.5 not started |
 | M4 — Invites + guest claim | Not started |
-| M5 — Expenses + split types | Not started |
+| M5 — Expenses + split types | Not started. **Must (ADR-043):** make `update_trip` refuse trip date changes that would leave an existing expense outside the trip; refuse expenses and repayments on archived trips; keep currency unchangeable; use the lock + version pattern for every money-changing function |
 | M6 — Balances + settlement plan | Not started |
 | M7 — Repayment lifecycle | Not started |
 | M8 — Dashboard, activity feed, basic budgets | Not started |
@@ -239,7 +239,7 @@ M3 is delivered as five small features, one at a time, each ending with your app
 |---|---|---|
 | **M3.1** | **Create a trip** (+ your trips on Home) | ✅ Complete (live-verified and approved 2026-11-18) |
 | M3.2 | View trip details (dates, budget, members list) | ✅ Complete (live-verified and approved 2026-11-18) |
-| M3.3 | Edit and archive a trip (admin only, conflict-safe) | Not started |
+| M3.3 | Edit and archive a trip (admin only, conflict-safe) | 🟡 Built and tested; awaiting your review. Migration #3 not yet applied live; nothing committed |
 | M3.4 | Members and roles: add guest members, remove, make/remove admin, leave, last-admin protection | Not started |
 | M3.5 | Invitation links: create, revoke, preview, join | Not started |
 
@@ -434,3 +434,192 @@ Editing or archiving (M3.3), adding, removing or re-roling members (M3.4), invit
 
 ### Risks
 Low. No database change; additive code; the main risk is the "embedded members" query interacting with the security rules, which the database tests cover directly.
+
+
+---
+
+## M3.3 — Edit and archive a trip
+
+**Status: built and tested. Awaiting your review.** The plan and all six decisions were approved on 2026-11-18, with extra conditions on concurrency, restore, Home, the shared form, routing, security and a future M5 dependency (all addressed below). **It has NOT been applied to your live Supabase project and NOT checked live** (see "Live check for you"). Nothing is committed or pushed.
+
+### What was implemented
+- **Edit a trip** (administrators only): name, destination, start and end dates, description, budget. Same validation and messages as Create (it uses the identical rules). Currency is shown but **cannot be changed** (the edit function has no input for it).
+- **Archive a trip**, with a confirmation dialog ("Nothing is deleted: history and expenses are kept, and you can restore it later").
+- **Restore a trip**, with its own confirmation. Restore changes only the status; the trip returns to whichever Home group its dates belong to.
+- **Archived trips are read-only in the database** and are clearly marked: banner on the trip page, "Archived" tag and muted title on Home cards, and a collapsed **"Archived (n)"** section on Home (n = the archived trips the database returned for this person; trips they cannot access are never counted).
+- **Concurrency:** the edit form remembers the version it started from. If someone else changed the trip first, the save is refused ("This trip was changed by someone else. Reload to see the latest, then try again."), nothing is overwritten, and **Reload latest** restarts the form from the newest version.
+- **Routing:** the details page is now `trips/[tripId]/index.tsx` (same address, `/trips/<id>`), with `/trips/<id>/edit` beside it. Direct addresses and refresh work for both.
+- **Shared form:** the six trip fields are one component used by Create and Edit.
+
+### Database changes (one migration, `20261118200000_trip_edit_archive.sql`)
+No table, column, policy or table-permission was changed. Row-level security is untouched; the first two migrations are byte-identical.
+- **Version trigger:** adds 1 to `trips.version` on every REAL change (ignoring `version` and `updated_at` themselves); a change that alters nothing does not. Whatever version a writer tries to set is overridden.
+- **`update_trip(...)`** and **`set_trip_archived(...)`**, callable by signed-in users, `SECURITY DEFINER`, pinned `search_path`, revoked from `PUBLIC` and `anon`, using `auth.uid()`. In order: signed in; active member (else the single existence-hiding answer `trip_not_found`); administrator (else `not_admin`); **row locked**; archived (edits only: `trip_archived`); version matches (else `version_conflict`, nothing changed); nothing to change (return as is, no new version); otherwise a version-guarded UPDATE. Archive/restore: same checks, change **only** `status`, and asking for the state it is already in is a safe no-op.
+- **`trip_role_of(trip, user)`**: internal helper, **not callable by the app** (only the two functions above use it).
+- Audit allow-list: exactly `update_trip` and `set_trip_archived` were added (two reviewed lines in `security-audit.test.ts`). **No secret key** is used or mentioned.
+
+### Files
+- **Database:** new `supabase/migrations/20261118200000_trip_edit_archive.sql`, `supabase/tests/trip-edit.test.ts`. Changed (as approved): `security-audit.test.ts` (allow-list +2 names) and `trip-details-access.test.ts` (its "callable functions" assertion now lists the 4 reviewed functions; it previously said "unchanged since M3.1", which M3.3 deliberately changes).
+- **Shared rules:** new `packages/core/src/tripEdit.ts` + test; `index.ts` (+1 export line). `trip.ts` and `tripDetails.ts` are untouched.
+- **App (new):** `tripEditService.ts` (+ test), `tripEditApi.ts`, `TripFormFields.tsx`, `ConfirmDialog.tsx`, `trips/[tripId]/edit.tsx`.
+- **App (changed, approved):** details page (moved to `[tripId]/index.tsx` and extended with Manage / Archive / Restore), Home (archived section), `TripCard.tsx` (Archived tag, muted title), `new.tsx` (now uses `TripFormFields`; behaviour unchanged).
+- **Scripts/docs:** `scripts/ui-check.ts` (new scenarios H and I), `scripts/verify-supabase.ts` (checks the new functions on your real project), docs.
+- **Verified unchanged since the last commit (`2653ae3`):** the M1 money engine, all M2 code and its migration and test, `trip.ts`, `tripDetails.ts`, the M3.1/M3.2 services and hooks, and migrations 1 and 2.
+
+### Tests and results (all run)
+| Check | Result |
+|---|---|
+| Type-check, all packages | Clean |
+| Whole repo | **632 tests pass**: API 17, app 165 (+30), core 295 (+30), database 155 (+54) |
+| Database (real Postgres engine, +54) | every function as administrator, second administrator, ordinary member, stranger, removed, left, signed out and "no login"; identical answer for a nonexistent trip; stale versions (two administrators replayed in sequence); atomicity (invalid data leaves the trip exactly as it was); no-op edits and repeated archive/restore don't add versions; archive and restore change only the status and don't touch members; archived trips refuse edits until restored; nobody can set the version; the helper and trigger function are closed to the app; the migration can be re-run |
+| **Mutation check (14 deliberate breaks of the new migration)** | **all caught**: admin check removed (twice), archived check removed, version check + guard removed (twice), row lock removed, no-op skip removed, existence leak, restore wiping a field, non-idempotent archive, trigger bumping on no-ops, trigger removed, helper made callable, an unreviewed extra function. A control (only the early version check removed) correctly passed because the guard inside the UPDATE still protects: defence in depth. Migration restored byte-for-byte after each. |
+| Security audit (ADR-032), 12 tests | all pass against all three migrations |
+| Shared rules (+30) | same validation as Create (identical messages), form pre-fill round trip, exact RPC argument names, no currency/status/creator, admin detection (former admins excluded), archived list and the approved Home grouping unchanged, restored trips fall in the right group |
+| Data layer (+30) | exact requests, version handling, malformed ids and bad versions never sent, every database answer mapped to a plain message, raw database text never shown |
+| Real browser (Edge), `npm run ui:check` | **225 checks pass**: the 133 earlier checks **unchanged and all passing** (including every Create Trip check after the shared-form extraction, details, time zones) plus **92 new** |
+| Live project check (`npm run verify:supabase`) | PASSED with 3 warnings: the three new functions are "not available yet" on your real project, as expected before you apply the migration |
+| Production build | succeeds; 0 secret keys, 0 service-role tokens, 0 connection strings; 1 copy of the publishable key (expected, public by design) |
+
+### The new browser checks (92) cover
+Administrators see Edit/Archive, members don't and are told why; pre-fill; Save disabled until something changes and again after reverting; every validation message (same as Create, nothing sent while invalid); the exact request (approved fields, cleaned, starting version; never currency/status/creator); trip page and Home update; the second edit starts from version 2; removing the budget; **another admin changing the trip first** (refused, nothing overwritten, Reload latest, retry keeps their changes); not-admin, not-found, archived and connection failures each explained, form kept, Save works after the connection returns; double taps (edit and archive each send one request); direct addresses (member, stranger, malformed, archived, signed out); Home's Archived section (count equals trips this person can access, hidden trips excluded, collapsed by default, tagged, accessible state, opens the trip); archive dialog (Cancel does nothing, names the trip, alert-dialog role); archive and **restore requests exactly as specified**; restore changes nothing else and returns the trip to Ongoing / Upcoming / Completed by its dates; archiving an already-archived trip is safe; archive from an outdated page is refused with Reload; failures inside the dialog; members cannot restore; Dark theme; and **editing dates, archiving and restoring in three time zones (UTC+14, UTC-11, India)**: starting today and ending today are Ongoing, ended yesterday Completed, starting tomorrow Upcoming.
+
+### Bugs found
+No application bugs. Two test-side problems, fixed: an enabled button simply has no "disabled" marker (my check assumed an explicit "false"), and a check ran before the dialog finished fading out. The first screenshots of the dialog were captured mid-fade, so I made the check wait and re-viewed them: the finished dialog is legible in both themes.
+
+### Not tested, not done, limits (honest)
+- **Not applied or checked on your live Supabase project.** I could not sign in as a real user, so edit/archive/restore have only been exercised against a real Postgres engine (database rules) and simulated Supabase answers (screens). Live steps below.
+- **A true simultaneous race** cannot be staged on a single-connection test engine. The tests replay the exact sequence a race produces and check the row lock and version-guarded UPDATE are in the function bodies; that the lock makes a real race behave the same way is Postgres' documented behaviour.
+- The simulated server in the browser run implements the same rules as the functions, but it is a re-implementation; the database tests are the authority for the rules.
+- Web only: not tested on a phone or emulator (the dialog uses React Native's Modal, which should behave the same, but is unverified there). The Escape key closes the dialogs on the web (tested); the Android back button is not tested.
+- A page left open across midnight updates its phase on the next load.
+- Deep-link restoration after sign-in is still out of scope. No deleting trips (archive only). No member management (M3.4) or invitations (M3.5).
+
+### Live check for you
+1. Do **Step 10** in [SUPABASE_SETUP.md](SUPABASE_SETUP.md) (run the third SQL file), then `npm run verify:supabase`: expect `PASSED` with **0 warnings**.
+2. `npm run app:web`, sign in, open a trip you created: you should see **Edit trip** and **Archive trip**.
+3. Edit it (change the name and the budget), Save: the trip page and Home show the new details.
+4. Archive it (check the confirmation text), then open Home: it left its group and **Archived (1)** appears; expand it, open the trip, **Restore** it: it returns to the right group.
+5. In a second browser as another account: open the trip's address (it must say "Trip not available"), and its `/edit` address (same).
+6. (Needs two accounts on one trip, which arrives in M3.4/M3.5) a non-admin member must not see Edit or Archive.
+
+### Obligations for later milestones (recorded so they cannot be forgotten)
+- **M5 (expenses): changing a trip's dates must be checked against existing expense dates.** `update_trip` has no expenses to look at today. When the expenses table is added, `update_trip` must refuse any date range that would leave an existing expense outside the trip (and the screens must show a clear message), with tests. See ADR-043.
+- Archived trips must refuse new expenses and repayments (read-only), and currency must stay unchangeable.
+- Every new money-changing function must use the same pattern: caller identity, active-member and role checks, row lock, version check, atomic change.
+
+### Next recommended step
+Your review of M3.3 and the live check above. After approval, and a decision on committing: **M3.4 - Members and roles** (not started).
+
+### Refinement requested during M3.3 review: date typing and calendar picker
+
+**Status: built and tested. Nothing committed or pushed. No database, API or date-logic change.**
+
+**What it does (Create Trip and Edit Trip, identically, because it lives in the shared `TripFormFields`):**
+- **Calendar button** beside Start date and End date. It opens a calendar dialog (month grid, previous/next month and year, Today, Close). Choosing a day writes it into the box as `DD/MM/YYYY`. The box and the calendar always agree (the box is the single source of truth): the calendar opens on the date typed, and a half-typed date selects nothing.
+- **End date calendar** opens on the start date's month and does not offer days before the start date (a convenience; a typed end date before the start is still rejected by the unchanged validation). "Today" is unavailable if today is before the start date.
+- **Automatic formatting:** `27122026` becomes `27/12/2026`, `05012027` becomes `05/01/2027`. Slashes appear when the third digit is typed; correctly formatted dates typed with slashes are accepted; `5/1/2027` becomes `05/01/2027`.
+- **Restrictions:** only digits and the automatic slashes are kept. Letters, spaces, symbols and digits from other scripts are rejected. Nothing beyond `DD/MM/YYYY` is accepted. Phones get the number keypad.
+- **Paste:** `27122026`, `27/12/2026` and (as whole dates) `27-12-2026`, `27.12.2026` and ISO `2026-12-27` all become `DD/MM/YYYY`; pasted text with letters keeps only its digits.
+- **Backspace and cursor:** backspace removes one thing at a time and steps over automatic slashes; deleting or typing in the middle keeps the cursor beside the edit. The edit position is worked out from the old and new text, not from selection events (which can lag).
+- **Validation is unchanged and not weakened.** The formatter only shapes text; it never corrects or judges a date (`31/02/2026` stays `31/02/2026` and is rejected as before). Impossible dates, wrong months, non-leap 29 February, partial and empty dates all still fail exactly as in M3.1.
+
+**Choice of calendar (dependencies inspected first):** no picker library was installed. The standard Expo/React Native picker (`@react-native-community/datetimepicker`) supports iOS, Android and Windows but **not the web**, so it would have needed a new dependency plus a second, different implementation for the browser, neither matching the TripMate theme nor testable in the browser harness. I built **one calendar from React Native's own building blocks** (a dialog and a grid): no new dependency, identical on web and phones, themed with the design tokens (both themes verified), accessible. Weekday maths uses the same timezone-free calendar-day arithmetic as the rest of the date code (1 Jan 1970 was a Thursday); first day of the week is Sunday; supported years are 2000 to 2100 (the range the validation already accepts, tied together by a test).
+
+**Files:** new `packages/core/src/dateInput.ts` (+ test), `calendar.ts` (+ test); `apps/app/src/components/CalendarIcon.tsx`, `DatePickerModal.tsx`; `apps/app/src/features/trips/DateField.tsx`. Changed: `TripFormFields.tsx` (the two date boxes now use `DateField`), `TextField.tsx` (additive optional props only: `trailing`, `selection`, `onSelectionChange`, `inputMode`), `packages/core/src/index.ts` (+2 export lines), `scripts/ui-check.ts`. **Unchanged:** `trip.ts`, `tripDetails.ts`, `tripEdit.ts` and their tests, the money engine, the M2 code, every migration, the M3.1/M3.2/M3.3 services and hooks, and `new.tsx` and `edit.tsx` themselves (they get the behaviour only through `TripFormFields`). No dependency was added.
+
+**Tests (all run):**
+| Check | Result |
+|---|---|
+| Type-check | Clean |
+| Whole repo | **704 tests pass**: API 17, app 165, core 367 (+72), database 155 |
+| Typing formatter (49) | digits-only grouping and every partial step; slashes and padding; letters, symbols, emoji and non-ASCII digits rejected; pasting (plain, slashes, dashes, dots, ISO, with junk); valid dates stay valid and invalid ones are never "fixed" (including 29 February in leap years 2000, 2024, 2028 and not 2100, 2027); **properties over thousands of cases**: any 8 digits give valid text exactly when that calendar date exists, every real date from 2000 to 2100 round-trips, output always well-shaped and at most 10 characters, shaping is idempotent (so editing a saved date never marks the form changed), only digits and "/" ever appear, the cursor is always inside the text; a text-box simulator for typing, backspace, middle edits and paste |
+| Calendar maths (23) | every month's grid (leading blanks, 4 to 6 rows, each day once in order, real dates, 1st under the right weekday) for every month 2000 to 2100; weekday of every day 2000 to 2100 checked against JavaScript's own calendar; leap years; month and year shifting with bounds |
+| **Mutation check (13 deliberate breaks)** | all caught (letters accepted, no padding, extra digits, cursor jumping, silently "correcting" a day over 31, ISO paste, stray slashes, cursor after slash, edit position, weekday off by one, February always 28, no year bounds, unpadded weeks). It first found a **gap** in my tests (doubled slashes with single-digit parts); I added the case and re-ran: all 13 caught. Files restored byte-for-byte. |
+| Real browser (Edge), `npm run ui:check` | **375 checks pass** (225 earlier unchanged + **150 new**: 149 for dates, 1 more for the archive dialog) |
+
+**Browser checks for dates (run on Create and again on Edit):** real key presses and a **real clipboard paste**; every example from your brief; letters/symbols; slashes; paste variants; backspace sequence and caret positions (`selectionStart`) for end, middle and over-a-slash edits; editing an existing date; 11 invalid dates (invalid day/month, 31 April, 30 February, non-leap 29 February, 29 February 2100, years 1999 and 2101) all rejected and none reaching the server; partial and empty dates rejected; 29 February 2028 accepted and sent as `2028-02-29`; calendar open/select/navigate (month, year), Today, Close, Escape, keyboard Enter to open; typing then calendar and calendar then typing, both ways; End calendar opens on the start month, blocks earlier days and blocked clicks do nothing; Edit specifics: saved dates unchanged in the new field, moving around or opening and closing the calendar does not mark the form changed, a calendar choice enables Save and saves as an ISO date; accessibility names (button, dialog, each day, selected state); **Light and Dark** (theme surface and selected-day colours); **phone-sized touch screen**: no sideways scroll, number keypad (`inputmode=numeric`), 44 px touch targets, dialog inside the screen, tapping a day fills the box.
+
+**Bug found and resolved:** none in the app. The first run failed the Escape-key check because my test pressed Escape before React Native Web's modal had finished fading in (it only listens afterwards, on key release). With the wait, Escape closes the calendar. I added the same check to the archive dialog (same modal component), which resolves the M3.3 limit "Escape not tested".
+
+**Limits (honest):**
+- **Not run on a real phone or emulator.** The phone checks are a phone-sized, touch-enabled browser. Unverified on devices: the native cursor control (`selection`) on iOS/Android, the native modal, the number keypad (note: iOS's number keypad has no "/" key, which is fine because slashes are inserted automatically), and the Android back button closing the calendar.
+- Typing a digit in the **middle** of a full date shifts the later digits right and the last one falls off (masked-field behaviour); deleting in the middle keeps the date tidy.
+- Dashes and dots are accepted only in a **whole pasted date** (`27-12-2026`); typed one at a time they are rejected, as asked.
+- Digits from other scripts (for example Devanagari) are rejected; only 0-9 are accepted.
+- No live "that date does not exist" message while typing: invalid dates are reported on Create/Save with the same messages as before (kept so nothing in M3.1/M3.3 changes).
+- Calendar: Sunday first, no month or year drop-down (use the arrows), years 2000 to 2100.
+- Web only in a real browser (Edge).
+
+### Approved plan (as presented, kept for reference)
+
+### Goal
+Let a trip's **administrators** edit its details and archive it (with a confirmation), while ordinary members cannot, enforced by the database. Archived trips are clearly marked, cannot be mistaken for active ones, and keep all their history.
+
+### What I inspected (facts)
+- `trips.status` already allows `active` / `archived`. **No new column needed.**
+- `trips.version` exists (default 1) but **nothing ever changes it**: the only trigger on `trips` stamps `updated_at`. A guard against overwriting someone else's newer edit therefore needs a new mechanism (below).
+- **No expenses (or other money) table exists yet**, so there is no financial data to disturb today. The schema document says currency is *immutable once a trip has expenses*; that rule cannot be enforced until expenses exist.
+- **Home hides archived trips completely** (`groupTripsByPhase` skips them; tested and approved in M3.1). The details screen already shows an "Archived" banner (M3.2).
+- Nobody can write `trips` directly (no grants). The callable-function allow-list in the audit test is exactly `create_trip` and `is_trip_member`.
+- Design documents already say: admins edit and archive; members cannot (`API_DESIGN` permission matrix); edits carry an `expectedVersion` and a stale one is a conflict (409); archive and unarchive are one pair of actions.
+- The trip details data already tells the screen who is an admin (members with role `admin`), so the screen can hide buttons from members. **Hiding is only a convenience; the database is the authority.**
+
+### Decisions I need from you
+1. **Restore (un-archive): include it (recommended).** You asked for archive only, but if archived trips are read-only (decision 4) and there is no way back, archiving by mistake would be permanent. Restore is the same function with the opposite value, with its own confirmation.
+2. **Currency is NOT editable in M3.3 (recommended).** Budget amounts are stored in the trip's currency; changing the currency would silently change what every amount means, and once expenses exist (M5) it would be dangerous. Making the edit function simply have no currency input makes the rule true *by construction*. The edit screen shows the currency read-only with a one-line reason. Alternative: allow it until the first expense exists, which needs a guard that can't be written until M5. The M5 plan must also guard shrinking a trip's dates below existing expense dates (recorded as obligations in the docs).
+3. **Archived trips appear on Home in a collapsed "Archived (n)" section at the bottom (recommended)**, each card tagged "Archived" and visually muted, tappable. They never count as Ongoing, Upcoming or Completed. Today they are simply invisible, which would make restore impossible to find. The existing grouping rule stays exactly as approved.
+4. **Archived trips are read-only in the database:** editing is refused while a trip is archived (restore first). This is what stops an archived trip being treated as active.
+5. **Edit form code:** to avoid pasting ~100 lines of the Create form into a second screen, I'd extract the shared fields into one small component used by both. That means a mechanical edit to the approved Create screen, guarded by the existing browser checks (they exercise every Create field and message and must stay green, unchanged). If you would rather not touch Create at all, I'll duplicate the fields instead.
+6. **Route change:** the edit page is `/trips/<id>/edit`. That needs the details file to move from `trips/[tripId].tsx` to `trips/[tripId]/index.tsx`: **same address, same content**, just a different place in the folder.
+
+### Database changes (one new migration `20261118200000_trip_edit_archive.sql`)
+No table, column, policy or table-permission changes. Row-level security is untouched.
+- **Version counter:** a `BEFORE UPDATE` trigger on `trips` adds 1 to `version` on every change (so any future writer is covered too).
+- **`trip_role_of(trip, user)`** (internal helper): returns the user's role if they are an *active* member, else nothing. Used by these functions. **Not callable by the app** (execute revoked from everyone but the owner), so it adds no new surface.
+- **`update_trip(trip_id, expected_version, name, destination, start_date, end_date, description, budget_minor)`** (callable by signed-in users). In order:
+  1. caller must be signed in (`auth.uid()`), else `not_authenticated`;
+  2. caller must be an **active member**, else `trip_not_found` (the same answer for a trip that doesn't exist, isn't theirs, or they left or were removed, so existence is never revealed);
+  3. caller must be an **administrator**, else `not_admin`;
+  4. the trip row is locked; if it is **archived** → `trip_archived`;
+  5. if `version` differs from `expected_version` → `version_conflict` (nothing is changed);
+  6. if nothing actually changes, return the trip as is (no needless version bump);
+  7. otherwise update; the existing table rules (lengths, dates, budget) validate; all-or-nothing.
+  It has **no currency, status or creator input**, so those cannot be changed through it.
+- **`set_trip_archived(trip_id, archived, expected_version)`** (callable by signed-in users): same steps 1 to 3, then locks, checks the version, is idempotent (asking for the state it's already in changes nothing), and otherwise flips `status`.
+- Both are `SECURITY DEFINER`, pinned `search_path`, revoked from `PUBLIC` and `anon`, granted to `authenticated`, and use `auth.uid()` (the ADR-032 checklist, answered per function in the decisions log). **No secret key.**
+- The audit test's allow-list will be edited **consciously** to add exactly `update_trip` and `set_trip_archived`; every other audit rule stays as is.
+
+### App changes
+- **Shared rules (new core file):** edit validation reuses the existing Create rules unchanged (the form's own currency is passed through), date text helpers for pre-filling the form (`2026-12-27` to `27/12/2026`), "is this person an admin of this trip", and the archived-trips helper. The approved `trip.ts` is not modified.
+- **Data layer (new files):** `tripEditService.ts`, `tripEditApi.ts`, with friendly mapping: not signed in, not available (the same combined message as M3.2), **not admin**, **archived**, **version conflict**, connection failure (Try again), invalid fields shown next to the right input.
+- **Screens:**
+  - Details (M3.2 file, moved): admins see **Edit trip** and **Archive trip**; members see neither (just a note that only admins can change a trip); an archived trip shows its banner, hides Edit/Archive, and offers **Restore trip** to admins.
+  - **Edit page:** the form pre-filled (dates as DD/MM/YYYY), same validation and messages as Create, currency shown read-only, **Save** disabled until something changes, duplicate-tap protection.
+  - **Confirmation dialog** (new small component, works on web and phones): *"Archive 'Goa Trip 2026'? It leaves your active trips. Nothing is deleted: history and expenses are kept, and you can restore it later."* with Cancel / Archive (and a matching one for Restore).
+  - Home: archived section (decision 3) and an "Archived" tag on those cards.
+- **Conflicts:** if someone else changed the trip while you were editing, you get *"This trip was changed by someone else. Reload to see the latest, then try again."* with a Reload button; nothing is overwritten.
+
+### Security implications
+- Only active administrators can edit or archive; enforced inside the functions. The UI hiding buttons is not relied on.
+- Ordinary members, strangers, removed and departed members, and signed-out callers are all refused by the database. Strangers/removed get the existence-hiding answer; members get "not an admin".
+- Old data can't be overwritten silently (version check), and edits can't touch creator, status, currency or id.
+- No new table permissions, no new policies, no secret key; the 12 audit tests still run against the new migration.
+
+### Edge cases I will test
+Two admins editing at once; the editor losing admin rights or being removed mid-edit; someone archiving the trip while another edits; editing an archived trip; archiving twice; restoring an active trip; clearing the description or budget; dates that move a trip between Ongoing/Upcoming/Completed (including starting or ending today, in different time zones); invalid dates and budgets; whitespace; very long text; nothing changed; double-taps; connection failure on save and on archive; direct address `/trips/<id>/edit` as a member, as a stranger, signed out.
+
+### Tests I will write
+- **Database (real Postgres engine, ~35):** each function as admin, ordinary member, stranger, removed, left, signed out; stale version leaves data untouched; archived trip refuses edits; no-op doesn't bump version; version trigger; atomicity; validation constraints; no way to change currency, status or creator through `update_trip`; members and history rows untouched by archive/restore; direct writes still denied; the helper is not callable by the app. Mutation checks (weaken each rule and confirm a test fails). Audit tests re-run with the updated allow-list.
+- **Shared rules (~20)** and **data layer (~25)** with a fake client.
+- **Real browser (~50 new checks):** admin sees and uses Edit/Archive/Restore; members do not see them; pre-fill; every validation message; the exact request sent; Home and details refresh; archived section; confirmation Cancel vs confirm; conflict, forbidden, not-available and connection-failure paths with Try again; double-tap; date-boundary movement between sections in three time zones; Dark theme.
+
+### Files (expected)
+**New:** one migration; `trip-edit.test.ts` (database); `tripEdit.ts` + test (core); `tripEditService.ts` + test, `tripEditApi.ts`, `TripFormFields.tsx`; `ConfirmDialog.tsx`; the edit screen.
+**Changed:** the details screen (moved and extended); Home (archived section); `TripCard.tsx` (Archived tag); the Create screen (uses the shared fields; decision 5); `security-audit.test.ts` (allow-list only); `core/index.ts` (+1 line); `ui-check.ts`; docs.
+**Not touched:** M1 engine, M2 auth/profile/theme/session code, `trip.ts`, `tripDetails.ts`, the M3.1 and M3.2 services, and the existing migrations.
+
+### Not in M3.3
+Member management and roles (M3.4), invitations (M3.5), deleting a trip (not planned: archive only), expenses, cover photos, editing currency.
+
+### Limitations to expect
+Web only; real-browser tests use simulated Supabase answers (the live check is yours); a page left open across midnight updates on next load; deep-link restoration after sign-in is still out of scope.

@@ -110,6 +110,10 @@ interface FakeBackend {
   slowDetailsMs: number;
   /** Set to make the fake server wrongly send former members too (the app must still not show them). */
   leakFormerMembers: boolean;
+  /** Force the edit/archive functions to answer with this database message (or drop the connection). */
+  rpcFail: null | 'network' | 'not_admin' | 'trip_not_found' | 'trip_archived' | 'version_conflict';
+  /** Delay, in ms, before the edit/archive functions answer (to test double taps). */
+  slowRpcMs: number;
 }
 
 const USER = { id: '11111111-2222-3333-4444-555555555555', email: 'asha@example.com', aud: 'authenticated', role: 'authenticated' };
@@ -146,6 +150,8 @@ function newBackend(): FakeBackend {
     failDetails: false,
     slowDetailsMs: 0,
     leakFormerMembers: false,
+    rpcFail: null,
+    slowRpcMs: 0,
   };
 }
 
@@ -283,6 +289,48 @@ async function installFakeSupabase(context: BrowserContext, backend: FakeBackend
       backend.trips.unshift(created);
       const { members: _members, ...plain } = publicRow(created);
       return json(200, plain);
+    }
+    // ---- update_trip / set_trip_archived: the fake enforces the SAME rules as the real database functions.
+    if ((url.pathname === '/rest/v1/rpc/update_trip' || url.pathname === '/rest/v1/rpc/set_trip_archived') && method === 'POST') {
+      const failWith = (message: string) => json(400, { code: 'P0001', message, details: null, hint: null });
+      if (backend.rpcFail === 'network') return route.abort('connectionfailed');
+      if (backend.slowRpcMs > 0) await new Promise((r) => setTimeout(r, backend.slowRpcMs));
+      if (backend.rpcFail) return failWith(backend.rpcFail);
+
+      const t = backend.trips.find((x) => x.id === body.p_trip_id && !x._hidden);
+      const me = t && (t._members as Record<string, any>[]).find((m) => m.user_id === USER.id && m.status === 'active');
+      if (!t || !me) return failWith('trip_not_found'); // same answer for "no such trip" and "not on it"
+      if (me.role !== 'admin') return failWith('not_admin');
+      const send = () => {
+        const { members: _members, ...plain } = publicRow(t);
+        return json(200, plain);
+      };
+      const touch = () => {
+        t.version += 1;
+        t.updated_at = new Date().toISOString();
+      };
+
+      if (url.pathname === '/rest/v1/rpc/set_trip_archived') {
+        const target = body.p_archived ? 'archived' : 'active';
+        if (t.status === target) return send(); // already there: nothing changes, no new version
+        if (t.version !== body.p_expected_version) return failWith('version_conflict');
+        t.status = target;
+        touch();
+        return send();
+      }
+
+      if (t.status === 'archived') return failWith('trip_archived');
+      if (t.version !== body.p_expected_version) return failWith('version_conflict');
+      const name = String(body.p_name).trim();
+      const destination = String(body.p_destination).trim();
+      const description = body.p_description === null || String(body.p_description).trim() === '' ? null : String(body.p_description).trim();
+      const unchanged =
+        t.name === name && t.destination === destination && t.start_date === body.p_start_date && t.end_date === body.p_end_date &&
+        t.description === description && t.budget_minor === body.p_budget_minor;
+      if (unchanged) return send(); // no-op: no new version
+      Object.assign(t, { name, destination, start_date: body.p_start_date, end_date: body.p_end_date, description, budget_minor: body.p_budget_minor });
+      touch();
+      return send();
     }
     backend.unexpected.push(`${method} ${url.pathname}`);
     return route.abort('blockedbyclient');
@@ -917,6 +965,735 @@ async function detailFlows(browser: Awaited<ReturnType<typeof chromium.launch>>)
   }
 }
 
+async function editFlows(browser: Awaited<ReturnType<typeof chromium.launch>>) {
+  console.log('\nH. Edit, archive and restore');
+  const site = await startWebsite({ EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY: DUMMY_PUBLISHABLE_KEY, EXPO_PUBLIC_SUPABASE_URL: SUPABASE_URL });
+  try {
+    const OTHER_ADMIN = '88888888-8888-4888-8888-888888888888';
+    const me = (role: string) => memberRow({ id: `me-${role}-${Math.random().toString(36).slice(2, 6)}`, user_id: USER.id, display_name: 'Asha Rao', role });
+    const other = memberRow({ id: 'other-admin', user_id: OTHER_ADMIN, display_name: 'Meera Nair', role: 'admin' });
+    const trip = (id: string, name: string, start: number, end: number, over: Record<string, any> = {}) =>
+      tripRow({ id, name, destination: 'Place', start_date: dayFromToday(start), end_date: dayFromToday(end), _members: [me('admin')], ...over });
+
+    const T = {
+      EDIT: uuid(201), MEMBER: uuid(202), ARCH_UP: uuid(203), HIDDEN_ARCH: uuid(204), ONGOING: uuid(205), CONFLICT: uuid(207),
+      ARCH_ONG: uuid(208), ARCH_PAST: uuid(209), CONFLICT2: uuid(210), DOUBLE: uuid(211), FAIL: uuid(212), ARCH_MEMBER: uuid(213), STALE_ARCH: uuid(214),
+    };
+    const backend = newBackend();
+    backend.trips = [
+      trip(T.EDIT, 'Edit Me', 30, 33, { description: 'Original', budget_minor: 6_000_000 }),
+      trip(T.MEMBER, 'Member Trip', 30, 33, { _members: [me('member'), other] }),
+      trip(T.ARCH_UP, 'Archived Upcoming', 10, 12, { status: 'archived' }),
+      trip(T.ARCH_ONG, 'Archived Ongoing', -1, 2, { status: 'archived' }),
+      trip(T.ARCH_PAST, 'Archived Past', -60, -57, { status: 'archived' }),
+      trip(T.ARCH_MEMBER, 'Archived Member Trip', -90, -88, { status: 'archived', _members: [me('member'), other] }),
+      trip(T.HIDDEN_ARCH, 'Hidden Archived', 5, 6, { status: 'archived', _hidden: true }),
+      trip(T.ONGOING, 'Ongoing Trip', -1, 2),
+      trip(T.CONFLICT, 'Conflict Trip', 40, 42, { description: 'Before' }),
+      trip(T.CONFLICT2, 'Conflict Two', 45, 47),
+      trip(T.DOUBLE, 'Double Tap', 50, 52),
+      trip(T.FAIL, 'Failure Trip', 55, 57),
+      trip(T.STALE_ARCH, 'Stale Archive', 60, 62),
+    ];
+    const row = (id: string) => backend.trips.find((t) => t.id === id)!;
+    const context = await browser.newContext();
+    await installFakeSupabase(context, backend);
+    await sessionInStorage(context);
+    const page = await context.newPage();
+
+    const rpc = (fn: string, id?: string) => backend.requests.filter((r) => r.method === 'POST' && r.path.startsWith(`/rest/v1/rpc/${fn}`) && (!id || r.body?.p_trip_id === id));
+    const updates = (id?: string) => rpc('update_trip', id);
+    const archives = (id?: string) => rpc('set_trip_archived', id);
+    const text = async (id: string) => (await byId(page, id).innerText().catch(() => '')).replace(/\s+/g, ' ').trim();
+    const go = async (path: string, waitFor: string) => {
+      await page.goto(`${BASE}${path}`);
+      return byId(page, waitFor).waitFor({ timeout: 20000 }).then(() => true, () => false);
+    };
+    const exists = async (id: string) => (await byId(page, id).count()) > 0;
+    const archivedExpected = () => backend.trips.filter((t) => t.status === 'archived' && !t._hidden).length;
+
+    // ============ who sees the buttons ============
+    await go(`/trips/${T.EDIT}`, 'trip-title');
+    check('an administrator sees Edit and Archive on the trip page', (await exists('trip-edit')) && (await exists('trip-archive')) && !(await exists('trip-restore')));
+    check('...and not the "only admins" note', !(await exists('trip-members-note')));
+    await go(`/trips/${T.MEMBER}`, 'trip-title');
+    check('an ordinary member sees neither Edit nor Archive', !(await exists('trip-edit')) && !(await exists('trip-archive')) && !(await exists('trip-restore')));
+    check('...and is told only admins can', (await text('trip-members-note')) === 'Only trip admins can edit, archive or restore this trip.');
+
+    // ============ the edit form ============
+    await byId(page, 'trip-back-home').click();
+    await go(`/trips/${T.EDIT}`, 'trip-edit');
+    await byId(page, 'trip-edit').click();
+    const formOpened = await byId(page, 'trip-name').waitFor({ timeout: 10000 }).then(() => true, () => false);
+    check('Edit trip opens /trips/<id>/edit', formOpened && pathOf(page) === `/trips/${T.EDIT}/edit`, pathOf(page));
+    const startDmy = asDmy(dayFromToday(30));
+    const endDmy = asDmy(dayFromToday(33));
+    check('the form is pre-filled (dates as DD/MM/YYYY, budget as typed rupees)',
+      (await byId(page, 'trip-name').inputValue()) === 'Edit Me' && (await byId(page, 'trip-destination').inputValue()) === 'Place' &&
+      (await byId(page, 'trip-start').inputValue()) === startDmy && (await byId(page, 'trip-end').inputValue()) === endDmy &&
+      (await byId(page, 'trip-description').inputValue()) === 'Original' && (await byId(page, 'trip-budget').inputValue()) === '60000');
+    check('the currency is shown but not editable, with the reason', (await text('edit-currency')) === 'INR' && (await exists('trip-currency-INR')) === false && (await vis(page, 'Fixed when the trip is created').isVisible()));
+    check('Save is disabled until something changes', (await byId(page, 'edit-save').getAttribute('aria-disabled')) === 'true');
+    await page.reload();
+    check('reloading the edit address keeps the form', await byId(page, 'trip-name').waitFor({ timeout: 20000 }).then(() => true, () => false) && (await byId(page, 'trip-name').inputValue()) === 'Edit Me');
+
+    // typing and reverting is "no change"
+    await byId(page, 'trip-name').fill('Edit Me!');
+    // An enabled button simply has no "disabled" marker (the attribute is absent or "false"); a disabled one says "true".
+    check('changing something enables Save', (await byId(page, 'edit-save').getAttribute('aria-disabled')) !== 'true');
+    await byId(page, 'trip-name').fill('Edit Me');
+    check('putting it back disables Save again (no change = nothing to save)', (await byId(page, 'edit-save').getAttribute('aria-disabled')) === 'true');
+
+    // validation: same rules and words as Create
+    await byId(page, 'trip-name').fill('');
+    await byId(page, 'trip-start').fill(asDmy(dayFromToday(10)));
+    await byId(page, 'trip-end').fill(asDmy(dayFromToday(5)));
+    await byId(page, 'trip-budget').fill('lots');
+    await byId(page, 'edit-save').click();
+    const msgs = await vis(page, 'Enter a trip name').waitFor({ timeout: 5000 }).then(() => true, () => false);
+    check('invalid edits show the same messages as Create', msgs && (await vis(page, 'The end date must be on or after the start date').isVisible()) && (await vis(page, 'Enter a budget like 60000').isVisible()));
+    check('...and nothing is sent', updates().length === 0);
+
+    // a valid edit
+    const newStart = dayFromToday(31);
+    const newEnd = dayFromToday(34);
+    await byId(page, 'trip-name').fill('  Edited Trip  ');
+    await byId(page, 'trip-destination').fill('New Place');
+    await byId(page, 'trip-start').fill(asDmy(newStart));
+    await byId(page, 'trip-end').fill(asDmy(newEnd));
+    await byId(page, 'trip-description').fill('');
+    await byId(page, 'trip-budget').fill('75,000.50');
+    await byId(page, 'edit-save').click();
+    const back = await byId(page, 'trip-title').waitFor({ timeout: 10000 }).then(() => true, () => false);
+    check('saving returns to the trip page', back && pathOf(page) === `/trips/${T.EDIT}`, pathOf(page));
+    const u1 = updates(T.EDIT)[0];
+    check('the request has exactly the approved fields, cleaned, with the starting version',
+      !!u1 && JSON.stringify(u1.body) === JSON.stringify({
+        p_trip_id: T.EDIT, p_expected_version: 1, p_name: 'Edited Trip', p_destination: 'New Place', p_start_date: newStart, p_end_date: newEnd, p_description: null, p_budget_minor: 7_500_050,
+      }), JSON.stringify(u1?.body));
+    check('...never currency, status or creator', !!u1 && !/currency|status|created_by/.test(Object.keys(u1.body).join(',')));
+    check('the request carries the user\'s login, not a secret key', !!u1?.auth?.startsWith('Bearer ') && !u1.auth.includes('sb_secret'));
+    check('the trip page shows the new details', (await text('trip-title')) === 'Edited Trip' && (await text('trip-destination')) === 'New Place' && (await text('trip-budget')) === '₹75,000.50' && (await text('trip-description')) === 'No description' && (await text('trip-dates')) === formatDateRange(newStart, newEnd));
+    await byId(page, 'trip-back-home').click();
+    await byId(page, 'section-upcoming').waitFor({ timeout: 10000 });
+    check('Home shows the new name', (await text('section-upcoming')).includes('Edited Trip') && !(await text('section-upcoming')).includes('Edit Me'));
+
+    // the second edit starts from the NEW version
+    await go(`/trips/${T.EDIT}/edit`, 'trip-name');
+    await byId(page, 'trip-name').fill('Edited Twice');
+    await byId(page, 'edit-save').click();
+    await byId(page, 'trip-title').waitFor({ timeout: 10000 });
+    check('a second edit starts from the new version (2)', updates(T.EDIT)[1]?.body.p_expected_version === 2, String(updates(T.EDIT)[1]?.body.p_expected_version));
+
+    // clearing the budget
+    await go(`/trips/${T.EDIT}/edit`, 'trip-name');
+    await byId(page, 'trip-budget').fill('');
+    await byId(page, 'edit-save').click();
+    await byId(page, 'trip-title').waitFor({ timeout: 10000 });
+    check('a budget can be removed', updates(T.EDIT)[2]?.body.p_budget_minor === null && (await text('trip-budget')) === 'No budget set');
+
+    // ============ another admin changes the trip first (concurrency) ============
+    await go(`/trips/${T.CONFLICT}/edit`, 'trip-name');
+    const vBefore = row(T.CONFLICT).version;
+    Object.assign(row(T.CONFLICT), { name: 'Changed by Meera', description: 'Meera note', version: vBefore + 1 }); // someone else saves while this form is open
+    await byId(page, 'trip-destination').fill('Mine');
+    await byId(page, 'edit-save').click();
+    const conflictMsg = await byId(page, 'form-error').waitFor({ timeout: 8000 }).then(() => true, () => false);
+    check('if someone else changed the trip first, the save is refused with a clear message', conflictMsg && (await text('form-error')) === 'This trip was changed by someone else. Reload to see the latest, then try again.', await text('form-error'));
+    check('...nothing of theirs was overwritten', row(T.CONFLICT).name === 'Changed by Meera' && row(T.CONFLICT).description === 'Meera note' && row(T.CONFLICT).destination === 'Place' && row(T.CONFLICT).version === vBefore + 1);
+    check('...and a Reload button is offered', await byId(page, 'edit-reload').isVisible());
+    await byId(page, 'edit-reload').click();
+    check('Reload shows the latest saved version', await waitFor(async () => (await byId(page, 'trip-name').inputValue()) === 'Changed by Meera') && (await byId(page, 'trip-description').inputValue()) === 'Meera note');
+    await byId(page, 'trip-destination').fill('Mine');
+    await byId(page, 'edit-save').click();
+    await byId(page, 'trip-title').waitFor({ timeout: 10000 });
+    const retry = updates(T.CONFLICT).at(-1)!;
+    check('retrying works from the latest version and keeps the other admin\'s changes', retry.body.p_expected_version === vBefore + 1 && retry.body.p_name === 'Changed by Meera' && retry.body.p_description === 'Meera note' && row(T.CONFLICT).destination === 'Mine' && row(T.CONFLICT).name === 'Changed by Meera');
+
+    // ============ what the database can answer ============
+    await go(`/trips/${T.FAIL}/edit`, 'trip-name');
+    const tryFail = async (mode: typeof backend.rpcFail) => {
+      backend.rpcFail = mode;
+      await byId(page, 'trip-name').fill(`Fail ${mode} ${Math.random().toString(36).slice(2, 5)}`);
+      await byId(page, 'edit-save').click();
+      await byId(page, 'form-error').waitFor({ timeout: 8000 }).catch(() => {});
+      return text('form-error');
+    };
+    check('a refusal "not an admin" is explained', (await tryFail('not_admin')) === 'Only trip admins can do that.');
+    check('"trip not found" gives the same combined message as the details page', (await tryFail('trip_not_found')) === "We couldn't open this trip. It may have been removed, or you may not be a member.");
+    check('"archived" is explained', (await tryFail('trip_archived')) === 'This trip is archived. Restore it to make changes.');
+    check('a connection failure is explained', /Can't reach the server/.test(await tryFail('network')));
+    check('the form is still open with the typing kept after failures', pathOf(page) === `/trips/${T.FAIL}/edit` && /^Fail network/.test(await byId(page, 'trip-name').inputValue()));
+    backend.rpcFail = null;
+    await byId(page, 'edit-save').click();
+    check('after the connection returns, Save works', await byId(page, 'trip-title').waitFor({ timeout: 10000 }).then(() => true, () => false));
+
+    // double tap
+    await go(`/trips/${T.DOUBLE}/edit`, 'trip-name');
+    backend.slowRpcMs = 1200;
+    await byId(page, 'trip-name').fill('Double Tapped');
+    await byId(page, 'edit-save').click();
+    await byId(page, 'edit-save').click({ timeout: 800, force: true }).catch(() => {});
+    await byId(page, 'trip-title').waitFor({ timeout: 10000 });
+    backend.slowRpcMs = 0;
+    check('tapping Save twice sends only one request', updates(T.DOUBLE).length === 1, String(updates(T.DOUBLE).length));
+
+    // ============ direct addresses ============
+    const before = updates().length;
+    await go(`/trips/${T.MEMBER}/edit`, 'edit-not-admin');
+    check('an ordinary member opening the edit address sees "only admins" and no form', (await exists('edit-not-admin')) && !(await exists('trip-name')));
+    await go(`/trips/${T.HIDDEN_ARCH}/edit`, 'trip-unavailable');
+    check('a trip you are not on shows the combined message on the edit address too', (await text('trip-unavailable')) === "We couldn't open this trip. It may have been removed, or you may not be a member." && !(await exists('trip-name')));
+    await go(`/trips/not-a-uuid/edit`, 'trip-unavailable');
+    check('a malformed edit address shows the same message', (await exists('trip-unavailable')) && !(await exists('trip-name')));
+    await go(`/trips/${T.ARCH_UP}/edit`, 'edit-archived');
+    check('an archived trip cannot be edited: "restore it first", no form', (await exists('edit-archived')) && !(await exists('trip-name')));
+    check('none of those attempts sent an edit', updates().length === before);
+    {
+      const anon = await browser.newContext();
+      const anonBackend = newBackend();
+      anonBackend.trips = backend.trips;
+      await installFakeSupabase(anon, anonBackend);
+      const p = await anon.newPage();
+      await p.goto(`${BASE}/trips/${T.EDIT}/edit`);
+      await byId(p, 'email').waitFor({ timeout: 20000 });
+      check('signed out, the edit address goes to sign-in and requests nothing', pathOf(p) === '/sign-in' && !anonBackend.requests.some((r) => r.path.startsWith('/rest/v1/trips') || r.path.startsWith('/rest/v1/rpc')));
+      await anon.close();
+    }
+
+    // ============ Home: archived section ============
+    await go('/', 'greeting');
+    await byId(page, 'section-archived').waitFor({ timeout: 10000 });
+    check('Home shows an "Archived (n)" section counting only trips this person can access', (await text('archived-toggle')).includes(`Archived (${archivedExpected()})`) && !(await page.locator('body').innerText()).includes('Hidden Archived'), await text('archived-toggle'));
+    check('it is collapsed by default (no archived card showing)', !(await exists(`trip-card-${T.ARCH_UP}`)));
+    check('archived trips are not in Ongoing, Upcoming or Completed', !/Archived/.test((await text('section-ongoing')) + (await text('section-upcoming')) + (await text('section-completed'))));
+    check('accessibility: the toggle says it is collapsed', (await byId(page, 'archived-toggle').getAttribute('aria-expanded')) === 'false');
+    await byId(page, 'archived-toggle').click();
+    await byId(page, `trip-card-${T.ARCH_UP}`).waitFor({ timeout: 5000 });
+    check('expanding shows the archived trips, each tagged "Archived"', (await exists(`archived-tag-${T.ARCH_UP}`)) && (await exists(`archived-tag-${T.ARCH_PAST}`)) && (await byId(page, 'archived-toggle').getAttribute('aria-expanded')) === 'true');
+    await shot(page, 'home-archived');
+    await byId(page, `trip-card-${T.ARCH_UP}`).click();
+    check('an archived trip opens its page, with the Archived notice', await byId(page, 'trip-archived').waitFor({ timeout: 8000 }).then(() => true, () => false));
+
+    // ============ archive ============
+    await go(`/trips/${T.ONGOING}`, 'trip-archive');
+    await byId(page, 'trip-archive').click();
+    const dialog = await byId(page, 'confirm-dialog').waitFor({ timeout: 5000 }).then(() => true, () => false);
+    check('Archive asks for confirmation first', dialog && (await text('confirm-title')) === 'Archive this trip?');
+    check('the confirmation names the trip and says nothing is deleted', /Ongoing Trip/.test(await text('confirm-message')) && /Nothing is deleted/.test(await text('confirm-message')));
+    check('accessibility: the dialog is announced as an alert dialog', (await byId(page, 'confirm-dialog').getAttribute('role')) === 'alertdialog' && !!(await byId(page, 'confirm-dialog').getAttribute('aria-label')));
+    await page.waitForTimeout(800); // let the fade-in finish so the screenshot shows the finished dialog
+    await shot(page, 'archive-dialog');
+    await page.keyboard.press('Escape');
+    check('the Escape key closes the archive dialog without archiving', (await waitFor(async () => !(await exists('confirm-dialog')))) && archives(T.ONGOING).length === 0 && (await exists('trip-archive')));
+    await byId(page, 'trip-archive').click();
+    await byId(page, 'confirm-dialog').waitFor({ timeout: 5000 });
+    await byId(page, 'confirm-cancel').click();
+    await waitFor(async () => !(await exists('confirm-dialog')));
+    check('Cancel closes it, sends nothing and leaves the trip active', !(await exists('confirm-dialog')) && archives(T.ONGOING).length === 0 && (await exists('trip-archive')) && !(await exists('trip-archived')));
+    await byId(page, 'trip-archive').click();
+    await byId(page, 'confirm-confirm').click();
+    const archivedShown = await byId(page, 'trip-archived').waitFor({ timeout: 8000 }).then(() => true, () => false);
+    const a1 = archives(T.ONGOING)[0];
+    check('confirming archives the trip', archivedShown && (await text('trip-notice')) === 'Trip archived.');
+    check('the request is exactly: this trip, archive, the current version', !!a1 && JSON.stringify(a1.body) === JSON.stringify({ p_trip_id: T.ONGOING, p_archived: true, p_expected_version: 1 }), JSON.stringify(a1?.body));
+    check('an archived trip offers Restore and no longer offers Edit or Archive', (await exists('trip-restore')) && !(await exists('trip-edit')) && !(await exists('trip-archive')));
+    await byId(page, 'trip-back-home').click();
+    await byId(page, 'section-archived').waitFor({ timeout: 10000 });
+    check('on Home it left Ongoing and the Archived count went up by one', !(await text('section-ongoing').catch(() => '')).includes('Ongoing Trip') && (await text('archived-toggle')).includes(`Archived (${archivedExpected()})`), await text('archived-toggle'));
+
+    // archived by someone else behind the page's back: archiving again is safe, not an error
+    await go(`/trips/${T.STALE_ARCH}`, 'trip-archive');
+    Object.assign(row(T.STALE_ARCH), { status: 'archived', version: row(T.STALE_ARCH).version + 1 });
+    await byId(page, 'trip-archive').click();
+    await byId(page, 'confirm-confirm').click();
+    check('archiving a trip that is already archived is safe (no error, no second version)', await byId(page, 'trip-notice').waitFor({ timeout: 8000 }).then(() => true, () => false) && row(T.STALE_ARCH).version === 2 && !(await exists('trip-action-error')));
+
+    // conflict on archive
+    await go(`/trips/${T.CONFLICT2}`, 'trip-archive');
+    row(T.CONFLICT2).version += 1;
+    row(T.CONFLICT2).description = 'Changed meanwhile';
+    await byId(page, 'trip-archive').click();
+    await byId(page, 'confirm-confirm').click();
+    const archConflict = await byId(page, 'trip-action-error').waitFor({ timeout: 8000 }).then(() => true, () => false);
+    check('archiving from an outdated page is refused with the "changed by someone else" message', archConflict && (await text('trip-action-error')) === 'This trip was changed by someone else. Reload to see the latest, then try again.' && row(T.CONFLICT2).status === 'active');
+    // (The dialog fades out, so give it a moment before checking that it is gone.)
+    check('...the dialog closes and Reload latest is offered', (await waitFor(async () => !(await exists('confirm-dialog')))) && (await exists('trip-reload')));
+    await byId(page, 'trip-reload').click();
+    await waitFor(async () => !(await exists('trip-action-error')));
+    await byId(page, 'trip-archive').click();
+    await byId(page, 'confirm-confirm').click();
+    check('after reloading, archiving works', await byId(page, 'trip-archived').waitFor({ timeout: 8000 }).then(() => true, () => false) && row(T.CONFLICT2).status === 'archived');
+
+    // errors inside the dialog
+    await go(`/trips/${T.DOUBLE}`, 'trip-archive');
+    backend.rpcFail = 'network';
+    await byId(page, 'trip-archive').click();
+    await byId(page, 'confirm-confirm').click();
+    const netInDialog = await byId(page, 'confirm-error').waitFor({ timeout: 8000 }).then(() => true, () => false);
+    check('a connection failure keeps the dialog open with a message, so it can simply be retried', netInDialog && /Can't reach the server/.test(await text('confirm-error')) && (await exists('confirm-dialog')));
+    backend.rpcFail = null;
+    await byId(page, 'confirm-confirm').click();
+    check('retrying from the same dialog works', await byId(page, 'trip-archived').waitFor({ timeout: 8000 }).then(() => true, () => false));
+    await go(`/trips/${T.FAIL}`, 'trip-archive');
+    backend.rpcFail = 'not_admin';
+    await byId(page, 'trip-archive').click();
+    await byId(page, 'confirm-confirm').click();
+    check('if your admin rights were removed meanwhile, the page says only admins can', await byId(page, 'trip-action-error').waitFor({ timeout: 8000 }).then(() => true, () => false) && (await text('trip-action-error')) === 'Only trip admins can do that.');
+    backend.rpcFail = null;
+
+    // double tap on confirm
+    await go(`/trips/${T.EDIT}`, 'trip-archive');
+    backend.slowRpcMs = 1200;
+    await byId(page, 'trip-archive').click();
+    await byId(page, 'confirm-confirm').click();
+    await byId(page, 'confirm-confirm').click({ timeout: 800, force: true }).catch(() => {});
+    await byId(page, 'trip-archived').waitFor({ timeout: 10000 });
+    backend.slowRpcMs = 0;
+    check('tapping Archive twice sends only one request', archives(T.EDIT).length === 1, String(archives(T.EDIT).length));
+
+    // ============ restore ============
+    const restoreAndCheck = async (id: string, name: string, section: string, label: string) => {
+      const beforeRow = { ...row(id) };
+      await go(`/trips/${id}`, 'trip-restore');
+      await byId(page, 'trip-restore').click();
+      const t = await text('confirm-title');
+      await byId(page, 'confirm-confirm').click();
+      const ok = await byId(page, 'trip-notice').waitFor({ timeout: 8000 }).then(() => true, () => false);
+      const req = archives(id).at(-1);
+      check(`${label}: Restore asks first, then restores`, t === 'Restore this trip?' && ok && (await text('trip-notice')) === 'Trip restored.' && !(await exists('trip-archived')) && (await exists('trip-edit')));
+      check(`${label}: the request is "restore" with the current version only`, !!req && JSON.stringify(req.body) === JSON.stringify({ p_trip_id: id, p_archived: false, p_expected_version: beforeRow.version }), JSON.stringify(req?.body));
+      const after = row(id);
+      check(`${label}: nothing else about the trip changed`, (['name', 'destination', 'start_date', 'end_date', 'description', 'budget_minor', 'currency', 'created_by'] as const).every((k) => after[k] === beforeRow[k]) && after.status === 'active');
+      await byId(page, 'trip-back-home').click();
+      await byId(page, `section-${section}`).waitFor({ timeout: 10000 });
+      check(`${label}: it returns to the "${section}" group on Home`, (await text(`section-${section}`)).includes(name));
+    };
+    await restoreAndCheck(T.ARCH_ONG, 'Archived Ongoing', 'ongoing', 'restoring a trip whose dates are happening now');
+    await restoreAndCheck(T.ARCH_UP, 'Archived Upcoming', 'upcoming', 'restoring a future trip');
+    await restoreAndCheck(T.ARCH_PAST, 'Archived Past', 'completed', 'restoring a finished trip');
+    await go('/', 'greeting');
+    check('the Archived count always equals the archived trips this person can access', (await text('archived-toggle')).includes(`Archived (${archivedExpected()})`), await text('archived-toggle'));
+
+    // members cannot restore
+    await go(`/trips/${T.ARCH_MEMBER}`, 'trip-archived');
+    check('an ordinary member of an archived trip sees the notice but no Restore button', !(await exists('trip-restore')) && (await exists('trip-members-note')));
+
+    check('no unexpected network calls in the edit/archive run', backend.unexpected.length === 0, backend.unexpected.join(', '));
+    await context.close();
+
+    // ============ dark theme ============
+    {
+      const dark = await browser.newContext();
+      const b = newBackend();
+      b.trips = backend.trips;
+      b.profile = { ...b.profile, theme_preference: 'dark' };
+      await installFakeSupabase(dark, b);
+      await sessionInStorage(dark);
+      await dark.addInitScript(() => window.localStorage.setItem('tripmate.theme-preference', 'dark'));
+      const p = await dark.newPage();
+      await p.goto(`${BASE}/trips/${T.DOUBLE}/edit`);
+      await byId(p, 'trip-name').waitFor({ timeout: 20000 }).catch(() => {});
+      await p.goto(`${BASE}/trips/${T.FAIL}/edit`);
+      await byId(p, 'trip-name').waitFor({ timeout: 20000 });
+      check('the edit page follows the Dark theme', await waitFor(async () => (await screenBg(p)) === DARK_BG));
+      await shot(p, 'edit-dark');
+      await p.goto(`${BASE}/trips/${T.FAIL}`);
+      await byId(p, 'trip-archive').waitFor({ timeout: 20000 });
+      await byId(p, 'trip-archive').click();
+      await byId(p, 'confirm-dialog').waitFor({ timeout: 5000 });
+      await p.waitForTimeout(800); // let the fade-in finish
+      await shot(p, 'archive-dialog-dark');
+      await dark.close();
+    }
+
+    // ============ dates and categories in different time zones ============
+    console.log('\nI. Editing dates moves a trip between groups, in different time zones');
+    for (const zone of ['Pacific/Kiritimati', 'Pacific/Pago_Pago', 'Asia/Kolkata']) {
+      const ctx = await browser.newContext({ timezoneId: zone });
+      const zb = newBackend();
+      const today = todayIn(zone);
+      const Z = uuid(301);
+      zb.trips = [tripRow({ id: Z, name: 'Zone Trip', destination: 'Test', start_date: addDays(today, 10), end_date: addDays(today, 12), _members: [me('admin')] })];
+      await installFakeSupabase(ctx, zb);
+      await sessionInStorage(ctx);
+      const p = await ctx.newPage();
+      const edit = async (start: string, end: string) => {
+        await p.goto(`${BASE}/trips/${Z}/edit`);
+        await byId(p, 'trip-name').waitFor({ timeout: 20000 });
+        await byId(p, 'trip-start').fill(asDmy(start));
+        await byId(p, 'trip-end').fill(asDmy(end));
+        await byId(p, 'edit-save').click();
+        await byId(p, 'trip-title').waitFor({ timeout: 10000 });
+        return (await byId(p, 'trip-phase').innerText()).trim();
+      };
+      const homeHas = async (section: string) => {
+        await p.goto(BASE);
+        await byId(p, `section-${section}`).waitFor({ timeout: 20000 }).catch(() => {});
+        return (await byId(p, `section-${section}`).innerText().catch(() => '')).includes('Zone Trip');
+      };
+      const startsToday = await edit(today, addDays(today, 2));
+      const h1 = await homeHas('ongoing');
+      check(`${zone} (today ${today}): editing a trip to START TODAY makes it Ongoing, on the page and on Home`, startsToday === 'Ongoing' && h1, startsToday);
+      const endsToday = await edit(addDays(today, -3), today);
+      const h2 = await homeHas('ongoing');
+      check(`${zone}: editing a trip to END TODAY keeps it Ongoing`, endsToday === 'Ongoing' && h2, endsToday);
+      const past = await edit(addDays(today, -5), addDays(today, -1));
+      const h3 = await homeHas('completed');
+      check(`${zone}: editing a trip to END YESTERDAY makes it Completed`, past === 'Completed' && h3, past);
+      const future = await edit(addDays(today, 1), addDays(today, 3));
+      const h4 = await homeHas('upcoming');
+      check(`${zone}: editing a trip to START TOMORROW makes it Upcoming`, future === 'Upcoming' && h4, future);
+      // archive, then restore: back in the group its dates say
+      await p.goto(`${BASE}/trips/${Z}`);
+      await byId(p, 'trip-archive').click();
+      await byId(p, 'confirm-confirm').click();
+      await byId(p, 'trip-archived').waitFor({ timeout: 8000 });
+      await p.goto(BASE);
+      await byId(p, 'section-archived').waitFor({ timeout: 20000 });
+      const gone = !(await byId(p, 'section-upcoming').innerText().catch(() => '')).includes('Zone Trip');
+      await p.goto(`${BASE}/trips/${Z}`);
+      await byId(p, 'trip-restore').click();
+      await byId(p, 'confirm-confirm').click();
+      await byId(p, 'trip-notice').waitFor({ timeout: 8000 });
+      const h5 = await homeHas('upcoming');
+      check(`${zone}: archived trips leave the groups, and a restored trip returns to the right one`, gone && h5);
+      await ctx.close();
+    }
+  } finally {
+    site.stop();
+  }
+}
+
+async function dateFlows(browser: Awaited<ReturnType<typeof chromium.launch>>) {
+  console.log('\nJ. Date input and calendar (Create and Edit share one field)');
+  const site = await startWebsite({ EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY: DUMMY_PUBLISHABLE_KEY, EXPO_PUBLIC_SUPABASE_URL: SUPABASE_URL });
+  try {
+    const TRIP = uuid(401);
+    const seed = () => [
+      tripRow({ id: TRIP, name: 'Date Trip', destination: 'Place', start_date: '2026-12-27', end_date: '2026-12-30', _members: [memberRow({ id: 'dm', user_id: USER.id, display_name: 'Asha Rao', role: 'admin' })] }),
+    ];
+    const newContext = async (opts: Parameters<typeof browser.newContext>[0] = {}, mutate?: (b: FakeBackend) => void) => {
+      const ctx = await browser.newContext({ permissions: ['clipboard-read', 'clipboard-write'], ...opts });
+      const b = newBackend();
+      b.trips = seed();
+      mutate?.(b);
+      await installFakeSupabase(ctx, b);
+      await sessionInStorage(ctx);
+      return { ctx, b, page: await ctx.newPage() };
+    };
+
+    /** The same battery of checks, run on the Create form and then on the Edit form. */
+    async function battery(page: Page, backend: FakeBackend, form: 'Create' | 'Edit') {
+      const S = 'trip-start';
+      const E = 'trip-end';
+      const submit = form === 'Create' ? 'create-trip-submit' : 'edit-save';
+      const rpcName = form === 'Create' ? 'create_trip' : 'update_trip';
+      const rpcCalls = () => backend.requests.filter((r) => r.method === 'POST' && r.path.startsWith(`/rest/v1/rpc/${rpcName}`));
+      const val = (id: string) => byId(page, id).inputValue();
+      const caret = (id: string) => byId(page, id).evaluate((e) => [(e as HTMLInputElement).selectionStart, (e as HTMLInputElement).selectionEnd]);
+      const typeKeys = async (id: string, text: string) => {
+        const el = byId(page, id);
+        await el.click();
+        await el.fill('');
+        await el.pressSequentially(text);
+      };
+      const paste = async (id: string, text: string) => {
+        const el = byId(page, id);
+        await page.evaluate((t) => navigator.clipboard.writeText(t), text);
+        await el.click();
+        await page.keyboard.press('Control+A');
+        await page.keyboard.press('Control+V');
+      };
+      const setCaret = (id: string, pos: number) => byId(page, id).evaluate((e, p) => { (e as HTMLInputElement).focus(); (e as HTMLInputElement).setSelectionRange(p, p); }, pos);
+      const pickerOpen = async () => (await page.locator('[data-testid="date-picker"]:visible').count()) > 0;
+      const closed = () => waitFor(async () => !(await pickerOpen()));
+      const day = (iso: string) => byId(page, `date-picker-day-${iso}`);
+      const startErr = () => vis(page, 'Enter the start date like 27/12/2026');
+      const P = `${form}:`;
+
+      // ---------- automatic formatting while typing ----------
+      await typeKeys(S, '27122026');
+      check(`${P} typing 27122026 gives 27/12/2026`, (await val(S)) === '27/12/2026', await val(S));
+      await typeKeys(S, '05012027');
+      check(`${P} 05012027 gives 05/01/2027`, (await val(S)) === '05/01/2027', await val(S));
+      await typeKeys(S, '01012027');
+      check(`${P} 01012027 gives 01/01/2027`, (await val(S)) === '01/01/2027', await val(S));
+      await typeKeys(S, '271');
+      check(`${P} the slash appears when the third digit is typed (27/1)`, (await val(S)) === '27/1', await val(S));
+      await typeKeys(S, '2712');
+      check(`${P} partial input is kept as typed (27/12)`, (await val(S)) === '27/12', await val(S));
+      await typeKeys(S, '27/12/2026');
+      check(`${P} correctly formatted dates typed with slashes are accepted unchanged`, (await val(S)) === '27/12/2026', await val(S));
+      await typeKeys(S, '5/1/2027');
+      check(`${P} single-digit day and month typed with slashes are padded (5/1/2027 -> 05/01/2027)`, (await val(S)) === '05/01/2027', await val(S));
+      check(`${P} the caret ends up at the end after typing`, (await caret(S)).join() === '10,10', (await caret(S)).join());
+
+      // ---------- restrictions ----------
+      await typeKeys(S, 'ab27xy12!@#2026');
+      check(`${P} letters and symbols are rejected while typing`, (await val(S)) === '27/12/2026', await val(S));
+      await typeKeys(S, 'abc');
+      check(`${P} letters alone leave the box empty`, (await val(S)) === '', await val(S));
+      await typeKeys(S, '27-12-2026');
+      check(`${P} dashes typed one at a time are rejected (only digits and automatic slashes remain)`, (await val(S)) === '27/12/2026', await val(S));
+      await typeKeys(S, '271220269999');
+      check(`${P} nothing beyond DD/MM/YYYY is accepted`, (await val(S)) === '27/12/2026', await val(S));
+      const attr = await byId(page, S).getAttribute('inputmode');
+      check(`${P} phones get the number keypad (inputmode numeric)`, attr === 'numeric', String(attr));
+
+      // ---------- paste (real clipboard) ----------
+      await paste(S, '27122026');
+      check(`${P} pasting 27122026 gives 27/12/2026`, (await val(S)) === '27/12/2026', await val(S));
+      await paste(S, '05/01/2027');
+      check(`${P} pasting 05/01/2027 keeps it`, (await val(S)) === '05/01/2027', await val(S));
+      await paste(S, '2026-12-27');
+      check(`${P} pasting an ISO date (2026-12-27) gives 27/12/2026`, (await val(S)) === '27/12/2026', await val(S));
+      await paste(S, '27-12-2026');
+      check(`${P} pasting 27-12-2026 gives 27/12/2026`, (await val(S)) === '27/12/2026', await val(S));
+      await paste(S, 'abc27122026xyz');
+      check(`${P} pasting text with letters keeps only the digits`, (await val(S)) === '27/12/2026', await val(S));
+      check(`${P} after a paste the caret is at the end`, (await caret(S)).join() === '10,10', (await caret(S)).join());
+      await paste(S, '!!!');
+      check(`${P} pasting only symbols leaves the box empty`, (await val(S)) === '', await val(S));
+
+      // ---------- backspace and the caret ----------
+      await typeKeys(S, '27122026');
+      const seen: string[] = [];
+      for (let i = 0; i < 8; i++) {
+        await page.keyboard.press('Backspace');
+        seen.push(await val(S));
+      }
+      check(`${P} backspace removes one thing at a time, stepping over automatic slashes`, JSON.stringify(seen) === JSON.stringify(['27/12/202', '27/12/20', '27/12/2', '27/12', '27/1', '27', '2', '']), seen.join(' | '));
+      await typeKeys(S, '27122026');
+      await setCaret(S, 3);
+      await page.keyboard.press('Backspace');
+      check(`${P} backspace right after an automatic slash moves over it without losing a digit`, (await val(S)) === '27/12/2026' && (await caret(S)).join() === '2,2', `${await val(S)} caret ${(await caret(S)).join()}`);
+      await setCaret(S, 4);
+      await page.keyboard.press('Backspace');
+      check(`${P} deleting a digit in the middle keeps the date tidy and the caret in place`, (await val(S)) === '27/02/2026' && (await caret(S)).join() === '3,3', `${await val(S)} caret ${(await caret(S)).join()}`);
+      await typeKeys(S, '27122026');
+      await setCaret(S, 2);
+      await page.keyboard.type('5');
+      check(`${P} typing a digit in the middle shifts the rest and keeps the caret just after it`, (await val(S)) === '27/51/2202' && (await caret(S)).join() === '4,4', `${await val(S)} caret ${(await caret(S)).join()}`);
+      await typeKeys(S, '27122026');
+      await setCaret(S, 10);
+      for (let i = 0; i < 4; i++) await page.keyboard.press('Backspace');
+      await page.keyboard.type('2027');
+      check(`${P} editing an existing date: delete the year and type a new one`, (await val(S)) === '27/12/2027', await val(S));
+
+      // ---------- invalid dates never pass validation ----------
+      await typeKeys(E, '30122026');
+      const before = rpcCalls().length;
+      for (const bad of ['31022026', '29022027', '30022026', '31042026', '00012026', '32012026', '15132026', '15002026', '01011999', '01012101', '29022100']) {
+        await typeKeys(S, bad);
+        const shown = await val(S);
+        await byId(page, submit).click();
+        const rejected = await startErr().waitFor({ timeout: 4000 }).then(() => true, () => false);
+        check(`${P} ${shown} is not accepted (it is shown as typed, never "corrected")`, rejected && shown === `${bad.slice(0, 2)}/${bad.slice(2, 4)}/${bad.slice(4)}`, shown);
+      }
+      check(`${P} none of the invalid dates reached the server`, rpcCalls().length === before);
+      await typeKeys(S, '2712');
+      await byId(page, submit).click();
+      check(`${P} a partial date (27/12) is rejected`, await startErr().waitFor({ timeout: 4000 }).then(() => true, () => false));
+      await typeKeys(S, '');
+      await byId(page, 'trip-end').fill('');
+      await byId(page, submit).click();
+      check(`${P} empty dates are rejected (both fields)`, (await startErr().waitFor({ timeout: 4000 }).then(() => true, () => false)) && (await vis(page, 'Enter the end date like 27/12/2026').isVisible()));
+
+      // ---------- calendar ----------
+      const calBtn = byId(page, `${S}-calendar`);
+      check(`${P} accessibility: the calendar button is named`, (await calBtn.getAttribute('aria-label')) === 'Choose start date from a calendar');
+      await typeKeys(S, '27122026');
+      await calBtn.click();
+      const opened = await byId(page, 'date-picker').waitFor({ timeout: 5000 }).then(() => true, () => false);
+      check(`${P} the calendar button opens a calendar`, opened);
+      check(`${P} accessibility: it is a dialog named "Start date"`, (await byId(page, 'date-picker').getAttribute('role')) === 'dialog' && (await byId(page, 'date-picker').getAttribute('aria-label')) === 'Start date');
+      check(`${P} it opens on the month of the typed date, with that day selected`, (await byId(page, 'date-picker-month').innerText()) === 'December 2026' && (await day('2026-12-27').getAttribute('aria-pressed')) === 'true');
+      check(`${P} accessibility: each day is named in full (27 December 2026)`, (await day('2026-12-27').getAttribute('aria-label')) === '27 December 2026');
+      await day('2026-12-15').click();
+      check(`${P} choosing a day fills the box (15/12/2026) and closes the calendar`, (await closed()) && (await val(S)) === '15/12/2026', await val(S));
+      await calBtn.click();
+      await byId(page, 'date-picker').waitFor({ timeout: 5000 });
+      check(`${P} reopening shows the newly chosen day selected`, (await day('2026-12-15').getAttribute('aria-pressed')) === 'true');
+      await byId(page, 'date-picker-next-month').click();
+      check(`${P} next month moves to January 2027`, (await byId(page, 'date-picker-month').innerText()) === 'January 2027');
+      await day('2027-01-05').click();
+      check(`${P} a single-digit day from the calendar is written with a zero (05/01/2027)`, (await closed()) && (await val(S)) === '05/01/2027', await val(S));
+      await calBtn.click();
+      await byId(page, 'date-picker').waitFor({ timeout: 5000 });
+      await byId(page, 'date-picker-next-year').click();
+      check(`${P} next year keeps the month (January 2028)`, (await byId(page, 'date-picker-month').innerText()) === 'January 2028');
+      await byId(page, 'date-picker-prev-year').click();
+      await byId(page, 'date-picker-prev-month').click();
+      check(`${P} previous year and previous month work (December 2026)`, (await byId(page, 'date-picker-month').innerText()) === 'December 2026');
+      await byId(page, 'date-picker-close').click();
+      check(`${P} Close leaves the date unchanged`, (await closed()) && (await val(S)) === '05/01/2027');
+      await calBtn.click();
+      await byId(page, 'date-picker').waitFor({ timeout: 5000 });
+      await page.waitForTimeout(800); // the web dialog starts listening for Escape once its fade-in has finished
+      await page.keyboard.press('Escape');
+      check(`${P} the Escape key closes the calendar without changing anything`, (await closed()) && (await val(S)) === '05/01/2027');
+      await calBtn.focus();
+      await page.keyboard.press('Enter');
+      check(`${P} the calendar can be opened from the keyboard (Enter)`, await byId(page, 'date-picker').waitFor({ timeout: 5000 }).then(() => true, () => false));
+      await byId(page, 'date-picker-today').click();
+      check(`${P} "Today" chooses today's date`, (await closed()) && (await val(S)) === asDmy(dayFromToday(0)), await val(S));
+
+      // switching between typing and the calendar, both ways
+      await typeKeys(S, '29122026');
+      await calBtn.click();
+      await byId(page, 'date-picker').waitFor({ timeout: 5000 });
+      check(`${P} typing then opening the calendar: it shows the typed date`, (await byId(page, 'date-picker-month').innerText()) === 'December 2026' && (await day('2026-12-29').getAttribute('aria-pressed')) === 'true');
+      await day('2026-12-30').click();
+      await closed();
+      check(`${P} choosing in the calendar updates the box (30/12/2026)`, (await val(S)) === '30/12/2026');
+      await byId(page, S).click();
+      await setCaret(S, 10);
+      await page.keyboard.press('Backspace');
+      await page.keyboard.press('Backspace');
+      check(`${P} then editing by hand works (30/12/20)`, (await val(S)) === '30/12/20', await val(S));
+      await calBtn.click();
+      await byId(page, 'date-picker').waitFor({ timeout: 5000 });
+      check(`${P} a half-typed date selects nothing in the calendar`, (await page.locator('[data-testid^="date-picker-day-"][aria-pressed="true"]:visible').count()) === 0);
+      await byId(page, 'date-picker-close').click();
+      await closed();
+      await byId(page, S).click();
+      await setCaret(S, 8);
+      await page.keyboard.type('27');
+      check(`${P} finishing it by hand makes a real date again (30/12/2027)`, (await val(S)) === '30/12/2027', await val(S));
+      await calBtn.click();
+      await byId(page, 'date-picker').waitFor({ timeout: 5000 });
+      check(`${P} the calendar then shows December 2027 with the 30th selected`, (await byId(page, 'date-picker-month').innerText()) === 'December 2027' && (await day('2027-12-30').getAttribute('aria-pressed')) === 'true');
+      await byId(page, 'date-picker-close').click();
+      await closed();
+
+      // the End date calendar: opens on the start date's month, and will not offer earlier days
+      await typeKeys(S, '27122026');
+      await typeKeys(E, '');
+      await byId(page, `${E}-calendar`).click();
+      await byId(page, 'date-picker').waitFor({ timeout: 5000 });
+      check(`${P} the End calendar opens on the Start date's month`, (await byId(page, 'date-picker-month').innerText()) === 'December 2026' && (await byId(page, 'date-picker-title').innerText()) === 'End date');
+      check(`${P} days before the start date cannot be chosen`, (await day('2026-12-26').getAttribute('aria-disabled')) === 'true' && (await day('2026-12-27').getAttribute('aria-disabled')) !== 'true');
+      await day('2026-12-26').click({ force: true }).catch(() => {});
+      check(`${P} clicking a blocked day does nothing`, (await pickerOpen()) && (await val(E)) === '');
+      await day('2026-12-31').click();
+      check(`${P} choosing the end date fills it (31/12/2026)`, (await closed()) && (await val(E)) === '31/12/2026', await val(E));
+      await typeKeys(S, '27122040'); // a start date far in the future makes "Today" unavailable for the End calendar
+      await typeKeys(E, '');
+      await byId(page, `${E}-calendar`).click();
+      await byId(page, 'date-picker').waitFor({ timeout: 5000 });
+      check(`${P} the End calendar's "Today" is unavailable when today is before the start date`, (await byId(page, 'date-picker-today').getAttribute('aria-disabled')) === 'true');
+      await byId(page, 'date-picker-close').click();
+      await closed();
+
+      // ---------- a real, valid, leap-day trip goes all the way through ----------
+      if (form === 'Create') {
+        await byId(page, 'trip-name').fill('Leap Trip');
+        await byId(page, 'trip-destination').fill('Leap Place');
+      } else {
+        await byId(page, 'trip-name').fill('Leap Trip');
+      }
+      await typeKeys(S, '29022028');
+      await typeKeys(E, '01032028');
+      await byId(page, submit).click();
+      await waitFor(() => rpcCalls().length > before);
+      const sent = rpcCalls().at(-1);
+      check(`${P} 29 February 2028 (a leap day) is accepted and sent as 2028-02-29 to 2028-03-01`, sent?.body.p_start_date === '2028-02-29' && sent?.body.p_end_date === '2028-03-01', JSON.stringify(sent?.body));
+    }
+
+    // ---------- Create form ----------
+    {
+      const { ctx, b, page } = await newContext();
+      await page.goto(`${BASE}/trips/new`);
+      await byId(page, 'trip-start').waitFor({ timeout: 20000 });
+      await battery(page, b, 'Create');
+      check('Create: no unexpected network calls', b.unexpected.length === 0, b.unexpected.join(', '));
+      await ctx.close();
+    }
+
+    // ---------- Edit form ----------
+    {
+      const { ctx, b, page } = await newContext();
+      await page.goto(`${BASE}/trips/${TRIP}/edit`);
+      await byId(page, 'trip-start').waitFor({ timeout: 20000 });
+      check('Edit: the saved dates appear unchanged in the new field', (await byId(page, 'trip-start').inputValue()) === '27/12/2026' && (await byId(page, 'trip-end').inputValue()) === '30/12/2026');
+      await byId(page, 'trip-start').click();
+      await page.keyboard.press('End');
+      await page.keyboard.press('ArrowLeft');
+      await byId(page, 'trip-end').click();
+      check('Edit: merely focusing and moving around the date fields does not make the form "changed"', (await byId(page, 'edit-save').getAttribute('aria-disabled')) === 'true');
+      await byId(page, 'trip-start-calendar').click();
+      await byId(page, 'date-picker').waitFor({ timeout: 5000 });
+      check('Edit: the calendar opens on the saved start date', (await byId(page, 'date-picker-month').innerText()) === 'December 2026' && (await byId(page, 'date-picker-day-2026-12-27').getAttribute('aria-pressed')) === 'true');
+      await byId(page, 'date-picker-close').click();
+      await waitFor(async () => (await page.locator('[data-testid="date-picker"]:visible').count()) === 0);
+      check('Edit: opening and closing the calendar without choosing leaves the form unchanged', (await byId(page, 'edit-save').getAttribute('aria-disabled')) === 'true');
+      await byId(page, 'trip-end-calendar').click();
+      await byId(page, 'date-picker').waitFor({ timeout: 5000 });
+      await byId(page, 'date-picker-day-2026-12-31').click();
+      await waitFor(async () => (await page.locator('[data-testid="date-picker"]:visible').count()) === 0);
+      check('Edit: choosing a date in the calendar makes the form "changed" (Save enabled)', (await byId(page, 'edit-save').getAttribute('aria-disabled')) !== 'true' && (await byId(page, 'trip-end').inputValue()) === '31/12/2026');
+      await byId(page, 'edit-save').click();
+      await byId(page, 'trip-title').waitFor({ timeout: 10000 });
+      const saved = b.requests.filter((r) => r.path.startsWith('/rest/v1/rpc/update_trip')).at(-1);
+      check('Edit: the date chosen in the calendar is saved as an ISO date, nothing else changed', saved?.body.p_end_date === '2026-12-31' && saved?.body.p_start_date === '2026-12-27' && saved?.body.p_name === 'Date Trip', JSON.stringify(saved?.body));
+      await page.goto(`${BASE}/trips/${TRIP}/edit`);
+      await byId(page, 'trip-start').waitFor({ timeout: 20000 });
+      await battery(page, b, 'Edit');
+      check('Edit: no unexpected network calls', b.unexpected.length === 0, b.unexpected.join(', '));
+      await ctx.close();
+    }
+
+    // ---------- Light and Dark ----------
+    for (const theme of ['light', 'dark'] as const) {
+      const { ctx, page } = await newContext(theme === 'dark' ? {} : {}, (b) => {
+        b.profile = { ...b.profile, theme_preference: theme };
+      });
+      if (theme === 'dark') await ctx.addInitScript(() => window.localStorage.setItem('tripmate.theme-preference', 'dark'));
+      await page.goto(`${BASE}/trips/new`);
+      await byId(page, 'trip-start').waitFor({ timeout: 20000 });
+      await byId(page, 'trip-start').fill('27122026');
+      await byId(page, 'trip-start-calendar').click();
+      await byId(page, 'date-picker').waitFor({ timeout: 5000 });
+      await page.waitForTimeout(800); // let the fade-in finish
+      const bg = (id: string) => byId(page, id).evaluate((e) => getComputedStyle(e).backgroundColor);
+      const wantSelected = theme === 'dark' ? 'rgb(127, 176, 143)' : 'rgb(31, 77, 58)';
+      const wantSurface = theme === 'dark' ? 'rgb(27, 37, 32)' : 'rgb(252, 250, 245)';
+      check(`${theme} theme: the calendar uses the theme's surface and its selected-day colour`, (await bg('date-picker')) === wantSurface && (await bg('date-picker-day-2026-12-27')) === wantSelected, `${await bg('date-picker')} / ${await bg('date-picker-day-2026-12-27')}`);
+      await shot(page, `calendar-${theme}`);
+      await ctx.close();
+    }
+
+    // ---------- phone-sized touch screen ----------
+    {
+      const { ctx, page } = await newContext({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true, deviceScaleFactor: 2 });
+      await page.goto(`${BASE}/trips/new`);
+      await byId(page, 'trip-start').waitFor({ timeout: 20000 });
+      check('Phone: no sideways scrolling on the form', await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1));
+      await byId(page, 'trip-start').tap();
+      await byId(page, 'trip-start').pressSequentially('27122026');
+      check('Phone: typing digits builds the date (27/12/2026)', (await byId(page, 'trip-start').inputValue()) === '27/12/2026');
+      check('Phone: the date boxes ask for the number keypad', (await byId(page, 'trip-start').getAttribute('inputmode')) === 'numeric' && (await byId(page, 'trip-end').getAttribute('inputmode')) === 'numeric');
+      const calBox = await byId(page, 'trip-start-calendar').boundingBox();
+      check('Phone: the calendar button is a comfortable touch target (at least 44 px)', !!calBox && calBox.width >= 44 && calBox.height >= 44, JSON.stringify(calBox));
+      await byId(page, 'trip-start-calendar').tap();
+      await byId(page, 'date-picker').waitFor({ timeout: 5000 });
+      await page.waitForTimeout(800);
+      const box = await byId(page, 'date-picker').boundingBox();
+      check('Phone: the calendar fits inside the screen', !!box && box.x >= 0 && box.x + box.width <= 390 && box.y >= 0 && box.y + box.height <= 844, JSON.stringify(box));
+      const cell = await byId(page, 'date-picker-day-2026-12-15').boundingBox();
+      check('Phone: day buttons are at least 44 px tall', !!cell && cell.height >= 44, JSON.stringify(cell));
+      await shot(page, 'calendar-phone');
+      await byId(page, 'date-picker-day-2026-12-15').tap();
+      await waitFor(async () => (await page.locator('[data-testid="date-picker"]:visible').count()) === 0);
+      check('Phone: tapping a day fills the box', (await byId(page, 'trip-start').inputValue()) === '15/12/2026', await byId(page, 'trip-start').inputValue());
+      await ctx.close();
+    }
+  } finally {
+    site.stop();
+  }
+}
+
 async function main() {
   const browser = await chromium.launch({ channel: 'msedge', headless: true });
   try {
@@ -925,6 +1702,8 @@ async function main() {
     await signedInFlows(browser);
     await tripFlows(browser);
     await detailFlows(browser);
+    await editFlows(browser);
+    await dateFlows(browser);
   } finally {
     await browser.close();
   }

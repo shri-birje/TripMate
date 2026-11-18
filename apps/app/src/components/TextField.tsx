@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, type ReactNode } from 'react';
 import { Pressable, Text, TextInput, View, type TextInputProps } from 'react-native';
 import { fontSize, radius, spacing } from '../theme/tokens';
 import { useTheme } from '../theme/ThemeProvider';
@@ -18,8 +18,13 @@ interface Props
     | 'editable'
     | 'maxLength'
     | 'multiline'
+    | 'selection'
+    | 'onSelectionChange'
+    | 'inputMode'
   > {
   label: string;
+  /** Optional button or icon shown inside the field, after the text (for example a calendar button). */
+  trailing?: ReactNode;
   error?: string | undefined;
   helper?: string | undefined;
   placeholder?: string | undefined;
@@ -28,7 +33,7 @@ interface Props
   testID?: string;
 }
 
-export function TextField({ label, error, helper, placeholder, secret = false, testID, ...input }: Props) {
+export function TextField({ label, error, helper, placeholder, secret = false, testID, trailing, ...input }: Props) {
   const { colors } = useTheme();
   const [revealed, setRevealed] = useState(false);
 
@@ -66,6 +71,7 @@ export function TextField({ label, error, helper, placeholder, secret = false, t
             fontSize: fontSize.body,
           }}
         />
+        {trailing}
         {secret && (
           <Pressable
             onPress={() => setRevealed((v) => !v)}

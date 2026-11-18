@@ -84,6 +84,8 @@ For ordinary signed-in operations (creating trips, and later changing members, e
 3. **Functions** callable only by signed-in users that identify the caller with `auth.uid()`, check membership/role/ownership, pin `search_path`, and make each change atomically.
 4. **An automatic audit** (`supabase/tests/security-audit.test.ts`) that fails if any migration breaks these rules, including an explicit allow-list of functions a signed-in user may run.
 
+**Administrator checks (M3.3):** role-restricted functions (`update_trip`, `set_trip_archived`) look up the caller's role with an internal helper (`trip_role_of`) that only counts ACTIVE members and that the app cannot call. A person who is not on the trip, or a trip that does not exist, always gets the same `trip_not_found` answer, so trip existence is never revealed; a member who is not an administrator gets `not_admin`. Edits take a row lock and check the caller's expected version in the same transaction, so a stale edit can never overwrite a newer one. Archived trips are read-only. The two functions were added to the audit allow-list as a deliberate review step.
+
 The service-role / secret key is **not used anywhere**. It may be introduced only for a specific trusted backend operation that genuinely needs elevated privileges, with a written justification and the owner's approval (see the ADR-032 conditions and checklist in the decisions log). It must never appear in the frontend, mobile app, public repository or any `EXPO_PUBLIC_` variable.
 
 ## 4. Input validation and sanitisation

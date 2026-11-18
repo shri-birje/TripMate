@@ -148,6 +148,24 @@ async function checkTrips(url: string, key: string) {
     else if (rpc.status === 404 || rpcCode === 'PGRST202') warn(`create_trip() does not exist yet. Run ${MIGRATION} in the Supabase SQL Editor.`);
     else if (rpcCode === '42501') ok('create_trip() cannot be run by signed-out visitors (permission denied)');
     else warn(`create_trip() refused a signed-out visitor, but with an unexpected code (HTTP ${rpc.status}, ${rpcCode || 'none'})`);
+
+    // ---- Milestone M3.3: edit / archive / restore, and the internal helper. None may run for a signed-out visitor.
+    // (Nothing can change: with no signed-in user these functions refuse before touching any data.)
+    const EDIT_MIGRATION = 'supabase/migrations/20261118200000_trip_edit_archive.sql';
+    const nobody = '00000000-0000-4000-8000-000000000000';
+    const probes: { name: string; args: Record<string, unknown>; mustBeClosed: boolean }[] = [
+      { name: 'update_trip', args: { p_trip_id: nobody, p_expected_version: 1, p_name: 'x', p_destination: 'y', p_start_date: '2030-01-01', p_end_date: '2030-01-02' }, mustBeClosed: true },
+      { name: 'set_trip_archived', args: { p_trip_id: nobody, p_archived: true, p_expected_version: 1 }, mustBeClosed: true },
+      { name: 'trip_role_of', args: { p_trip_id: nobody, p_user_id: nobody }, mustBeClosed: true },
+    ];
+    for (const probe of probes) {
+      const r = await call(`${url}/rest/v1/rpc/${probe.name}`, key, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(probe.args) });
+      const c = (r.body?.code as string | undefined) ?? '';
+      if (r.status >= 200 && r.status < 300) fail(`A signed-out visitor could RUN ${probe.name}(). Security rules are wrong!`);
+      else if (c === '42501') ok(`${probe.name}() cannot be run by signed-out visitors (permission denied)`);
+      else if (r.status === 404 || c === 'PGRST202') warn(`${probe.name}() is not available yet. Run ${EDIT_MIGRATION} in the Supabase SQL Editor (trip editing and archiving need it).`);
+      else warn(`${probe.name}() refused a signed-out visitor, but with an unexpected code (HTTP ${r.status}, ${c || 'none'})`);
+    }
   } catch (e) {
     fail(`Trips check failed: ${e instanceof Error ? e.name : 'error'}`);
   }

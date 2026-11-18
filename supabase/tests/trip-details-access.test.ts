@@ -219,7 +219,9 @@ describe('the read adds no new way in', () => {
       `select p.proname from pg_proc p join pg_namespace n on n.oid = p.pronamespace
         where n.nspname = 'public' and has_function_privilege('authenticated', p.oid, 'EXECUTE') order by 1`,
     )).rows.map((r) => r.proname);
-    expect(fns).toEqual(['create_trip', 'is_trip_member']); // unchanged since M3.1
+    // M3.1 had create_trip + is_trip_member. M3.3 deliberately added exactly update_trip + set_trip_archived
+    // (reviewed in security-audit.test.ts). Reading a trip still uses none of them.
+    expect(fns).toEqual(['create_trip', 'is_trip_member', 'set_trip_archived', 'update_trip']);
   });
 
   it('the details read still cannot be used to change anything', async () => {

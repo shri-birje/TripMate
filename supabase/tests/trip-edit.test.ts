@@ -456,12 +456,12 @@ describe('the helper and the trigger function are closed to the app', () => {
     }
   });
 
-  it('the app cannot learn anyone\'s role through any function: only the two new functions were added', async () => {
+  it('the callable functions are exactly the reviewed ones (M3.3 added two; M3.4 later added six, which tell a role only to members of that trip)', async () => {
     await users.asAdmin();
     const fns = (await db.query<{ proname: string }>(
       `select p.proname from pg_proc p join pg_namespace n on n.oid = p.pronamespace where n.nspname = 'public' and has_function_privilege('authenticated', p.oid, 'EXECUTE') order by 1`,
     )).rows.map((r) => r.proname);
-    expect(fns).toEqual(['create_trip', 'is_trip_member', 'set_trip_archived', 'update_trip']);
+    expect(fns).toEqual(['add_guest_member', 'create_trip', 'is_trip_member', 'leave_trip', 'list_trip_members', 'remove_member', 'rename_guest_member', 'set_member_role', 'set_trip_archived', 'update_trip']);
   });
 
   it('direct writes to trips are still denied for everyone, including administrators', async () => {

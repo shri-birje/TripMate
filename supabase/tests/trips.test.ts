@@ -263,9 +263,13 @@ describe('who can see trips and members (row-level security)', () => {
     await users.asUser(leaver);
     expect((await db.query('select id from public.trips where id = $1', [t.id])).rows).toHaveLength(1);
 
+    // A second administrator keeps the trip valid (since M3.4 the database refuses to leave a trip with no administrator).
+    const other = await users.signUp('see-other-admin@example.com', 'Other Admin');
+    await users.asAdmin();
+    await db.query(`insert into public.trip_members (trip_id, user_id, display_name, role) values ($1, $2, 'Other Admin', 'admin')`, [t.id, other]);
     for (const status of ['removed', 'left']) {
       await users.asAdmin();
-      await db.query(`update public.trip_members set status = $2 where trip_id = $1`, [t.id, status]);
+      await db.query(`update public.trip_members set status = $2 where trip_id = $1 and user_id = $3`, [t.id, status, leaver]);
       await users.asUser(leaver);
       expect((await db.query('select id from public.trips where id = $1', [t.id])).rows).toHaveLength(0);
       expect((await db.query('select id from public.trip_members where trip_id = $1', [t.id])).rows).toHaveLength(0);
@@ -346,7 +350,9 @@ describe('table rules the database enforces on its own', () => {
 
   it('only allows the known roles and statuses', async () => {
     await users.asAdmin();
-    await expect(db.query(`insert into public.trip_members (trip_id, display_name, role) values ($1, 'X', 'owner')`, [tripId])).rejects.toThrow(/trip_members_role_values/);
+    const named = await users.signUp('role-check@example.com', 'Role Check'); // a real person, so only the role rule is in play (guests have their own rule since M3.4)
+    await users.asAdmin();
+    await expect(db.query(`insert into public.trip_members (trip_id, user_id, display_name, role) values ($1, $2, 'X', 'owner')`, [tripId, named])).rejects.toThrow(/trip_members_role_values/);
     await expect(db.query(`insert into public.trip_members (trip_id, display_name, status) values ($1, 'X', 'banned')`, [tripId])).rejects.toThrow(/trip_members_status_values/);
     await expect(db.query(`insert into public.trip_members (trip_id, display_name) values ($1, '   ')`, [tripId])).rejects.toThrow(/trip_members_display_name_length/);
   });

@@ -194,7 +194,14 @@ Display states "Upcoming / Ongoing / Completed" are **derived from dates**, not 
 
 **Constraints:**
 - `UNIQUE (trip_id, user_id) WHERE user_id IS NOT NULL` — a user appears once per trip (rejoin reactivates the same row, preserving history).
-- Every active trip must keep **≥ 1 active admin** (enforced inside the write functions; a trigger is the backstop).
+- Every trip with members must keep **≥ 1 active, signed-up admin**: enforced inside the write functions **and** by a deferred constraint trigger (`trip_members_keep_admin`, checked at commit) as the backstop (M3.4 step b).
+- `CHECK (user_id IS NOT NULL OR role = 'member')` — a guest can never be an admin (`trip_members_guest_is_member`, M3.4 step b).
+- Names are unique among **active** people (ignoring case and surrounding whitespace) and at most 50 people are active per trip: enforced inside the functions (not by an index, so M3.5 joins are not blocked unexpectedly).
+- Rows are never deleted by any function: removing or leaving sets `status` and `left_at`. (Deviation from the earlier plan: no `removed_by` column; who removed someone is recorded in `trip_member_events`.)
+
+**Audit table `trip_member_events` (M3.4 step b, append-only):** `id`, `seq` (strict order), `trip_id` (cascade only), `actor_member_id`, `target_member_id` (both `trip_members.id`, so no user ids), `action` (`guest_added`, `guest_renamed`, `made_admin`, `removed_admin`, `removed`, `left`), `old_value`, `new_value`, `created_at`. Readable by current members of the trip; no insert/update/delete/truncate rights for any app role; a trigger refuses update, delete and truncate for everyone (except the automatic cascade when a whole trip is removed).
+
+**Functions (M3.4 step b), all `SECURITY DEFINER`, `search_path` pinned, `auth.uid()`, callable by signed-in users only:** `list_trip_members(trip)` (current members in full; former members with user id and role left empty), `add_guest_member(trip, name)`, `rename_guest_member(trip, member, name)`, `set_member_role(trip, member, role, expected_role)`, `remove_member(trip, member)`, `leave_trip(trip)`. Internal (not callable by the app): `member_change_context`, `name_trim`, `check_trip_has_admin`, `trip_member_events_append_only`.
 
 **Indexes:** `(trip_id, status)`, `(user_id) WHERE status = 'active'` (the "my trips" query).
 
@@ -479,7 +486,7 @@ Implemented as a SQL view/function (`trip_member_balances`) plus the TypeScript 
 | Clients cannot bypass rules | Clients have **no direct INSERT/UPDATE/DELETE** on financial tables; only service-side write functions (ADR-004) |
 | Auditable | `expense_revisions` + `activity_log`, append-only |
 
-**Removing a member** sets `status='removed'`; their rows in payers/splits/repayments remain, so history is intact. Whether a member with a non-zero balance may be removed is open question Q-4 (recommendation: block until settled or until an admin explicitly forgives the balance by recording a settlement).
+**Removing a member** sets `status='removed'`; their rows in payers/splits/repayments remain, so history is intact. A member with a non-zero balance **must not** be removable or able to leave once expenses exist: decided 2026-11-18 (Q-4, M3.4 D8), a **mandatory M5 requirement** (ADR-047); until M5 there are no balances, so M3.4 allows removal. Former members' rows are never deleted and are shown to current members as a name and a date only (ADR-049).
 
 **Deleting an account** anonymises the profile and detaches `trip_members.user_id`, converting the member into a named placeholder ("Former member"); other members' ledgers are unaffected.
 

@@ -108,12 +108,14 @@ interface FakeBackend {
   failDetails: boolean;
   /** Delay, in ms, before the details request is answered (to see the loading state). */
   slowDetailsMs: number;
-  /** Set to make the fake server wrongly send former members too (the app must still not show them). */
-  leakFormerMembers: boolean;
   /** Force the edit/archive functions to answer with this database message (or drop the connection). */
   rpcFail: null | 'network' | 'not_admin' | 'trip_not_found' | 'trip_archived' | 'version_conflict';
   /** Delay, in ms, before the edit/archive functions answer (to test double taps). */
   slowRpcMs: number;
+  /** Force the member functions (add, rename, role, remove, leave) to answer with this database message (or drop the connection). */
+  memberFail: null | string;
+  /** Delay, in ms, before the member functions answer (to test double taps). */
+  slowMemberMs: number;
 }
 
 const USER = { id: '11111111-2222-3333-4444-555555555555', email: 'asha@example.com', aud: 'authenticated', role: 'authenticated' };
@@ -149,9 +151,10 @@ function newBackend(): FakeBackend {
     failTripsList: false,
     failDetails: false,
     slowDetailsMs: 0,
-    leakFormerMembers: false,
     rpcFail: null,
     slowRpcMs: 0,
+    memberFail: null,
+    slowMemberMs: 0,
   };
 }
 
@@ -167,6 +170,7 @@ function memberRow(over: Record<string, any>): Record<string, any> {
     role: 'member',
     status: 'active',
     joined_at: '2026-11-18T10:00:00+00:00',
+    left_at: null,
     ...over,
   };
 }
@@ -220,6 +224,9 @@ function dayFromToday(offset: number): string {
 /** The same day written the way people type it in India: DD/MM/YYYY. */
 const asDmy = (iso: string) => iso.split('-').reverse().join('/');
 
+/** Counts the friends added through the fake add_guest_member, so each gets its own id. */
+let memberSeq = 0;
+
 async function installFakeSupabase(context: BrowserContext, backend: FakeBackend) {
   await context.route(/supabase\.co/, async (route: Route, request: Request) => {
     const url = new URL(request.url());
@@ -262,9 +269,7 @@ async function installFakeSupabase(context: BrowserContext, backend: FakeBackend
         const wanted = idFilter.slice(3);
         const found = backend.trips.find((t) => t.id === wanted && !t._hidden);
         if (!found) return json(200, []); // unknown trip, someone else's trip, or removed: the database says nothing
-        const activeOnly = url.searchParams.get('trip_members.status') === 'eq.active' && !backend.leakFormerMembers;
-        const members = (found._members as Record<string, any>[]).filter((m) => !activeOnly || m.status === 'active');
-        return json(200, [{ ...publicRow(found), trip_members: members }]); // arrays, exactly as the real server answers
+        return json(200, [publicRow(found)]); // the trip alone, as an array exactly as the real server answers (people come from list_trip_members)
       }
       if (backend.failTripsList) return route.abort('connectionfailed');
       return json(200, backend.trips.filter((t) => !t._hidden).map(publicRow));
@@ -289,6 +294,97 @@ async function installFakeSupabase(context: BrowserContext, backend: FakeBackend
       backend.trips.unshift(created);
       const { members: _members, ...plain } = publicRow(created);
       return json(200, plain);
+    }
+    // ---- list_trip_members: current people in full, former people WITHOUT user id or role; nothing at all for someone not on the trip.
+    if (url.pathname === '/rest/v1/rpc/list_trip_members' && method === 'POST') {
+      if (backend.failDetails) return route.abort('connectionfailed');
+      if (backend.slowDetailsMs > 0) await new Promise((r) => setTimeout(r, backend.slowDetailsMs));
+      const t = backend.trips.find((x) => x.id === body.p_trip_id && !x._hidden);
+      const ms = ((t?._members ?? []) as Record<string, any>[]);
+      if (!t || !ms.some((m) => m.user_id === USER.id && m.status === 'active')) return json(200, []);
+      return json(
+        200,
+        ms.map((m) => ({
+          member_id: m.id,
+          user_id: m.status === 'active' ? m.user_id : null,
+          display_name: m.display_name,
+          role: m.status === 'active' ? m.role : null,
+          status: m.status,
+          joined_at: m.joined_at,
+          left_at: m.left_at ?? null,
+          is_guest: m.user_id === null,
+        })),
+      );
+    }
+    // ---- the five member functions: the fake enforces the SAME rules as the real database functions.
+    const memberFn = url.pathname.replace('/rest/v1/rpc/', '');
+    if (url.pathname.startsWith('/rest/v1/rpc/') && ['add_guest_member', 'rename_guest_member', 'set_member_role', 'remove_member', 'leave_trip'].includes(memberFn) && method === 'POST') {
+      const failWith = (message: string) => json(400, { code: 'P0001', message, details: null, hint: null });
+      if (backend.memberFail === 'network') return route.abort('connectionfailed');
+      if (backend.slowMemberMs > 0) await new Promise((r) => setTimeout(r, backend.slowMemberMs));
+      if (backend.memberFail) return failWith(backend.memberFail);
+
+      const t = backend.trips.find((x) => x.id === body.p_trip_id && !x._hidden);
+      const ms = ((t?._members ?? []) as Record<string, any>[]);
+      const me = ms.find((m) => m.user_id === USER.id && m.status === 'active');
+      if (!t || !me) return failWith('trip_not_found');
+      const leaving = memberFn === 'leave_trip';
+      if (!leaving && me.role !== 'admin') return failWith('not_admin');
+      if (!leaving && t.status === 'archived') return failWith('trip_archived');
+
+      const clean = (v: unknown) => String(v ?? '').replace(/^[\s\u00a0]+|[\s\u00a0]+$/g, '');
+      const otherAdmins = (exceptId: string) => ms.some((x) => x.id !== exceptId && x.role === 'admin' && x.status === 'active' && x.user_id !== null);
+      const clash = (name: string, exceptId?: string) => ms.some((x) => x.status === 'active' && x.id !== exceptId && clean(x.display_name).toLowerCase() === name.toLowerCase());
+      const done = (m: Record<string, any>, changed: boolean) => {
+        t.members = ms.map((x) => ({ id: x.id, status: x.status })); // the head-count the trip list shows
+        return json(200, [{ member_id: m.id, changed }]);
+      };
+      const target = ms.find((m) => m.id === body.p_member_id);
+
+      if (memberFn === 'add_guest_member') {
+        const name = clean(body.p_display_name);
+        if (name.length < 1 || name.length > 60) return failWith('invalid_request');
+        if (ms.filter((m) => m.status === 'active').length >= 50) return failWith('trip_full');
+        if (clash(name)) return failWith('name_taken');
+        const created = memberRow({ id: uuid(9500 + ++memberSeq), user_id: null, display_name: name, role: 'member', status: 'active', joined_at: new Date().toISOString() });
+        ms.push(created);
+        return done(created, true);
+      }
+      if (memberFn === 'rename_guest_member') {
+        if (!target || target.status !== 'active') return failWith('member_not_found');
+        if (target.user_id !== null) return failWith('cannot_rename');
+        const name = clean(body.p_display_name);
+        if (name.length < 1 || name.length > 60) return failWith('invalid_request');
+        if (target.display_name === name) return done(target, false);
+        if (clash(name, target.id)) return failWith('name_taken');
+        target.display_name = name;
+        return done(target, true);
+      }
+      if (memberFn === 'set_member_role') {
+        if (!['admin', 'member'].includes(body.p_role) || !['admin', 'member'].includes(body.p_expected_role)) return failWith('invalid_request');
+        if (!target || target.status !== 'active') return failWith('member_not_found');
+        if (target.role === body.p_role) return done(target, false);
+        if (target.role !== body.p_expected_role) return failWith('member_changed');
+        if (body.p_role === 'admin' && target.user_id === null) return failWith('guest_cannot_be_admin');
+        if (body.p_role === 'member' && !otherAdmins(target.id)) return failWith('last_admin');
+        target.role = body.p_role;
+        return done(target, true);
+      }
+      if (memberFn === 'remove_member') {
+        if (!target) return failWith('member_not_found');
+        if (target.id === me.id) return failWith('use_leave_instead');
+        if (target.status !== 'active') return done(target, false);
+        if (target.role === 'admin' && !otherAdmins(target.id)) return failWith('last_admin');
+        target.status = 'removed';
+        target.left_at = new Date().toISOString();
+        return done(target, true);
+      }
+      // leave_trip
+      if (me.role === 'admin' && !otherAdmins(me.id)) return failWith('last_admin');
+      me.status = 'left';
+      me.left_at = new Date().toISOString();
+      t._hidden = true; // the person can no longer see the trip at all
+      return done(me, true);
     }
     // ---- update_trip / set_trip_archived: the fake enforces the SAME rules as the real database functions.
     if ((url.pathname === '/rest/v1/rpc/update_trip' || url.pathname === '/rest/v1/rpc/set_trip_archived') && method === 'POST') {
@@ -761,6 +857,7 @@ async function detailFlows(browser: Awaited<ReturnType<typeof chromium.launch>>)
     const CREATOR_LEFT = uuid(4);
     const ARCHIVED = uuid(5);
     const HIDDEN = uuid(6); // exists, but belongs to someone else
+    const PLAIN = uuid(7); // you are an ordinary member here, and someone left
     const UNKNOWN = uuid(999); // does not exist at all
     const startIso = dayFromToday(30);
     const endIso = dayFromToday(33);
@@ -777,8 +874,18 @@ async function detailFlows(browser: Awaited<ReturnType<typeof chromium.launch>>)
           memberRow({ id: 'g2', user_id: '22222222-2222-4222-8222-222222222222', display_name: 'Ravi Kumar', joined_at: '2026-11-18T11:00:00+00:00' }),
           memberRow({ id: 'g1', user_id: USER.id, display_name: 'Asha Rao', role: 'admin', joined_at: '2026-11-18T10:00:00+00:00' }),
           memberRow({ id: 'g3', user_id: null, display_name: 'Gita (guest)', joined_at: '2026-11-18T12:00:00+00:00' }),
-          memberRow({ id: 'g4', user_id: '44444444-4444-4444-8444-444444444444', display_name: 'Removed Rahul', status: 'removed' }),
-          memberRow({ id: 'g5', user_id: '55555555-5555-4555-8555-555555555555', display_name: 'Departed Dev', status: 'left' }),
+          memberRow({ id: 'g4', user_id: '44444444-4444-4444-8444-444444444444', display_name: 'Removed Rahul', role: 'admin', status: 'removed', left_at: '2026-11-20T10:00:00+00:00' }),
+          memberRow({ id: 'g5', user_id: '55555555-5555-4555-8555-555555555555', display_name: 'Departed Dev', status: 'left', left_at: '2026-11-21T10:00:00+00:00' }),
+          memberRow({ id: 'g6', user_id: null, display_name: 'Departed Guest Gopal', status: 'removed', left_at: '2026-11-19T10:00:00+00:00' }),
+        ],
+      }),
+      tripRow({
+        id: PLAIN, name: 'Plain Member Trip', destination: 'Udaipur', start_date: startIso, end_date: endIso,
+        members: [{ id: 'p1', status: 'active' }, { id: 'p2', status: 'active' }],
+        _members: [
+          memberRow({ id: 'p1', user_id: OTHER, display_name: 'Boss Bhavna', role: 'admin' }),
+          memberRow({ id: 'p2', user_id: USER.id, display_name: 'Asha Rao' }),
+          memberRow({ id: 'p3', user_id: '66666666-6666-4666-8666-666666666666', display_name: 'A Former Friend With An Extremely Long Name That Must Wrap Neatly On A Phone Screen', status: 'left', left_at: '2026-11-22T10:00:00+00:00' }),
         ],
       }),
       tripRow({ id: MINIMAL, name: 'Minimal Trip', destination: 'Lonavala', start_date: startIso, end_date: startIso }),
@@ -800,6 +907,7 @@ async function detailFlows(browser: Awaited<ReturnType<typeof chromium.launch>>)
       await page.goto(`${BASE}/trips/${id}`);
       return byId(page, waitFor).waitFor({ timeout: 20000 }).then(() => true, () => false);
     };
+    const exists = async (id: string) => (await byId(page, id).count()) > 0;
 
     // ---- open from Home
     await page.goto(BASE);
@@ -822,15 +930,33 @@ async function detailFlows(browser: Awaited<ReturnType<typeof chromium.launch>>)
     check('lists current people, administrators first', people.indexOf('Asha Rao') < people.indexOf('Ravi Kumar') && people.indexOf('Ravi Kumar') < people.indexOf('Gita (guest)'), people);
     check('marks the administrator, yourself and a guest', (await textOf('member-g1')).includes('Admin') && (await textOf('member-g1')).includes('You') && !(await textOf('member-g2')).includes('Admin') && (await textOf('member-g3')).includes('Guest'));
     const all = await body();
-    check('former members (removed, left) are not shown', !/Removed Rahul|Departed Dev/.test(all));
+    check('former members are not in the people list or its count', !/Removed Rahul|Departed Dev|Departed Guest/.test(people) && !/Admin/.test(await textOf('trip-people').then((t) => t.replace(/Asha Rao Admin You/, ''))));
+    check('says what your role is (administrator)', (await textOf('trip-my-role')) === 'You are an admin of this trip.');
+    check('the former members list is collapsed at first: no former name is visible', (await byId(page, 'former-toggle').isVisible()) && !/Removed Rahul|Departed Dev|Departed Guest/.test(all));
     check('privacy: no email addresses or UPI IDs anywhere on the page', !/@|example\.com|okhdfcbank|upi/i.test(all.replace(/\bTripMate\b/g, '')), all.slice(0, 200));
     const req = detailRequests(GOA)[0];
     const decoded = decodeURIComponent(req?.path ?? '').replace(/\+/g, ' ');
-    check('the request names its columns (no "select everything")', !!req && !decoded.includes('select=*') && decoded.includes('display_name') && decoded.includes('trip_members('), decoded.slice(0, 160));
-    check('the request asks only for CURRENT members', decoded.includes('trip_members.status=eq.active'), decoded);
+    check('the request names its columns (no "select everything") and asks the trips table for no members', !!req && !decoded.includes('select=*') && decoded.includes('destination') && !decoded.includes('trip_members'), decoded.slice(0, 160));
+    const listReqs = backend.requests.filter((r) => r.method === 'POST' && r.path === '/rest/v1/rpc/list_trip_members' && r.body?.p_trip_id === GOA);
+    check('the people come from list_trip_members, which is sent only the trip id', listReqs.length >= 1 && JSON.stringify(listReqs[0]!.body) === JSON.stringify({ p_trip_id: GOA }), JSON.stringify(listReqs[0]?.body));
     check('the request never touches profiles or emails', !/profiles|email|upi/i.test(decoded));
     check('it carries the user\'s login, not a secret key', !!req?.auth?.startsWith('Bearer ') && !req.auth.includes('sb_secret'));
     await shot(page, 'details-light');
+
+    // ---- former members (read-only list)
+    const dmy = (iso: string) => { const d = new Date(iso); const day = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; return formatDateRange(day, day); };
+    check('the toggle names the count and is collapsed', (await textOf('former-toggle')).includes('Former members (3)') && (await byId(page, 'former-toggle').getAttribute('aria-expanded')) === 'false');
+    await byId(page, 'former-toggle').click();
+    check('opening it expands (aria-expanded) and shows the former members', (await byId(page, 'former-toggle').getAttribute('aria-expanded')) === 'true' && (await byId(page, 'former-members').isVisible()));
+    const former = await textOf('former-members');
+    check('lists most recent first: Dev, Rahul, then the guest', former.indexOf('Departed Dev') < former.indexOf('Removed Rahul') && former.indexOf('Removed Rahul') < former.indexOf('Departed Guest Gopal'), former);
+    check('each says how and when they left, in the viewer\'s day', (await textOf('former-note-g5')) === `Left ${dmy('2026-11-21T10:00:00+00:00')}` && (await textOf('former-note-g4')) === `Removed ${dmy('2026-11-20T10:00:00+00:00')}` && (await textOf('former-note-g6')) === `Removed ${dmy('2026-11-19T10:00:00+00:00')}`);
+    check('a former guest is marked Guest; a former admin shows no Admin/You tag', (await textOf('former-g6')).includes('Guest') && !/Admin|You/.test(await textOf('former-g4')));
+    check('the former members are not counted in "People (3)", and still no one gets a role from this list', await vis(page, 'People (3)').isVisible());
+    check('privacy: the list shows no email, UPI or user ids', !/@|upi|okhdfcbank|[0-9a-f]{8}-[0-9a-f]{4}-/i.test(former), former);
+    await shot(page, 'details-former-light');
+    await byId(page, 'former-toggle').click();
+    check('closing it hides them again', !/Removed Rahul|Departed Dev/.test(await body()) && (await byId(page, 'former-toggle').getAttribute('aria-expanded')) === 'false');
 
     // ---- back, deep link, reload
     await byId(page, 'trip-back-home').click();
@@ -883,11 +1009,20 @@ async function detailFlows(browser: Awaited<ReturnType<typeof chromium.launch>>)
     check('...then the trip appears', await byId(page, 'trip-title').waitFor({ timeout: 10000 }).then(() => true, () => false));
     backend.slowDetailsMs = 0;
 
-    // ---- a misbehaving server cannot make former members appear
-    backend.leakFormerMembers = true;
-    await open(GOA);
-    check('even if the server wrongly sent former members, they are not shown', !/Removed Rahul|Departed Dev/.test(await body()) && (await vis(page, 'People (3)').isVisible()));
-    backend.leakFormerMembers = false;
+    // ---- an ordinary member sees their role and the same former-member list, and no admin controls
+    await open(PLAIN);
+    check('an ordinary member is told they are a member (not an admin) and sees no admin controls', (await textOf('trip-my-role')) === 'You are a member of this trip.' && !(await exists('trip-edit')) && !(await exists('trip-archive')));
+    check('the administrator is tagged; you are tagged You; the heading counts the two current people', (await textOf('member-p1')).includes('Admin') && (await textOf('member-p2')).includes('You') && (await vis(page, 'People (2)').isVisible()));
+    await byId(page, 'former-toggle').click();
+    check('a member sees the former members too, with their note', (await textOf('former-p3')).includes('A Former Friend') && (await textOf('former-note-p3')).startsWith('Left '));
+    await page.setViewportSize({ width: 360, height: 780 });
+    check('phone width: a very long former name wraps; no sideways scrolling', await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1));
+    check('phone width: the toggle is a comfortable touch target (44 px)', ((await byId(page, 'former-toggle').boundingBox())?.height ?? 0) >= 44);
+    await shot(page, 'details-former-phone');
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await open(MINIMAL);
+    check('a trip nobody has left shows no "Former members" section', !(await exists('section-former')));
+
 
     check('no unexpected network calls on the details pages', backend.unexpected.length === 0, backend.unexpected.join(', '));
     await context.close();
@@ -921,6 +1056,9 @@ async function detailFlows(browser: Awaited<ReturnType<typeof chromium.launch>>)
       await byId(p, 'trip-title').waitFor({ timeout: 20000 });
       check('the details page follows the Dark theme', await waitFor(async () => (await screenBg(p)) === DARK_BG));
       await shot(p, 'details-dark');
+      await byId(p, 'former-toggle').click();
+      check('Dark theme: the former members list opens and is readable', (await byId(p, 'former-members').isVisible()) && (await byId(p, 'former-note-g5').innerText()).startsWith('Left '));
+      await shot(p, 'details-former-dark');
       await dark.close();
     }
 
@@ -1694,16 +1832,379 @@ async function dateFlows(browser: Awaited<ReturnType<typeof chromium.launch>>) {
   }
 }
 
+async function memberFlows(browser: Awaited<ReturnType<typeof chromium.launch>>) {
+  console.log('\nK. People: add a friend, rename, roles, remove, leave');
+  const site = await startWebsite({ EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY: DUMMY_PUBLISHABLE_KEY, EXPO_PUBLIC_SUPABASE_URL: SUPABASE_URL });
+  try {
+    const ID = { me: uuid(9001), ravi: uuid(9002), priya: uuid(9003), gita: uuid(9004), boss: uuid(9005), dev: uuid(9006), gopal: uuid(9007), longg: uuid(9008), ila: uuid(9009) } as const;
+    const T = {
+      A: uuid(501), MEM: uuid(502), ARCH: uuid(503), FULL: uuid(504), LEAVE: uuid(505), LEAVEARCH: uuid(506),
+      FAIL: uuid(507), STALE: uuid(508), DOUBLE: uuid(509), PHONE: uuid(510), DARK: uuid(511),
+    };
+    const RAVI = '22222222-2222-4222-8222-222222222222';
+    const PRIYA = '33333333-3333-4333-8333-333333333333';
+    const BOSS = '88888888-8888-4888-8888-888888888888';
+    const DEV = '55555555-5555-4555-8555-555555555555';
+    const mine = (id: string, role = 'admin') => memberRow({ id, user_id: USER.id, display_name: 'Asha Rao', role, joined_at: '2026-11-18T09:00:00+00:00' });
+    const ravi = (id: string = ID.ravi) => memberRow({ id, user_id: RAVI, display_name: 'Ravi Kumar', joined_at: '2026-11-18T10:00:00+00:00' });
+    const priya = (id: string = ID.priya) => memberRow({ id, user_id: PRIYA, display_name: 'Priya Shah', role: 'admin', joined_at: '2026-11-18T10:30:00+00:00' });
+    const gita = (id: string = ID.gita) => memberRow({ id, user_id: null, display_name: 'Gita', joined_at: '2026-11-18T11:00:00+00:00' });
+    const boss = (id: string = ID.boss) => memberRow({ id, user_id: BOSS, display_name: 'Boss Bhavna', role: 'admin', joined_at: '2026-11-18T08:00:00+00:00' });
+    const dev = () => memberRow({ id: ID.dev, user_id: DEV, display_name: 'Departed Dev', role: 'admin', status: 'left', left_at: '2026-11-15T10:00:00+00:00' });
+    const start = dayFromToday(20);
+    const end = dayFromToday(23);
+    const trip = (id: string, name: string, members: Record<string, any>[], over: Record<string, any> = {}) =>
+      tripRow({ id, name, destination: 'Place', start_date: start, end_date: end, members: members.filter((m) => m.status === 'active').map((m) => ({ id: m.id, status: m.status })), _members: members, ...over });
+
+    const seed = () => [
+      trip(T.A, 'People Trip', [mine(ID.me), ravi(), priya(), gita(), dev()]),
+      trip(T.MEM, 'Member View Trip', [mine(ID.me, 'member'), boss(), memberRow({ id: ID.gopal, user_id: null, display_name: 'Gopal' })]),
+      trip(T.ARCH, 'Archived People', [mine(ID.me), ravi(), priya()], { status: 'archived' }),
+      trip(T.FULL, 'Full Trip', [mine(ID.me), ...Array.from({ length: 49 }, (_, i) => memberRow({ id: uuid(9100 + i), user_id: null, display_name: `Guest ${i + 2}` }))]),
+      trip(T.LEAVE, 'Leave Trip', [mine(ID.me, 'member'), boss(), ravi()]),
+      trip(T.LEAVEARCH, 'Leave Archived', [mine(ID.me, 'member'), boss()], { status: 'archived' }),
+      trip(T.FAIL, 'Failure Trip', [mine(ID.me), ravi(), priya(), gita()]),
+      trip(T.STALE, 'Stale Trip', [mine(ID.me), priya()]),
+      trip(T.DOUBLE, 'Double Tap Trip', [mine(ID.me), ravi(), gita()]),
+      trip(T.PHONE, 'Phone Trip', [mine(ID.me), ravi(), memberRow({ id: ID.longg, user_id: null, display_name: 'A Friend With An Extremely Long Name That Must Wrap Neatly On A Phone Screen' })]),
+      trip(T.DARK, 'Dark Trip', [mine(ID.me), ravi(), priya(), dev()]),
+    ];
+
+    const context = await browser.newContext();
+    const backend = newBackend();
+    backend.trips = seed();
+    await installFakeSupabase(context, backend);
+    await sessionInStorage(context);
+    const page = await context.newPage();
+    let lastList = null as any[] | null;
+    page.on('response', async (r) => {
+      if (r.url().includes('/rpc/list_trip_members')) lastList = await r.json().catch(() => null);
+    });
+
+    const row = (trip: string) => backend.trips.find((t) => t.id === trip)!;
+    const people = (trip: string) => row(trip)._members as Record<string, any>[];
+    const calls = (fn: string) => backend.requests.filter((r) => r.method === 'POST' && r.path === `/rest/v1/rpc/${fn}`);
+    const allMemberCalls = () => ['add_guest_member', 'rename_guest_member', 'set_member_role', 'remove_member', 'leave_trip'].flatMap(calls);
+    const text = async (id: string) => (await byId(page, id).innerText().catch(() => '')).replace(/\s+/g, ' ').trim();
+    const exists = async (id: string) => (await byId(page, id).count()) > 0;
+    const go = async (id: string, wait = 'trip-people') => {
+      await page.goto(`${BASE}/trips/${id}`);
+      return byId(page, wait).waitFor({ timeout: 20000 }).then(() => true, () => false);
+    };
+    const settle = (fn: () => Promise<boolean> | boolean) => waitFor(fn, 8000);
+    const dialogGone = () => waitFor(async () => !(await exists('confirm-dialog')));
+    const isoToday = dayFromToday(0);
+    const todayNote = formatDateRange(isoToday, isoToday);
+    /** Opens a person's actions (and closes anyone else's); leaves them open if they already are. */
+    const manage = async (id: string) => {
+      if (!(await exists(`member-actions-${id}`))) await byId(page, `member-manage-${id}`).click();
+      await byId(page, `member-actions-${id}`).waitFor({ timeout: 5000 });
+    };
+    const confirmDialog = () => byId(page, 'confirm-dialog').waitFor({ timeout: 5000 });
+
+    // =============== an administrator's view ===============
+    check('opens a trip as an administrator', await go(T.A));
+    check('the heading counts only current people (4)', await vis(page, 'People (4)').isVisible());
+    check('says you are an admin', (await text('trip-my-role')) === 'You are an admin of this trip.');
+    for (const name of ['ravi', 'priya', 'gita', 'me'] as const) check(`a Manage button is offered for ${name}`, await exists(`member-manage-${ID[name]}`));
+    check('accessibility: Manage buttons name the person and report expanded/collapsed', (await byId(page, `member-manage-${ID.ravi}`).getAttribute('aria-label')) === 'Manage Ravi Kumar' && (await byId(page, `member-manage-${ID.ravi}`).getAttribute('aria-expanded')) === 'false');
+    await manage(ID.ravi);
+    check('for an ordinary member: Make admin and Remove only (no rename, no admin rights)', (await exists(`member-make-admin-${ID.ravi}`)) && (await exists(`member-remove-${ID.ravi}`)) && !(await exists(`member-rename-${ID.ravi}`)) && !(await exists(`member-remove-admin-${ID.ravi}`)));
+    check('...and Manage reports expanded', (await byId(page, `member-manage-${ID.ravi}`).getAttribute('aria-expanded')) === 'true');
+    await manage(ID.priya);
+    check('for another admin: Remove admin rights and Remove (no Make admin)', (await exists(`member-remove-admin-${ID.priya}`)) && (await exists(`member-remove-${ID.priya}`)) && !(await exists(`member-make-admin-${ID.priya}`)));
+    await manage(ID.gita);
+    check('for a guest: Rename and Remove, never Make admin', (await exists(`member-rename-${ID.gita}`)) && (await exists(`member-remove-${ID.gita}`)) && !(await exists(`member-make-admin-${ID.gita}`)));
+    await manage(ID.me);
+    check('for yourself: only Remove admin rights (another admin exists); you cannot remove yourself', (await exists(`member-remove-admin-${ID.me}`)) && !(await exists(`member-remove-${ID.me}`)) && !(await exists(`member-make-admin-${ID.me}`)));
+    await byId(page, `member-manage-${ID.me}`).click();
+    check('the add-a-friend box and an enabled Leave trip are offered', (await exists('add-guest-name')) && (await byId(page, 'leave-trip').getAttribute('aria-disabled')) !== 'true');
+    await shot(page, 'people-admin-light');
+
+    // =============== add a friend ===============
+    const sentBefore = calls('add_guest_member').length;
+    await byId(page, 'add-guest-submit').click();
+    check('an empty name is refused on the spot, with no request', (await vis(page, 'Enter a name').isVisible()) && calls('add_guest_member').length === sentBefore);
+    await byId(page, 'add-guest-name').fill('RAVI KUMAR');
+    await byId(page, 'add-guest-submit').click();
+    check('a name someone already has (any case) is refused on the spot, with no request', (await vis(page, 'Someone on this trip already has that name. Use a different name.').isVisible()) && calls('add_guest_member').length === sentBefore);
+    await byId(page, 'add-guest-name').fill('  Hari  ');
+    await byId(page, 'add-guest-submit').click();
+    check('adding a friend sends exactly the trip and the trimmed name (no user id)', await settle(() => calls('add_guest_member').length === sentBefore + 1) && JSON.stringify(calls('add_guest_member').at(-1)!.body) === JSON.stringify({ p_trip_id: T.A, p_display_name: 'Hari' }), JSON.stringify(calls('add_guest_member').at(-1)?.body));
+    check('the friend appears (tagged Guest), the count goes up and the box is cleared', (await vis(page, 'People (5)').waitFor({ timeout: 8000 }).then(() => true, () => false)) && (await text('trip-people')).includes('Hari') && (await text(`member-${uuid(9501)}`)).includes('Guest') && (await byId(page, 'add-guest-name').inputValue()) === '');
+    check('a confirmation is shown', (await text('people-notice')) === 'Added to the trip.');
+
+    // someone else added "Ila" meanwhile: this screen does not know yet, the database refuses, and the list refreshes
+    people(T.A).push(memberRow({ id: ID.ila, user_id: null, display_name: 'Ila' }));
+    await byId(page, 'add-guest-name').fill('ila');
+    await byId(page, 'add-guest-submit').click();
+    check('if the database refuses a duplicate the screen did not know about, the message sits by the box', await byId(page, 'add-guest-name').waitFor().then(async () => (await vis(page, 'Someone on this trip already has that name. Use a different name.').waitFor({ timeout: 8000 }).then(() => true, () => false))));
+    check('...and the list refreshes to show the newcomer', (await vis(page, 'People (6)').waitFor({ timeout: 8000 }).then(() => true, () => false)) && (await text('trip-people')).includes('Ila'));
+    await byId(page, 'add-guest-name').fill('');
+
+    // =============== rename a friend ===============
+    await manage(ID.gita);
+    await byId(page, `member-rename-${ID.gita}`).click();
+    check('Rename opens a box with the current name', (await byId(page, `rename-input-${ID.gita}`).inputValue()) === 'Gita');
+    const renamesBefore = calls('rename_guest_member').length;
+    await byId(page, `rename-cancel-${ID.gita}`).click();
+    check('Cancel changes nothing and sends nothing', !(await exists(`rename-input-${ID.gita}`)) && calls('rename_guest_member').length === renamesBefore && (await text(`member-${ID.gita}`)).includes('Gita'));
+    await manage(ID.gita);
+    await byId(page, `member-rename-${ID.gita}`).click();
+    await byId(page, `rename-input-${ID.gita}`).fill('ravi kumar');
+    await byId(page, `rename-save-${ID.gita}`).click();
+    check('a name someone else has is refused on the spot, with no request', (await vis(page, 'Someone on this trip already has that name. Use a different name.').isVisible()) && calls('rename_guest_member').length === renamesBefore);
+    await byId(page, `rename-input-${ID.gita}`).fill('Geeta');
+    await byId(page, `rename-save-${ID.gita}`).click();
+    check('renaming sends exactly the trip, the person and the new name', await settle(() => calls('rename_guest_member').length === renamesBefore + 1) && JSON.stringify(calls('rename_guest_member').at(-1)!.body) === JSON.stringify({ p_trip_id: T.A, p_member_id: ID.gita, p_display_name: 'Geeta' }), JSON.stringify(calls('rename_guest_member').at(-1)?.body));
+    check('the new name shows and a confirmation appears', (await settle(async () => (await text(`member-${ID.gita}`)).includes('Geeta'))) && (await text('people-notice')) === 'Name changed.');
+    check('signed-up people cannot be renamed: no Rename button for them', await (async () => { await manage(ID.ravi); return !(await exists(`member-rename-${ID.ravi}`)); })());
+    await byId(page, `member-manage-${ID.ravi}`).click();
+
+    // =============== make admin / remove admin rights ===============
+    await manage(ID.ravi);
+    await byId(page, `member-make-admin-${ID.ravi}`).click();
+    await confirmDialog();
+    check('Make admin asks first, in plain words', (await text('confirm-title')) === 'Make Ravi Kumar an admin?' && /edit and archive this trip, add and remove people/.test(await text('confirm-message')));
+    const rolesBefore = calls('set_member_role').length;
+    await byId(page, 'confirm-cancel').click();
+    check('Cancel makes no change and sends nothing', (await dialogGone()) && calls('set_member_role').length === rolesBefore && !(await text(`member-${ID.ravi}`)).includes('Admin'));
+    await manage(ID.ravi);
+    await byId(page, `member-make-admin-${ID.ravi}`).click();
+    await byId(page, 'confirm-confirm').click();
+    check('confirming sends the role asked for AND the role the person was seen in', await settle(() => calls('set_member_role').length === rolesBefore + 1) && JSON.stringify(calls('set_member_role').at(-1)!.body) === JSON.stringify({ p_trip_id: T.A, p_member_id: ID.ravi, p_role: 'admin', p_expected_role: 'member' }), JSON.stringify(calls('set_member_role').at(-1)?.body));
+    check('the Admin tag appears, the dialog closes and a confirmation shows', (await settle(async () => (await text(`member-${ID.ravi}`)).includes('Admin'))) && (await dialogGone()) && (await text('people-notice')) === 'Ravi Kumar is now an admin.');
+
+    await manage(ID.priya);
+    await byId(page, `member-remove-admin-${ID.priya}`).click();
+    check('Remove admin rights asks first', (await text('confirm-title')) === 'Remove Priya Shah as admin?');
+    await byId(page, 'confirm-confirm').click();
+    check('...and sends the member role, having seen an admin', await settle(() => calls('set_member_role').length === rolesBefore + 2) && JSON.stringify(calls('set_member_role').at(-1)!.body) === JSON.stringify({ p_trip_id: T.A, p_member_id: ID.priya, p_role: 'member', p_expected_role: 'admin' }));
+    check('the Admin tag goes away', await settle(async () => !(await text(`member-${ID.priya}`)).includes('Admin')));
+
+    // =============== remove someone ===============
+    await manage(ID.ravi);
+    await byId(page, `member-remove-${ID.ravi}`).click();
+    check('Remove explains that history is kept and that they will be listed as a former member', (await text('confirm-title')) === 'Remove Ravi Kumar from this trip?' && /Former members/.test(await text('confirm-message')) && /stays in the trip's history/.test(await text('confirm-message')));
+    const removesBefore = calls('remove_member').length;
+    await byId(page, 'confirm-confirm').click();
+    check('confirming sends exactly the trip and the person', await settle(() => calls('remove_member').length === removesBefore + 1) && JSON.stringify(calls('remove_member').at(-1)!.body) === JSON.stringify({ p_trip_id: T.A, p_member_id: ID.ravi }));
+    check('they leave the people list and the count drops', (await vis(page, 'People (5)').waitFor({ timeout: 8000 }).then(() => true, () => false)) && !(await text('trip-people')).includes('Ravi Kumar'));
+    check('they appear under Former members (now 2) as "Removed" today', (await text('former-toggle')).includes('Former members (2)'));
+    await byId(page, 'former-toggle').click();
+    check('...with the removal day', (await text(`former-note-${ID.ravi}`)) === `Removed ${todayNote}`, await text(`former-note-${ID.ravi}`));
+    await page.waitForTimeout(300);
+    check('privacy: the list the server sent has no user id or role for any former member', Array.isArray(lastList) && lastList!.filter((r: any) => r.status !== 'active').length === 2 && lastList!.filter((r: any) => r.status !== 'active').every((r: any) => r.user_id === null && r.role === null), JSON.stringify(lastList?.filter((r: any) => r.status !== 'active')));
+    check('privacy: no user id of a former member is anywhere on the page', !(await page.locator('body').innerHTML()).includes(RAVI) && !(await page.locator('body').innerHTML()).includes(DEV));
+    await byId(page, 'former-toggle').click();
+
+    // =============== the only admin ===============
+    // Active now: me (admin), priya (member), gita, hari, ila.  Only I am an admin.
+    check('as the only admin, nothing at all is offered on me (no Manage button: I cannot step down, remove or promote myself)', !(await exists(`member-manage-${ID.me}`)));
+    check('Leave trip is disabled, with the reason', ((await byId(page, 'leave-trip').getAttribute('aria-disabled')) === 'true') && (await text('leave-blocked')) === 'You are the only admin, so you cannot leave yet. Make someone else an admin first.');
+    const leavesBefore = calls('leave_trip').length;
+    await byId(page, 'leave-trip').click({ force: true, timeout: 1500 }).catch(() => {});
+    check('pressing the disabled button sends nothing and opens nothing', calls('leave_trip').length === leavesBefore && !(await exists('confirm-dialog')));
+    await manage(ID.priya);
+    await byId(page, `member-make-admin-${ID.priya}`).click();
+    await byId(page, 'confirm-confirm').click();
+    check('after naming a second admin, the first may step down', await settle(async () => (await text(`member-${ID.priya}`)).includes('Admin')) && (await exists(`member-manage-${ID.me}`)));
+    await manage(ID.me);
+    await byId(page, `member-remove-admin-${ID.me}`).click();
+    check('stepping down is explained (you lose the ability to manage)', (await text('confirm-title')) === 'Step down as admin?' && /no longer be able to manage/.test(await text('confirm-message')));
+    await byId(page, 'confirm-confirm').click();
+    check('afterwards you are an ordinary member: role line changes and all admin controls disappear', (await settle(async () => (await text('trip-my-role')) === 'You are a member of this trip.')) && !(await exists('add-guest-name')) && !(await exists(`member-manage-${ID.priya}`)) && !(await exists(`member-manage-${ID.me}`)));
+    await shot(page, 'people-member-light');
+
+    // =============== leaving (an administrator who is no longer needed, now an ordinary member) ===============
+    await byId(page, 'leave-trip').click();
+    check('Leave asks first and says what is kept', (await text('confirm-title')) === 'Leave this trip?' && /stays in the trip's history/.test(await text('confirm-message')));
+    await byId(page, 'confirm-cancel').click();
+    check('Cancel keeps you on the trip and sends nothing', (await dialogGone()) && calls('leave_trip').length === leavesBefore && pathOf(page) === `/trips/${T.A}`);
+    await byId(page, 'leave-trip').click();
+    await byId(page, 'confirm-confirm').click();
+    check('confirming sends only the trip', await settle(() => calls('leave_trip').length === leavesBefore + 1) && JSON.stringify(calls('leave_trip').at(-1)!.body) === JSON.stringify({ p_trip_id: T.A }));
+    check('you land on Home, and the trip is no longer in your list', (await byId(page, 'greeting').waitFor({ timeout: 8000 }).then(() => true, () => false)) && pathOf(page) === '/' && !(await exists(`trip-card-${T.A}`)));
+    check('opening that trip again gives the single "not available" message', await go(T.A, 'trip-unavailable'));
+
+    // =============== an ordinary member ===============
+    check('opens a trip as an ordinary member', await go(T.MEM));
+    check('a member sees their role and no management controls at all', (await text('trip-my-role')) === 'You are a member of this trip.' && !(await exists('add-guest-name')) && !(await page.locator('[data-testid^="member-manage-"]').count()));
+    check('...but can leave', (await byId(page, 'leave-trip').getAttribute('aria-disabled')) !== 'true');
+    await go(T.LEAVE);
+    await byId(page, 'leave-trip').click();
+    await byId(page, 'confirm-confirm').click();
+    check('an ordinary member can leave, and goes Home', (await byId(page, 'greeting').waitFor({ timeout: 8000 }).then(() => true, () => false)) && people(T.LEAVE).find((m) => m.id === ID.me)!.status === 'left');
+
+    // =============== archived trips ===============
+    await go(T.ARCH);
+    check('on an archived trip an admin sees no management controls, only the reason', !(await exists('add-guest-name')) && !(await page.locator('[data-testid^="member-manage-"]').count()) && /archived, so people can't be changed/.test(await text('people-archived-note')));
+    check('...and can still leave (the one exception to read-only)', (await byId(page, 'leave-trip').getAttribute('aria-disabled')) !== 'true');
+    await go(T.LEAVEARCH);
+    await byId(page, 'leave-trip').click();
+    await byId(page, 'confirm-confirm').click();
+    check('a member can leave an archived trip', (await byId(page, 'greeting').waitFor({ timeout: 8000 }).then(() => true, () => false)) && people(T.LEAVEARCH).find((m) => m.id === ID.me)!.status === 'left');
+
+    // =============== the 50-person limit ===============
+    await go(T.FULL);
+    check('at 50 people the add box is replaced by a note', !(await exists('add-guest-name')) && (await text('add-guest-full')).includes('50 people'));
+
+    // =============== failures are explained, and recoverable ===============
+    await go(T.FAIL);
+    backend.memberFail = 'network';
+    await manage(ID.ravi);
+    await byId(page, `member-make-admin-${ID.ravi}`).click();
+    await byId(page, 'confirm-confirm').click();
+    check('a connection failure keeps the dialog open with a message, so it can simply be retried', (await byId(page, 'confirm-error').waitFor({ timeout: 8000 }).then(() => true, () => false)) && /Can't reach the server/.test(await text('confirm-error')) && (await exists('confirm-dialog')));
+    backend.memberFail = null;
+    await byId(page, 'confirm-confirm').click();
+    check('retrying from the same dialog works', await settle(async () => (await text(`member-${ID.ravi}`)).includes('Admin')) && (await dialogGone()));
+
+    backend.memberFail = 'not_admin';
+    await manage(ID.gita);
+    await byId(page, `member-remove-${ID.gita}`).click();
+    await byId(page, 'confirm-confirm').click();
+    check('if your admin rights were removed meanwhile: the dialog closes and the card explains', (await byId(page, 'people-error').waitFor({ timeout: 8000 }).then(() => true, () => false)) && (await text('people-error')) === 'Only trip admins can do that.' && (await dialogGone()));
+    backend.memberFail = null;
+    await byId(page, 'people-reload').click();
+    check('"Reload latest" clears the message and re-reads the trip', await settle(async () => !(await exists('people-error'))));
+
+    const failures = [
+      ['trip_archived', /archived, so people can't be changed/],
+      ['member_not_found', /no longer on this trip/],
+      ['member_changed', /Someone else changed this person first/],
+      ['guest_cannot_be_admin', /without an account can't be an admin/],
+      ['trip_not_found', /couldn't open this trip/],
+    ] as const;
+    for (const [token, pattern] of failures) {
+      backend.memberFail = token;
+      await go(T.FAIL);
+      await manage(ID.gita);
+      await byId(page, `member-remove-${ID.gita}`).click();
+      await byId(page, 'confirm-confirm').click();
+      check(`the database answer "${token}" is explained in plain words`, (await byId(page, 'people-error').waitFor({ timeout: 8000 }).then(() => true, () => false)) && pattern.test(await text('people-error')), await text('people-error'));
+      check(`...and offers Reload latest (${token})`, await exists('people-reload'));
+      backend.memberFail = null;
+    }
+    backend.memberFail = 'last_admin';
+    await go(T.FAIL);
+    await byId(page, 'leave-trip').click();
+    await byId(page, 'confirm-confirm').click();
+    check('"last_admin" when leaving says you are the only admin', (await byId(page, 'people-error').waitFor({ timeout: 8000 }).then(() => true, () => false)) && /only admin, so you cannot leave/.test(await text('people-error')));
+    backend.memberFail = null;
+    backend.memberFail = 'network';
+    await go(T.FAIL);
+    await manage(ID.gita);
+    await byId(page, `member-rename-${ID.gita}`).click();
+    await byId(page, `rename-input-${ID.gita}`).fill('Geeta');
+    await byId(page, `rename-save-${ID.gita}`).click();
+    check('a connection failure while renaming keeps the box and message, so it can be retried', (await vis(page, "Can't reach the server. Check your internet connection and try again.").waitFor({ timeout: 8000 }).then(() => true, () => false)) && (await byId(page, `rename-input-${ID.gita}`).inputValue()) === 'Geeta');
+    backend.memberFail = null;
+    await byId(page, `rename-save-${ID.gita}`).click();
+    check('retrying works', await settle(async () => (await text(`member-${ID.gita}`)).includes('Geeta')));
+
+    // stale screen: two admins on screen, but the other was demoted meanwhile, so stepping down would leave none
+    await go(T.STALE);
+    people(T.STALE).find((m) => m.id === ID.priya)!.role = 'member';
+    await manage(ID.me);
+    await byId(page, `member-remove-admin-${ID.me}`).click();
+    await byId(page, 'confirm-confirm').click();
+    check('stepping down as the last admin is refused by the database even though the screen offered it', (await byId(page, 'people-error').waitFor({ timeout: 8000 }).then(() => true, () => false)) && /at least one admin/.test(await text('people-error')) && people(T.STALE).find((m) => m.id === ID.me)!.role === 'admin');
+    await byId(page, 'people-reload').click();
+    check('after reloading, the screen shows you as the only admin (no step-down, Leave disabled)', (await settle(async () => (await exists('leave-blocked')))) && !(await exists(`member-remove-admin-${ID.me}`)));
+
+    // =============== double taps ===============
+    await go(T.DOUBLE);
+    backend.slowMemberMs = 1200;
+    await byId(page, 'add-guest-name').fill('Quick');
+    const addsBefore = calls('add_guest_member').length;
+    await byId(page, 'add-guest-submit').click();
+    await byId(page, 'add-guest-submit').click({ timeout: 800, force: true }).catch(() => {});
+    await settle(() => calls('add_guest_member').length >= addsBefore + 1);
+    await page.waitForTimeout(1500);
+    check('tapping Add twice sends only one request', calls('add_guest_member').length === addsBefore + 1, String(calls('add_guest_member').length - addsBefore));
+    await manage(ID.ravi);
+    await byId(page, `member-remove-${ID.ravi}`).click();
+    const rmBefore = calls('remove_member').length;
+    await byId(page, 'confirm-confirm').click();
+    await byId(page, 'confirm-confirm').click({ timeout: 800, force: true }).catch(() => {});
+    await page.waitForTimeout(1800);
+    check('tapping Remove twice sends only one request', calls('remove_member').length === rmBefore + 1, String(calls('remove_member').length - rmBefore));
+    backend.slowMemberMs = 0;
+
+    // =============== what is (never) sent ===============
+    const ids = [USER.id, RAVI, PRIYA, BOSS, DEV];
+    check('no request to a member function ever carries a user id', allMemberCalls().every((r) => !ids.some((id) => JSON.stringify(r.body).includes(id))));
+    check('every member request carries the login, not a secret key', allMemberCalls().every((r) => !!r.auth?.startsWith('Bearer ') && !r.auth.includes('sb_secret')));
+    check('the people are read through list_trip_members (never the members table directly)', backend.requests.some((r) => r.path === '/rest/v1/rpc/list_trip_members') && !backend.requests.some((r) => r.path.startsWith('/rest/v1/trip_members')));
+    check('no unexpected network calls', backend.unexpected.length === 0, backend.unexpected.join(', '));
+    await context.close();
+
+    // =============== phone-sized touch screen ===============
+    {
+      const ctx = await browser.newContext({ viewport: { width: 360, height: 780 }, isMobile: true, hasTouch: true, deviceScaleFactor: 2 });
+      const b = newBackend();
+      b.trips = seed();
+      await installFakeSupabase(ctx, b);
+      await sessionInStorage(ctx);
+      const p = await ctx.newPage();
+      await p.goto(`${BASE}/trips/${T.PHONE}`);
+      await byId(p, 'trip-people').waitFor({ timeout: 20000 });
+      check('Phone: no sideways scrolling with a very long name on the trip', await p.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1));
+      const manageBox = await byId(p, `member-manage-${ID.ravi}`).boundingBox();
+      check('Phone: Manage is a comfortable touch target (44 px)', !!manageBox && manageBox.height >= 44 && manageBox.width >= 44, JSON.stringify(manageBox));
+      await byId(p, `member-manage-${ID.ravi}`).tap();
+      await byId(p, `member-remove-${ID.ravi}`).tap();
+      await byId(p, 'confirm-dialog').waitFor({ timeout: 5000 });
+      await p.waitForTimeout(800);
+      const box = await byId(p, 'confirm-dialog').boundingBox();
+      check('Phone: the confirmation fits inside the screen', !!box && box.x >= 0 && box.x + box.width <= 360 && box.y >= 0 && box.y + box.height <= 780, JSON.stringify(box));
+      await shot(p, 'people-confirm-phone');
+      await byId(p, 'confirm-cancel').tap();
+      await ctx.close();
+    }
+
+    // =============== Dark theme ===============
+    {
+      const dark = await browser.newContext();
+      const b = newBackend();
+      b.trips = seed();
+      b.profile = { ...b.profile, theme_preference: 'dark' };
+      await installFakeSupabase(dark, b);
+      await sessionInStorage(dark);
+      await dark.addInitScript(() => window.localStorage.setItem('tripmate.theme-preference', 'dark'));
+      const p = await dark.newPage();
+      await p.goto(`${BASE}/trips/${T.DARK}`);
+      await byId(p, 'trip-people').waitFor({ timeout: 20000 });
+      await byId(p, `member-manage-${ID.ravi}`).click();
+      await byId(p, `member-remove-${ID.ravi}`).click();
+      await byId(p, 'confirm-dialog').waitFor({ timeout: 5000 });
+      await p.waitForTimeout(800);
+      const surface = await byId(p, 'confirm-dialog').evaluate((e) => getComputedStyle(e).backgroundColor);
+      check('Dark theme: the confirmation uses the dark surface', surface === 'rgb(27, 37, 32)', surface);
+      await shot(p, 'people-confirm-dark');
+      await dark.close();
+    }
+  } finally {
+    site.stop();
+  }
+}
+
 async function main() {
   const browser = await chromium.launch({ channel: 'msedge', headless: true });
   try {
-    await setupScreens(browser);
-    await accountFlows(browser);
-    await signedInFlows(browser);
-    await tripFlows(browser);
-    await detailFlows(browser);
-    await editFlows(browser);
-    await dateFlows(browser);
+    if (process.env.UI_ONLY === 'K') {
+      await memberFlows(browser); // quick re-run of the people scenario alone while developing
+    } else {
+      await setupScreens(browser);
+      await accountFlows(browser);
+      await signedInFlows(browser);
+      await tripFlows(browser);
+      await detailFlows(browser);
+      await editFlows(browser);
+      await dateFlows(browser);
+      await memberFlows(browser);
+    }
   } finally {
     await browser.close();
   }

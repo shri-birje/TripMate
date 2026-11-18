@@ -24,7 +24,10 @@ import { newDatabase } from './harness';
 let db: PGlite;
 
 /** Functions that signed-in users are allowed to run. Add a name here ONLY after reviewing the function. */
-const ALLOWED_CALLABLE_FUNCTIONS = ['create_trip', 'is_trip_member', 'set_trip_archived', 'update_trip']; // set_trip_archived and update_trip added and reviewed for M3.3
+const ALLOWED_CALLABLE_FUNCTIONS = [
+  'add_guest_member', 'create_trip', 'is_trip_member', 'leave_trip', 'list_trip_members', 'remove_member',
+  'rename_guest_member', 'set_member_role', 'set_trip_archived', 'update_trip',
+]; // set_trip_archived and update_trip reviewed for M3.3; the six member functions (add_guest_member ... set_member_role) reviewed for M3.4
 
 /** Column-level UPDATE rights a signed-in user may have (table -> columns). */
 const ALLOWED_COLUMN_UPDATES: Record<string, string[]> = {

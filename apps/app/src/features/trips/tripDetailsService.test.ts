@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import type { TripDetailsRow, TripMemberRow } from '@tripmate/core';
+import type { MemberListRow, TripDetailsRow, TripMemberRow } from '@tripmate/core';
 import {
   TRIP_DETAILS_COLUMNS,
   TripDetailsError,
@@ -39,11 +39,33 @@ const row: TripDetailsRow = {
 };
 
 type Reply = { data: TripDetailsRow | null; error: { code?: string; message?: string } | null };
+type PeopleReply = { data: MemberListRow[] | null; error: { code?: string; message?: string } | null };
 
-/** A fake that records the exact query so tests can check precisely what was asked of the database. */
-function fakeClient(reply: Reply | (() => Promise<Reply>)) {
+/** The list_trip_members() answer for a set of member rows: a former member's user id and role are withheld, as the database does. */
+const peopleOf = (rows: TripMemberRow[] | null | undefined): PeopleReply => ({
+  data: (rows ?? []).map((m) => ({
+    member_id: m.id,
+    user_id: m.status === 'active' ? m.user_id : null,
+    display_name: m.display_name,
+    role: m.status === 'active' ? m.role : null,
+    status: m.status,
+    joined_at: m.joined_at,
+    left_at: m.left_at ?? null,
+    is_guest: m.user_id === null,
+  })),
+  error: null,
+});
+
+/** A fake that records the exact queries so tests can check precisely what was asked of the database. */
+function fakeClient(reply: Reply | (() => Promise<Reply>), people?: PeopleReply | (() => Promise<PeopleReply>)) {
   const queries: { table: string; columns: string; filters: [string, string][] }[] = [];
+  const rpcs: { fn: string; args: unknown }[] = [];
   const client: TripDetailsClient = {
+    rpc: (fn, args) => {
+      rpcs.push({ fn, args });
+      if (typeof people === 'function') return people();
+      return Promise.resolve(people ?? peopleOf(typeof reply === 'function' ? row.trip_members : reply.data?.trip_members));
+    },
     from: (table) => ({
       select: (columns) => {
         const q = { table, columns, filters: [] as [string, string][] };
@@ -59,20 +81,23 @@ function fakeClient(reply: Reply | (() => Promise<Reply>)) {
       },
     }),
   };
-  return { client, queries };
+  return { client, queries, rpcs };
 }
 
 describe('getTripDetails: the request', () => {
-  it('asks for one trip by id and only its CURRENT members, with an explicit column list', async () => {
-    const { client, queries } = fakeClient({ data: row, error: null });
+  it('asks for one trip by id with an explicit column list, and for its people through list_trip_members only', async () => {
+    const { client, queries, rpcs } = fakeClient({ data: row, error: null });
     await getTripDetails(client, TRIP_ID);
     expect(queries).toHaveLength(1);
     expect(queries[0]!.table).toBe('trips');
     expect(queries[0]!.columns).toBe(TRIP_DETAILS_COLUMNS);
-    expect(queries[0]!.filters).toEqual([
-      ['id', TRIP_ID],
-      ['trip_members.status', 'active'],
-    ]);
+    expect(queries[0]!.filters).toEqual([['id', TRIP_ID]]);
+    expect(rpcs).toEqual([{ fn: 'list_trip_members', args: { p_trip_id: TRIP_ID } }]);
+  });
+
+  it('never reads the members table directly: the trip request has no member columns at all', () => {
+    expect(TRIP_DETAILS_COLUMNS).not.toContain('trip_members');
+    expect(TRIP_DETAILS_COLUMNS).not.toContain('user_id');
   });
 
   it('never asks for everything, for other tables, or for private profile data', () => {
@@ -82,10 +107,6 @@ describe('getTripDetails: the request', () => {
     }
   });
 
-  it('asks only for the member columns the screen shows (name, role, status, join date, ids)', () => {
-    const memberPart = /trip_members\(([^)]*)\)/.exec(TRIP_DETAILS_COLUMNS)![1]!.split(',').map((s) => s.trim());
-    expect(memberPart).toEqual(['id', 'user_id', 'display_name', 'role', 'status', 'joined_at']);
-  });
 });
 
 describe('getTripDetails: the result', () => {
@@ -97,14 +118,39 @@ describe('getTripDetails: the result', () => {
     expect(d.lengthDays).toBe(4);
   });
 
-  it('never shows former members, even if the server wrongly sent them', async () => {
+  it('keeps former members out of the people list, head-count and admins, and lists them separately', async () => {
     const withFormer: TripDetailsRow = {
       ...row,
-      trip_members: [...row.trip_members!, member('3', { display_name: 'Removed Rahul', status: 'removed' }), member('4', { display_name: 'Departed Dev', status: 'left' })],
+      trip_members: [
+        ...row.trip_members!,
+        member('3', { display_name: 'Removed Rahul', status: 'removed', role: 'admin', left_at: '2026-11-20T10:00:00Z' }),
+        member('4', { display_name: 'Departed Dev', status: 'left', left_at: '2026-11-21T10:00:00Z' }),
+      ],
     };
     const d = await getTripDetails(fakeClient({ data: withFormer, error: null }).client, TRIP_ID);
     expect(d.members.map((m) => m.displayName)).toEqual(['Asha Rao', 'Ravi']);
-    expect(JSON.stringify(d)).not.toMatch(/Rahul|Dev/);
+    expect(d.admins.map((m) => m.displayName)).toEqual(['Asha Rao']); // a removed admin is not an admin
+    expect(d.trip.memberCount).toBe(2);
+    expect(d.formerMembers.map((m) => m.displayName)).toEqual(['Departed Dev', 'Removed Rahul']);
+    expect(Object.keys(d.formerMembers[0]!).sort()).toEqual(['displayName', 'id', 'isGuest', 'leftOn', 'status']); // no user id, no role
+  });
+
+  it('former members arrive from the database without a user id or role, and are still told apart (account vs guest)', async () => {
+    const withFormer: TripDetailsRow = {
+      ...row,
+      trip_members: [
+        ...row.trip_members!,
+        member('3', { display_name: 'Removed Rahul', status: 'removed', role: 'admin', left_at: '2026-11-20T10:00:00Z' }),
+        member('4', { display_name: 'Guest Gopal', user_id: null, status: 'left', left_at: '2026-11-21T10:00:00Z' }),
+      ],
+    };
+    const reply = peopleOf(withFormer.trip_members);
+    const sent = reply.data!.filter((r) => r.status !== 'active');
+    expect(sent.every((r) => r.user_id === null && r.role === null)).toBe(true); // what the database sends
+    const d = await getTripDetails(fakeClient({ data: row, error: null }, reply).client, TRIP_ID);
+    expect(d.formerMembers.find((m) => m.displayName === 'Removed Rahul')!.isGuest).toBe(false);
+    expect(d.formerMembers.find((m) => m.displayName === 'Guest Gopal')!.isGuest).toBe(true);
+    expect(JSON.stringify(d)).not.toContain('user-3');
   });
 });
 
@@ -135,6 +181,14 @@ describe('getTripDetails: unavailable trips all look identical', () => {
     expect(e.message).toBe(UNAVAILABLE_MESSAGE);
   });
 
+  it('a trip that is visible but lists nobody (the person was removed in between) is also the same combined error', async () => {
+    const e = await kinds(() => getTripDetails(fakeClient({ data: row, error: null }, { data: [], error: null }).client, TRIP_ID));
+    expect(e.kind).toBe('unavailable');
+    expect(e.message).toBe(UNAVAILABLE_MESSAGE);
+    const e2 = await kinds(() => getTripDetails(fakeClient({ data: row, error: null }, { data: null, error: null }).client, TRIP_ID));
+    expect(e2.kind).toBe('unavailable');
+  });
+
   it('the message does not hint at whether the trip exists', () => {
     expect(UNAVAILABLE_MESSAGE).not.toMatch(/denied|forbidden|not found|doesn't exist|does not exist|private|permission/i);
   });
@@ -163,6 +217,19 @@ describe('getTripDetails: real problems', () => {
 
   it('a missing table is reported as a setup problem', async () => {
     for (const code of ['PGRST205', '42P01']) expect(await run({ data: null, error: { code, message: 'x' } })).toMatchObject({ kind: 'setup' });
+  });
+
+  it('a missing members function (database update not applied) is a setup problem with its own message; other member errors are generic or network', async () => {
+    for (const code of ['PGRST202', '42883']) {
+      let err: unknown;
+      await getTripDetails(fakeClient({ data: row, error: null }, { data: null, error: { code, message: 'x' } }).client, TRIP_ID).catch((e) => (err = e));
+      expect(err).toMatchObject({ kind: 'setup' });
+      expect((err as Error).message).toMatch(/members/i);
+    }
+    const bad = await getTripDetails(fakeClient({ data: row, error: null }, { data: null, error: { code: 'XX000', message: 'SELECT secret' } }).client, TRIP_ID).catch((e) => e);
+    expect(bad).toMatchObject({ kind: 'unknown', message: 'Something went wrong. Please try again.' });
+    const net = await getTripDetails(fakeClient({ data: row, error: null }, { data: null, error: { message: 'Failed to fetch' } }).client, TRIP_ID).catch((e) => e);
+    expect(net).toMatchObject({ kind: 'network' });
   });
 
   it('anything unexpected becomes a generic message and never shows raw database text', async () => {

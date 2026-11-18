@@ -130,6 +130,22 @@ M3.3 adds a third database update. **Run it after Steps 4 and 9** (it needs the 
 
 If you try to edit or archive *before* running this update, the app says "Editing trips isn't set up on the server yet" instead of failing mysteriously.
 
+## Step 11 - People and roles (added with Milestone M3.4 step b)
+
+M3.4 step (b) adds a fourth database update. **Run it after Step 10.**
+
+1. In VS Code open `supabase/migrations/20261118300000_member_management.sql`, select all, copy.
+2. Supabase dashboard -> **SQL Editor -> New query**, paste, **Run**. Expect "Success. No rows returned". It is safe to run again. (It adds a rule that guests can never be admins, an append-only record of membership changes, a safety net that a trip always keeps an admin, and six functions.)
+3. Check it from the outside:
+
+   ```powershell
+   npm run verify:supabase
+   ```
+
+   Expect `PASSED` with **0 warnings**. Section 4 now also confirms that the six member functions and their internal helper cannot be run by signed-out visitors. (Before this step you will see seven "not available yet" warnings, which is expected.)
+4. Try it: `npm run app:web`, sign in, open a trip you created. Under **People**: add a friend by name, rename them, **Remove** them (read the confirmation), then expand **Former members**. With a second admin or member you cannot create yet (invitations arrive in M3.5), the role buttons and **Leave trip** can only be tried on trips where you have another admin; the screen explains why **Leave trip** is disabled when you are the only admin.
+5. If you open the trip page *before* running this update, the app says "Members aren't set up on the server yet" instead of failing mysteriously.
+
 ## Troubleshooting
 
 | You see | Meaning and fix |

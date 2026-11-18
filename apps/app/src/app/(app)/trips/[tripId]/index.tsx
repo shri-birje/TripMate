@@ -9,6 +9,7 @@ import { Card } from '../../../../components/Card';
 import { ConfirmDialog } from '../../../../components/ConfirmDialog';
 import { Screen } from '../../../../components/Screen';
 import { useUserId } from '../../../../features/auth/AuthProvider';
+import { PeopleCard } from '../../../../features/trips/PeopleCard';
 import { PhaseBadge } from '../../../../features/trips/PhaseBadge';
 import { useTripDetails } from '../../../../features/trips/tripDetailsApi';
 import { useSetTripArchived } from '../../../../features/trips/tripEditApi';
@@ -78,13 +79,12 @@ export default function TripDetailsScreen() {
 type Pending = 'archive' | 'restore' | null;
 
 function Details({ details, reload }: { details: TripDetails; reload: () => void }) {
-  const { trip, members, creatorName, lengthDays } = details;
+  const { trip, lengthDays } = details;
   const router = useRouter();
   const userId = useUserId();
   const { colors } = useTheme();
   // "Today" and the trip's dates are both plain calendar days, so this comparison has no time-zone surprises.
   const phase = tripPhase(trip.startDate, trip.endDate, todayIso());
-  const creatorIsMe = userId !== null && members.some((m) => m.userId === userId && m.userId === trip.createdBy);
   const isAdmin = isTripAdmin(details, userId);
   const archived = trip.status === 'archived';
 
@@ -204,26 +204,7 @@ function Details({ details, reload }: { details: TripDetails; reload: () => void
         <Field label="Currency" testID="trip-currency" value={trip.currency} />
       </Card>
 
-      <Card>
-        <AppText variant="heading">{`People (${members.length})`}</AppText>
-        <AppText variant="small" tone="secondary" testID="trip-creator">
-          {creatorIsMe ? 'Created by you' : creatorName ? `Created by ${creatorName}` : 'Created by a former member'}
-        </AppText>
-        <View style={{ gap: spacing.sm }} testID="trip-people">
-          {members.map((m) => (
-            <View
-              key={m.id}
-              testID={`member-${m.id}`}
-              style={{ flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', gap: spacing.sm }}
-            >
-              <AppText>{m.displayName}</AppText>
-              {m.role === 'admin' && <Tag label="Admin" color={colors.primary} />}
-              {m.userId !== null && m.userId === userId && <Tag label="You" color={colors.textSecondary} />}
-              {m.isGuest && <Tag label="Guest" color={colors.textSecondary} />}
-            </View>
-          ))}
-        </View>
-      </Card>
+      <PeopleCard details={details} userId={userId} reload={reload} onLeft={() => router.replace('/')} />
 
       <ConfirmDialog
         visible={pending !== null}
@@ -251,16 +232,6 @@ function Field({ label, value, testID, muted = false }: { label: string; value: 
       </AppText>
       <AppText tone={muted ? 'secondary' : 'primary'} testID={testID}>
         {value}
-      </AppText>
-    </View>
-  );
-}
-
-function Tag({ label, color }: { label: string; color: string }) {
-  return (
-    <View style={{ borderWidth: 1, borderColor: color, borderRadius: 999, paddingHorizontal: spacing.sm, paddingVertical: 1 }}>
-      <AppText variant="small" style={{ color, fontWeight: '600' }}>
-        {label}
       </AppText>
     </View>
   );

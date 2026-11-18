@@ -13,7 +13,7 @@ Rule: a feature is **Complete** only when it works **and has been tested**. "Cod
 | **M0 — Project foundation** | ✅ **Complete (approved 2026-11-17)** |
 | **M1 — Core money engine (`packages/core`)** | ✅ **Complete (approved 2026-11-17)** |
 | **M2 — Accounts, profiles, theme** | ✅ **Complete** (live check passed and approved 2026-11-18; committed and pushed as `f90d1a6`) |
-| **M3 — Trips and members** | 🔵 **In progress, 5 small features** (see M3 plan): **M3.1 Create a trip ✅ complete (approved 2026-11-18)**; **M3.2 View trip details ✅ complete (live-verified and approved 2026-11-18)**; **M3.3 Edit and archive: built and tested, plus a date input and calendar refinement requested in review; awaiting your review (migration not yet applied to your live project, nothing committed)**; M3.4-M3.5 not started |
+| **M3 — Trips and members** | 🔵 **In progress, 5 small features** (see M3 plan): **M3.1 Create a trip ✅ complete (approved 2026-11-18)**; **M3.2 View trip details ✅ complete (live-verified and approved 2026-11-18)**; **M3.3 Edit and archive, with the date input and calendar refinement: approved, committed (`84ec09e`) and pushed**; **M3.4 members and roles: plan approved (D1-D10); step (a) read side approved; step (b) write actions, audit trail and People card controls built and tested, awaiting your review (nothing committed; migration #4 not yet applied live)**; M3.5 not started |
 | M4 — Invites + guest claim | Not started |
 | M5 — Expenses + split types | Not started. **Must (ADR-043):** make `update_trip` refuse trip date changes that would leave an existing expense outside the trip; refuse expenses and repayments on archived trips; keep currency unchangeable; use the lock + version pattern for every money-changing function |
 | M6 — Balances + settlement plan | Not started |
@@ -239,8 +239,8 @@ M3 is delivered as five small features, one at a time, each ending with your app
 |---|---|---|
 | **M3.1** | **Create a trip** (+ your trips on Home) | ✅ Complete (live-verified and approved 2026-11-18) |
 | M3.2 | View trip details (dates, budget, members list) | ✅ Complete (live-verified and approved 2026-11-18) |
-| M3.3 | Edit and archive a trip (admin only, conflict-safe) | 🟡 Built and tested; awaiting your review. Migration #3 not yet applied live; nothing committed |
-| M3.4 | Members and roles: add guest members, remove, make/remove admin, leave, last-admin protection | Not started |
+| M3.3 | Edit and archive a trip (admin only, conflict-safe) | ✅ Complete, approved, committed `84ec09e` and pushed |
+| M3.4 | Members and roles: add guest members, remove, make/remove admin, leave, last-admin protection | 🟡 Plan approved. Step (a) approved. Step (b) built and tested, awaiting your review (uncommitted); migration #4 not yet applied live |
 | M3.5 | Invitation links: create, revoke, preview, join | Not started |
 
 **Design decision for M3 (recorded as ADR-032):** trip and member changes are **database functions that check who is calling** (`auth.uid()`), not an API using Supabase's secret key. Each is atomic and tested with the same real-Postgres method as profiles. This means **no secret key is needed anywhere**. The original plan (API + secret key, ADR-004) only becomes necessary at expenses (M5) where the money engine must run on a server, and even then the server can forward the user's own login. **ADR-032 was approved by you on 2026-11-18, with eight security conditions** (listed in the decisions log). They are enforced by an automatic audit test (`supabase/tests/security-audit.test.ts`) that runs against every migration.
@@ -623,3 +623,208 @@ Member management and roles (M3.4), invitations (M3.5), deleting a trip (not pla
 
 ### Limitations to expect
 Web only; real-browser tests use simulated Supabase answers (the live check is yours); a page left open across midnight updates on next load; deep-link restoration after sign-in is still out of scope.
+
+
+---
+
+## M3.4 — Members and roles (PLAN ONLY: nothing implemented, awaiting your approval)
+
+**Status: planning. No M3.4 code, migration or test has been written.** M3.3 (including the date refinement) is approved, committed as `84ec09e` and pushed.
+
+### What I inspected
+Product rules (permission matrix in API_DESIGN §2), SYSTEM/SECURITY architecture, DATABASE_SCHEMA §4.3 and §6, decisions Q-4 to Q-7 and ADR-032/036/043, the live `trip_members` table and its RLS (migration 2), `create_trip`, `trip_role_of`/`update_trip`/`set_trip_archived` (migration 3), the M3.2 details read and member display, the security-audit test, and the M1 money engine.
+
+**Facts that shape the plan**
+1. `trip_members` already has everything a member model needs: `role` (admin/member), `status` (active/removed/left), `left_at`, `invited_by`, nullable `user_id` (NULL = guest), one row per person per trip. **No DML is granted to the app**: all writes must be functions. RLS lets any current member read **all** rows of their trip, including former members (so history can show names).
+2. **Expenses do not exist yet** (M5). So no balances exist and Q-4 ("can someone with a balance be removed?") cannot be enforced yet. The plan makes the rule an explicit M5 obligation, like ADR-043.
+3. Money history will point at `trip_members.id` (ADR-007), never at `user_id`, and **no code path may delete a member row**. Removing someone only changes `status`, so shares/repayments stay intact by construction.
+4. The M3.2 screen currently requests **active members only**, so former members are not shown yet (M3.2 limit 2: "appear in M3.4").
+5. Account deletion (not built) is documented as detaching `user_id`, which would turn a member into a guest-like placeholder; if that member were the last admin, the trip would have no admin. Recorded as an obligation below.
+
+### 1. Proposed member and role model
+- **Two roles, as already stored:** `admin` and `member`. No "owner": the creator is just the first admin (`trips.created_by` stays informational).
+- **Two kinds of person:** a *signed-up member* (`user_id` set) and a *guest* (name only, `user_id` NULL; a friend who has not joined, claimable in M3.5).
+- **Three statuses:** `active`, `left` (chose to go), `removed` (an admin removed them). Rows are never deleted.
+- **Invariant (database-enforced):** every trip always has **at least one active admin who is a signed-up person**. Guests can never be admins (they cannot sign in), so a trip can never become unmanageable.
+- **Permissions (all enforced in the database, the screens only hide buttons):**
+
+| Action | Admin | Member | Guest/removed/left/stranger |
+|---|---|---|---|
+| See current members, roles, "you", former members | yes | yes | no (the single "not available" answer) |
+| Add a guest, rename a guest | yes | no | no |
+| Make admin / remove admin rights | yes | no | no |
+| Remove someone | yes | no | no |
+| Leave the trip | yes, only if another active admin exists | yes | no |
+| Any of the above on an **archived** trip | refused (read-only), **except leaving** | leaving only | no |
+
+### 2. Recommended business rules (decisions for you are marked **D**)
+- **Promote** (member to admin): admin only; target must be an active, signed-up member of that trip (not a guest).
+- **Demote** (admin to member): admin only; refused if the target is the last admin. An admin may demote themselves only if another admin exists.
+- **D1. Admins are peers.** Any admin may promote, demote or remove another admin (simple, matches "who is trusted to manage"). The risk is an admin demoting a co-admin; mitigated by the audit trail below. The alternative (only the creator may demote/remove admins) is stricter but makes a creator who leaves a problem. *Recommendation: peers.*
+- **Remove:** admin only; target must be active and **in this trip**; an admin cannot remove themselves (they use Leave) so the caller always stays an admin. Removed people lose all access (existing RLS, Q-7 default); the row stays.
+- **Leave:** any active member for themselves. **D2. A sole admin cannot leave**; they must make someone else admin first (clear message). There is no "delete trip" (archive only), so an abandoned trip cannot appear.
+- **D3. Archived trips:** member changes refused (`trip_archived`) except **leaving**, so nobody is trapped in a trip they cannot restore.
+- **Guests:** added by name by an admin (Q-5/Q-6: admins only; configurable later). Name 1 to 60 characters, trimmed (existing table rule). **D4. Duplicate active names (ignoring case) are refused** so two "Rahul" can never confuse a ledger; checked inside the locked function, not by a unique index, so M3.5 joins are not blocked unexpectedly. **D5. Guest renaming is included** (typos are likely and names appear in the ledger); signed-up members cannot be renamed by an admin (their name comes from their profile; no impersonation). **D6. Cap of 50 active people per trip** (abuse bound).
+- **D7. Former members are shown to every current member** (name, "Left"/"Removed", date; **not** who removed them), in a collapsed "Former members" list. They are never shown any other detail and never get access.
+- **D8. Q-4 (balances).** Because no balances exist yet, M3.4 allows removal and leaving. **M5 must refuse removal/leaving while the person has a non-zero balance** (confirmed or projected) until it is settled or an admin records an explicit settlement; this becomes ADR-047 (obligation). Please confirm this is the rule you want.
+- **D9. Audit trail:** add a small append-only table `trip_member_events` (who did what to whom and when: added_guest, renamed_guest, made_admin, removed_admin, removed, left). Written only by the functions, readable by current members of the trip, no direct writes. This fills the "historical records must remain auditable" requirement now instead of retrofitting later. *Alternative:* defer to the future activity log.
+- **D10. Size:** M3.4 is large. I can build it in one go, or as two reviewable steps: **(a)** read side: current + former members, roles, "you", admin tags; **(b)** the write actions. *Recommendation: two steps, each tested, one approval at the end* (say if you would rather approve between them).
+
+### 3. Database migration requirements (one new migration, additive)
+- `trip_members`: add `removed_by uuid null references trip_members(id)`; add CHECK `user_id is not null or role = 'member'` (guests are never admins). Existing rows already satisfy it (only creators' admin rows exist).
+- New table `trip_member_events` (see D9) with RLS: members select; no DML grants.
+- **Backstop trigger:** deferred constraint trigger on `trip_members` verifying "at least one active admin with a user" per existing trip after any change (checked at commit, so `create_trip` is unaffected, and a trip deleted by cascade is skipped). It is a safety net behind the function checks, not the main defence.
+- **Internal helpers (not callable by the app):** member id of a user on a trip; active-admin count.
+
+### 4. Database functions and RLS changes
+New functions (all `SECURITY DEFINER`, `search_path=''`, `auth.uid()`, revoked from public/anon, granted to authenticated only; same pattern as M3.3):
+- `add_guest_member(p_trip_id, p_display_name)`
+- `rename_guest_member(p_trip_id, p_member_id, p_display_name)`
+- `set_member_role(p_trip_id, p_member_id, p_role, p_expected_role)`
+- `remove_member(p_trip_id, p_member_id, p_expected_status)`
+- `leave_trip(p_trip_id)`
+
+Common order of checks: signed in → active member (else `trip_not_found`, the same answer for strangers/removed/left, so existence stays hidden) → admin where required (`not_admin`) → **lock the trip row** `FOR UPDATE` (this serialises every membership change on that trip, so two admins demoting each other at the same moment cannot both succeed and leave zero admins) → target belongs to **this** trip (`member_not_found`, prevents using another trip's member id) → archived check → state check against the caller's expectation (`member_changed`, so a stale screen never overwrites a newer change) → rule checks (`last_admin`, `guest_cannot_be_admin`, `name_taken`, `trip_full`, `use_leave_instead`) → change + event row, repeat-safe (asking for the state already true changes nothing).
+No policy changes to `trips`/`trip_members` reads. No new grants besides EXECUTE on the five functions. Membership changes do **not** bump `trips.version` (editing a trip must not conflict with someone adding a friend). `security-audit.test.ts` allow-list gains the five names (and its other rules stay).
+No secret/service-role key anywhere (ADR-032).
+
+### 5. API and frontend changes
+- **core:** `memberManagement.ts` (+test): guest-name validation (reuses the 1-60 rule), RPC argument builders, `canPromote/canDemote/canRemove/canLeave` helpers used only to show or hide buttons (the database stays the authority), former-member partition. Small additive change to `tripDetails.ts`: rows also carry `left_at`, and `TripDetails` gains `formerMembers` (existing active-member behaviour and tests unchanged).
+- **app:** `tripMemberService.ts` (+test; typed errors like `tripEditService`: last_admin, conflict, not_admin, archived, unavailable, name_taken, full, auth, network, setup, unknown), `tripMemberApi.ts` (hooks; refresh details + Home list), `tripDetailsService.ts` (stop filtering out former members at the query; select `left_at`; partition in core).
+- **UI on the trip page:** "People" card: each person with Admin / You / Guest tags; admins get a per-person action menu (Make admin, Remove admin rights, Remove, Rename for guests) and an "Add a friend by name" row; everyone gets **Leave trip** (disabled with an explanation for a sole admin); all destructive actions use the existing `ConfirmDialog` with plain language ("Removing Asha keeps everything she paid or owes; she just stops having access"). Conflicts offer "Reload latest". Collapsed "Former members" list. After leaving, return to Home.
+- `scripts/verify-supabase.ts` probes the five functions as signed-out visitors (must be refused).
+- **Unchanged:** M1 money engine, M2 auth/profile, trip create/edit/archive functions and screens (apart from where the People card sits), migrations 1-3.
+
+### 6. Security and privacy
+- Every rule lives in SQL; hidden buttons are cosmetic. Identity only from `auth.uid()`; no user id parameter anywhere (the caller is never "told" who they are).
+- Existence hiding preserved; cross-trip member ids refused; role escalation impossible (a member cannot call any admin function successfully; a guest cannot be made admin; no function sets role to anything but 'admin'/'member').
+- Privacy: the People list shows only display names, roles, join/left dates. No emails, UPI IDs or profile reads (co-member profiles stay unreadable). Events table stores member ids and action names only.
+- Former members keep **no** access (Q-7 default); their historical rows stay for ledger display only.
+- Backstop trigger and function checks are independent, so one bug cannot remove the last admin.
+
+### 7. Edge cases and failure scenarios (each gets a test)
+Last admin tries to leave / demote self / be removed; two admins act on each other at once (second is refused); stale screen (someone else changed the role first); target from another trip; removing someone already removed/left (safe repeat, no new event); promoting a guest; adding a duplicate name (different case, extra spaces); 51st person; archived trip actions (refused) and leaving an archived trip (allowed); removed/left/stranger/signed-out callers; admin removing themselves via remove; leaving while another admin exists; signed-up member whose profile was soft-deleted; connection failure keeps dialogs open for retry; double-tap on every confirm (the synchronous guard added in M3.3).
+
+### 8. Test strategy
+- **Database (real Postgres engine, PGlite):** full allow/deny matrix per function (admin, ordinary member, guest row, stranger, removed, left, signed-out); invariants after every operation; **model-based property test**: thousands of random action sequences, asserting at every step: at least one active signed-up admin, no member row ever deleted or count reduced, guests never admin, names unique among active, events match changes; balances-integrity check that the M1 engine files and money tables are untouched (no financial tables yet: asserted by schema checks that no function can delete a member row and that ids stay stable); security-audit update.
+- **Mutation tests (≈12 deliberate SQL breaks, each must fail a test, then be restored byte-for-byte):** drop the last-admin check, drop the same-trip check, drop the admin check, drop the row lock, drop the guest rule, drop the archived rule, allow sole-admin leave, skip event writing, remove the backstop trigger, wrong status transition, role set from a parameter, skip the duplicate-name check.
+- **Core/app unit tests:** validation, button-visibility helpers, service error mapping, former-member partition, details compatibility (existing 165+367 tests keep passing).
+- **Real browser (Edge, simulated Supabase):** admin vs member views, every action with its confirmation (Cancel vs confirm), the exact request sent, conflict/last-admin/duplicate/full/archived/not-available/connection-failure paths, former members list, leaving then landing on Home, double-tap, Light/Dark, phone-sized touch screen. Your live check with two accounts becomes possible only after M3.5 (invitations); until then live checks cover the admin-only paths and guests.
+- Full suite, type-check, `verify:supabase` (0 warnings) and a secret scan before reporting.
+
+### 9. Files expected to change
+**New:** one migration (members and roles); `supabase/tests/trip-members.test.ts`; `packages/core/src/memberManagement.ts` + test; `apps/app/src/features/trips/tripMemberService.ts` + test, `tripMemberApi.ts`, `PeopleCard.tsx` (and small row/menu components).
+**Changed (additively):** `packages/core/src/tripDetails.ts` (+ its test: former members), `tripDetailsService.ts` (select/filter), the trip details screen (People card replaces the plain list), `security-audit.test.ts` (allow-list), `core/index.ts`, `scripts/ui-check.ts`, `scripts/verify-supabase.ts`, docs (progress, decisions log ADR-047 onward, database schema, API design, security architecture, Supabase setup step 11).
+**Not touched:** M1 engine, M2 code, trip create/edit/archive logic and migrations 1-3.
+
+### 10. Dependencies and M3.5 considerations
+- Needs M3.2/M3.3 (done). Adds migration #4 for you to apply in the SQL Editor (same ritual; the migration is safe to re-run).
+- **M3.5 (invitations) must reuse the same rules:** joining takes the trip lock; refuses archived trips and full trips; claims a guest by turning that row into a signed-up member with role `member` (never admin); **rejoining a left/removed row reactivates it with role reset to `member`** and clears `left_at`/`removed_by`; a joiner whose name equals an active member's gets a clear disambiguation path (this is why duplicate names are a function check, not an index); invites are created by admins only by default (Q-6); an event row is written.
+- **M5 obligations (to record as ADR-047/048):** refuse remove/leave with a non-zero balance (D8); only **active** members may be payers or share-holders on new expenses, while history keeps references to former members; expenses/repayments refused on archived trips (ADR-043); all money-changing functions use the same lock + expected-state pattern.
+- **Account deletion (future):** must be refused or must first hand over administration when the person is the last admin; a detached admin must never leave a trip admin-less (the guest-never-admin CHECK would reject it, which is the intended safety stop).
+
+### Decisions I need from you
+D1 peer admins; D2 sole admin cannot leave; D3 archived = read-only except leaving; D4 duplicate names refused; D5 guest rename included; D6 cap 50; D7 former members visible to current members; D8 balance rule deferred to M5 (Q-4); D9 audit events table now; D10 one build or two steps. Each has my recommendation above; "approve with the recommendations" is enough.
+
+
+---
+
+## M3.4 step (a) — Members and roles: read side (built and tested; awaiting your review; nothing committed)
+
+**Scope: read only.** Your decisions D1-D10 are recorded as ADR-048, the mandatory M5 balance rule as **ADR-047**, and the read-side design as ADR-049. **No write action, no migration, no new database function, no new table, no permission change** was made in this step. Step (b) (add/rename guest, make/remove admin, remove, leave, audit trail) is not started.
+
+### What it does
+- **Current members and roles:** the People card on the trip page already listed current people with Admin / You / Guest tags; it now also says what **your** role is ("You are an admin of this trip." / "You are a member of this trip.").
+- **Former members (D7):** a collapsed **"Former members (n)"** list inside the People card, shown only when someone has left or been removed. Each row shows the **name**, a **Guest** tag where it applies, and **"Left 21 Nov 2026"** or **"Removed 20 Nov 2026"** (the day in the viewer's own time zone; just "Left"/"Removed" if the day is unknown). Most recent first. A short note says they no longer have access and that anything they paid or owe stays in the trip's history.
+- **Privacy:** a former member is reduced to name, status, day and guest flag. **No user id, no role, no email, no UPI**; a removed admin shows no Admin tag. Former members are not counted in "People (n)", the trip card's head-count or the admin list, and they get no access (unchanged).
+- Everyone who is on the trip sees the same list (administrators and ordinary members); people who are not on the trip still get the single "Trip not available" answer.
+
+### How (small, additive)
+- The details request now asks for **all** of the trip's members with their `left_at` date, instead of filtering to active ones in the request; the shared rules separate them. Row-level security is unchanged: it already let a current member read their trip's former-member rows (as the M3.2 report noted), so this shows nothing the database did not already allow.
+- The M3.2 rule "former members' names never appear" is **intentionally replaced** by your D7; the M3.2 tests that asserted it (one in core, three in the app service test, the matching browser checks) were rewritten to the new rule; the existing database tests are unchanged (only the fixtures gained leave dates). Everything else in M3.2 is unchanged.
+
+### Tests and verification (only what this change affects)
+| Check | Result |
+|---|---|
+| Type-check | Clean |
+| Whole repo | **725 tests pass**: API 17, app 165, core 380 (+13), database 163 (+8); every earlier test still passes except those rewritten to D7 (listed above) |
+| Core (new/changed) | former members built only from left/removed rows (unknown status is treated as current, never former); they carry only name/status/day/guest flag (no user id, no role); unreadable or missing leave times give "no date"; ordering (recent first, unknown last, name, id); wording "Left"/"Removed" with the day; the day is the **viewer's local day in 5 time zones**; `myRole` (current members only; nothing for strangers, signed-out, removed or left people); head-count and admins exclude former members |
+| App service | the request names its columns, includes `left_at`, no longer filters by status, never asks for profiles/email/UPI; former members separated, no user id or role |
+| Database (real Postgres engine, 8 new) | admin and ordinary member see the same current + former rows with leave dates; former guests recognisable; strangers, other-trip members, removed, left and signed-out callers see **nothing**; a former member's trip stays invisible to them; other trips never show these people; no email/UPI in the rows; **reading changes nothing and the reader cannot write or delete member rows** |
+| Security conditions | no new function, table, grant or policy; security-audit allow-list unchanged and passing; `verify:supabase` passes with 0 warnings; secret scan clean |
+| **Mutation check (10 deliberate breaks)** | all caught: an active person counted as former; former people in the current list; user id leaked into a former member; role leaked; oldest-first ordering; UTC day instead of the viewer's day; "Removed" described as "Left"; a stranger told they are a member; the request forgetting `left_at`; the request going back to filtering active-only. Files restored byte-for-byte. |
+| Real browser (Edge), `npm run ui:check` | **391 checks pass** (375 earlier + 16 new): collapsed by default with `aria-expanded`; expands and collapses; names, order, notes and guest tag; no Admin/You tag on a former admin; no email/UPI/ids; head-count "People (3)" unchanged; role line for an administrator and for an ordinary member (who sees no Edit/Archive); a very long former name wraps on a **360 px phone screen with no sideways scrolling**; 44 px touch target; no section when nobody left; **Dark theme**; request columns |
+
+### Limitations / unresolved
+- The server still sends a former member's user id and role to the browser in the same response (the database allows a member to read those rows, and the shared rules discard them immediately, so they are never stored in the screen's state or shown). Narrowing the request further would need either a second filtered request or a database view; I recommend leaving it as is.
+- A former member's name is the snapshot taken when they joined; it does not follow later profile changes (as for current members).
+- "Left"/"Removed" days are computed from `left_at` in the viewer's time zone; rows with no `left_at` show no day.
+- Web only in a real browser (Edge) with simulated Supabase answers; not run on a phone or emulator. Live check: you cannot produce a former member from the app until step (b) exists (the only way today is editing the database directly), so the live check of this step is limited to "nothing changed for current members".
+- Who removed someone is not shown (and not recorded yet): the audit trail arrives in step (b).
+
+### Files changed (nothing else)
+**Changed:** `packages/core/src/tripDetails.ts` (+ `tripDetails.test.ts`), `apps/app/src/features/trips/tripDetailsService.ts` (+ `tripDetailsService.test.ts`), `apps/app/src/app/(app)/trips/[tripId]/index.tsx` (role line, collapsed Former members list), `supabase/tests/trip-details-access.test.ts` (8 new tests, fixtures with leave dates), `scripts/ui-check.ts` (fake server returns all members; 16 new checks), docs (`DEVELOPMENT_PROGRESS.md`, `ARCHITECTURE_DECISIONS_LOG.md` ADR-047 to ADR-049 and Q-4, `DATABASE_SCHEMA.md`).
+**Not touched:** every migration, the M1 engine, M2 code, trip create/edit/archive code, the security-audit test, `core/index.ts` (exports are automatic).
+
+### Next
+Your review of step (a). Then, only on your approval, step (b): the five write functions, the append-only audit table, and the controls on the People card.
+
+
+---
+
+## M3.4 step (b) — Members and roles: write actions, audit trail and People card controls (built and tested; awaiting your review; nothing committed)
+
+**Scope:** add a friend, rename a friend, make/remove admin, remove, leave; the append-only audit table; the controls on the People card. Implements your approved D1-D10 and ADR-047 to ADR-049, plus ADR-050 to ADR-053 recorded in this step. **Not started: M3.5 (invitations).** M1 engine, M2 code and the trip create/edit/archive code are unchanged.
+
+### What it does
+- **For administrators (active trips only):** each person has a **Manage** button (never on yourself unless you can step down). Actions offered only where they can work: **Make admin** (signed-up members), **Remove admin rights** (another admin, or yourself when another admin exists), **Rename** (friends added by name only), **Remove from trip**. **"Add a friend by name"** box (hidden at 50 people, with a note). Every change of role, removal and leaving asks first, in plain words (what is kept, who loses access).
+- **For everyone on the trip:** **Leave trip**. The only admin sees it disabled with the reason ("make someone else an admin first"). Allowed on archived trips (the one exception to read-only). After leaving you go Home and the trip is gone from your list.
+- **Former members** keep appearing under "Former members" (name, Left/Removed, day); nothing about them is deleted.
+- **Failures are explained and recoverable:** a connection failure keeps the dialog or box open to retry; refusals (rights changed, someone changed things first, trip archived, last admin) close it and explain on the card with **Reload latest**. Names are checked at once on the screen (nothing sent for an empty, taken or too-long name). Double taps send one request.
+
+### Rules enforced inside the database (migration `20261118300000_member_management.sql`, migration #4 for you to run)
+- Six functions, all `SECURITY DEFINER`, `search_path` pinned, caller from `auth.uid()` only (**no function takes a user id**), signed-in users only: `list_trip_members`, `add_guest_member`, `rename_guest_member`, `set_member_role`, `remove_member`, `leave_trip`. One internal helper (not callable by the app) does, in order: identify the caller, refuse strangers **before** locking, **lock the trip row**, re-check membership under the lock, then admin and archived checks. A stranger, removed or departed person, or unknown trip always gets the same `trip_not_found`.
+- **Always at least one active, signed-up administrator**, enforced twice and independently: inside the functions, and by a deferred trigger on `trip_members` (checked at commit). Guests can never be admins (table rule). Cross-trip member ids are refused. Duplicate active names (ignoring case and surrounding whitespace) refused; 50 active people maximum; archived trips refused except leaving; admins are equal peers (D1) and cannot remove themselves (they leave).
+- **Nothing is ever deleted**: removing/leaving sets status and `left_at` only. **No expense/share/repayment history can be touched** (none exists yet; a stand-in ledger table pointing at members is used in a test to prove it stays valid, and that deleting a referenced member is blocked).
+- **Audit trail `trip_member_events` is append-only:** no write rights for any app role; readable only by current members of that trip; triggers refuse update, delete and truncate even for the database owner (except the automatic clean-up if a whole trip is removed); strict `seq` order; member ids and words only. One record per successful change; refusals and safe repeats record nothing.
+- **Privacy:** the trip page now reads people through `list_trip_members`, which sends a former member's **name, status, dates and guest flag but NULL user id and NULL role**. The browser never receives them (checked in a real browser). The trip request no longer touches the members table.
+- ADR-047 (M5 must block removal/leaving with a non-zero balance) stays mandatory; membership changes never touch the trip itself (its version is unchanged).
+
+### Verification (only what this change affects)
+| Check | Result |
+|---|---|
+| Type-check | Clean |
+| Whole repo | **834 tests pass**: API 17, app 191 (+26), core 403 (+23), database 223 (+60) |
+| Database (real Postgres engine, 60 new in `trip-members.test.ts`) | allow/deny matrix per function for admin, ordinary member, guest, stranger, other trip's member, removed, left, signed out; read data minimised; every rule (last admin, peers, self-removal, guests, names incl. tabs/non-breaking spaces, 50 limit, archived, repeats, stale role); audit trail contents, protection and ordering; history preserved; nothing deletes; earlier trip functions unaffected; **each function refuses on its own with the safety-net trigger switched off**; and a **model test: 1,500 random actions by admins, members and strangers** compared against an independently written copy of the rules, checking after every step: nobody deleted, always a signed-up admin, guests never admin, active names unique, `left_at` set exactly when someone is gone |
+| Security audit | allow-list now exactly the 10 reviewed functions; RLS on every table; no anon/PUBLIC rights; `search_path` pinned; `auth.uid()` in every callable definer function; **no secret key anywhere** |
+| Core / app | button rules (what is offered to whom), names, the exact arguments (no user id), message mapping (including "only admin" wording for leaving), service checks before anything is sent, details read through `list_trip_members`, former members arrive without user id or role |
+| **Mutation check (37 deliberate breaks)** | **all caught**, files restored byte-for-byte: 23 in the SQL (leave/demote as last admin, self-removal, cross-trip ids x3, no lock, no admin check, archived editable, guest admin, duplicate names, no limit, names trimmed of spaces only, removal not recorded, safety net disabled, audit trail editable, former user id and role sent, strangers can list, stale role, repeat removal, rename accounts, signed-out can leave) plus 14 in the screen rules and services. **Two survived at first** (the function-level last-admin check was masked by the trigger raising the same error); I added the independent-defence test and both are now caught. |
+| Real browser (Edge), `npm run ui:check` | **480 checks pass** (391 earlier + 89 new): admin vs member views, every action with its confirmation (Cancel vs confirm), exact requests (no user ids), count/tag/notice updates, former members with privacy check, only-admin state, step-down, leaving and landing on Home, archived and 50-person states, every failure path with retry/Reload latest, stale screen refused by the database, double taps, phone width (44 px targets, confirmation inside the screen, long name), Dark theme |
+| `verify:supabase` | PASSED with **0 failures and 7 warnings**: the 7 new functions "not available yet" because **migration #4 is not applied to your live project** (Step 11 in SUPABASE_SETUP). Earlier functions confirmed closed to signed-out visitors. |
+| Secret scan | clean (only the existing fake test key and a doc sentence) |
+
+### Found while testing (and fixed)
+- Postgres's `btrim` trims only spaces: a name of only tabs/new lines would have been accepted. Added `name_trim` (all whitespace incl. non-breaking space) and tests.
+- Timestamps can tie, so audit events needed a strict `seq` order.
+- Two approved M3.1 test fixtures conflicted with the new rules for legitimate reasons (a direct SQL update removed a trip's only admin; an invalid-role insert was a guest) and got minimal fixture fixes keeping their intent; three function allow-lists were updated.
+- Checking names inside the mutation delayed the message until a refresh finished; names are now validated at once on the screen.
+
+### Deviations from the written plan
+No `removed_by` column (the events table records who removed whom); `remove_member` has no expected-status argument (removing someone already gone is a safe repeat); the details read changed to `list_trip_members` to meet "minimise data returned to the browser" (ADR-050, supersedes part of ADR-049). The unreachable "last admin" guard inside `remove_member` (the caller is always another admin) is kept as belt and braces.
+
+### Limitations / unresolved
+- **Migration #4 is not applied live.** Until you run Step 11, the trip page says "Members aren't set up on the server yet". Live two-account checks need invitations (M3.5); until then a live check covers adding, renaming and removing friends, and the screens' states.
+- Real simultaneous callers cannot be run in this test engine. Concurrency is covered by stale-screen simulations, a source check that every write takes the lock (strangers are refused before it, membership re-checked under it), the deferred trigger, and Postgres's own row-lock guarantee.
+- A current member can still read the raw `trip_members` rows of their own trip through row-level security (including former members' user ids and roles); the app never asks for them. Closing that fully needs column-level grants touching approved M3.1/M3.2 reads (recommended later hardening, ADR-050).
+- No screen shows the audit trail yet (it is recorded and readable by members of the trip).
+- Browser tests use a simulated Supabase in Edge only; not run on a phone or emulator. The Android back button and native modal behaviour are unverified.
+- Admins are equal peers by your decision D1: any admin can demote or remove another (recorded in the audit trail).
+- M5 obligations unchanged: ADR-047 (block remove/leave with a balance), only active members on new expenses, expenses refused on archived trips (ADR-043).
+
+### Files
+**New:** `supabase/migrations/20261118300000_member_management.sql`; `supabase/tests/trip-members.test.ts`; `packages/core/src/memberManagement.ts` + test; `apps/app/src/features/trips/PeopleCard.tsx`, `tripMemberService.ts` + test, `tripMemberApi.ts`.
+**Changed:** `packages/core/src/tripDetails.ts` (list rows, former-member flag) + `index.ts` (+1 line); `tripDetailsService.ts` + test (people via `list_trip_members`); trip page `trips/[tripId]/index.tsx` (the People card moved into `PeopleCard`); `supabase/tests/security-audit.test.ts` (allow-list), `trip-details-access.test.ts`, `trip-edit.test.ts` (function lists), `trips.test.ts` (two fixtures); `scripts/verify-supabase.ts` (7 probes), `scripts/ui-check.ts` (fake server + scenario K + `UI_ONLY=K` switch); docs (progress, decisions log ADR-050 to 053, database schema, API design, security architecture, Supabase setup Step 11).
+**Not touched:** M1 engine, M2 code, migrations 1 to 3, trip create/edit/archive code.
+
+### Next
+Your review. Then, only on approval: commit/push, and you apply migration #4 (Step 11). M3.5 (invitations) is not started.

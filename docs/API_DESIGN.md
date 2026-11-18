@@ -127,6 +127,9 @@ Legend: **R** = also available as a direct RLS read from the client; **W** = wri
 | GET | `/trips/:tripId/summary` | Dashboard: total spend, counts, per-member paid/share, category totals, remaining budget | M |
 
 ### 5.4 Members and invitations
+
+> **Implementation note (M3.4 step b, ADR-032):** the member rows below are implemented as **database functions** called through Supabase, not HTTP endpoints: `GET /members` is `list_trip_members`, `POST /members` is `add_guest_member`, `PATCH /members/:id` is `rename_guest_member` (guests only) and `set_member_role`, `DELETE /members/:id` is `remove_member`, and `POST /leave` is `leave_trip`. Errors are the tokens `not_authenticated`, `trip_not_found` (also for strangers and unknown trips), `not_admin`, `trip_archived`, `member_not_found`, `member_changed`, `last_admin`, `guest_cannot_be_admin`, `name_taken`, `trip_full`, `invalid_request`, `use_leave_instead`, `cannot_rename`. Invitations (M3.5) are not built yet.
+
 | Method | Path | Description | Phase |
 |---|---|---|---|
 | GET | `/trips/:tripId/members` | List members **R** | M |

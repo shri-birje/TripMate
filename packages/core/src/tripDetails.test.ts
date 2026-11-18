@@ -2,8 +2,12 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
   calendarDayNumber,
   daysLabel,
+  formerMemberFromRow,
+  formerMemberNote,
   isValidTripId,
   memberFromRow,
+  myRole,
+  sortFormerMembers,
   sortMembers,
   tripDetailsFromRow,
   tripLengthDays,
@@ -211,19 +215,26 @@ describe('tripDetailsFromRow', () => {
     expect(d.lengthDays).toBe(4);
   });
 
-  it('shows only CURRENT members, even if the server sent former ones (their names must never appear)', () => {
+  it('keeps former members apart: not in the people list, head-count or admins, and without a role or user id', () => {
     const d = tripDetailsFromRow({
       ...base,
       trip_members: [
         ...base.trip_members!,
-        row({ id: '3', display_name: 'Removed Rahul', status: 'removed' }),
-        row({ id: '4', display_name: 'Departed Dev', status: 'left' }),
+        row({ id: '3', display_name: 'Removed Rahul', status: 'removed', role: 'admin', left_at: '2026-11-20T10:00:00+00:00' }),
+        row({ id: '4', display_name: 'Departed Dev', status: 'left', left_at: '2026-11-21T10:00:00+00:00' }),
       ],
     });
     expect(d.members.map((m) => m.displayName)).toEqual(['Asha Rao', 'Ravi']);
-    expect(JSON.stringify(d)).not.toContain('Rahul');
-    expect(JSON.stringify(d)).not.toContain('Dev');
+    expect(d.admins.map((m) => m.displayName)).toEqual(['Asha Rao']);
     expect(d.trip.memberCount).toBe(2);
+    expect(d.formerMembers.map((m) => m.displayName)).toEqual(['Departed Dev', 'Removed Rahul']);
+    for (const f of d.formerMembers) expect(Object.keys(f).sort()).toEqual(['displayName', 'id', 'isGuest', 'leftOn', 'status']);
+    expect(JSON.stringify(d.formerMembers)).not.toContain('user-');
+  });
+
+  it('has no former members when everyone is current, or when there is no member list', () => {
+    expect(tripDetailsFromRow(base).formerMembers).toEqual([]);
+    expect(tripDetailsFromRow({ ...base, trip_members: undefined }).formerMembers).toEqual([]);
   });
 
   it('leaves the creator unnamed if they are no longer on the trip', () => {
@@ -245,5 +256,91 @@ describe('tripDetailsFromRow', () => {
   it('carries no email addresses, UPI IDs or profile fields', () => {
     const text = JSON.stringify(tripDetailsFromRow(base)).toLowerCase();
     for (const forbidden of ['email', 'upi', 'password', 'phone']) expect(text).not.toContain(forbidden);
+  });
+});
+
+describe('former members', () => {
+  const gone = (over: Partial<TripMemberRow> & { id: string }) => row({ status: 'left', left_at: '2026-11-20T12:00:00+00:00', ...over });
+
+  it('are built only from people who left or were removed', () => {
+    expect(formerMemberFromRow(row({ id: 'a' }))).toBeNull();
+    expect(formerMemberFromRow(row({ id: 'a', status: 'weird' }))).toBeNull();
+    expect(formerMemberFromRow(gone({ id: 'a' }))).toMatchObject({ id: 'a', status: 'left', isGuest: false });
+    expect(formerMemberFromRow(gone({ id: 'b', status: 'removed' }))).toMatchObject({ status: 'removed' });
+    expect(formerMemberFromRow(gone({ id: 'g', user_id: null }))!.isGuest).toBe(true);
+  });
+
+  it('carry nothing but a name, a status, a day and the guest flag', () => {
+    const f = formerMemberFromRow(gone({ id: 'a', role: 'admin' }))!;
+    expect(Object.keys(f).sort()).toEqual(['displayName', 'id', 'isGuest', 'leftOn', 'status']);
+  });
+
+  it('turn an unknown or unreadable leave time into "no date" rather than failing', () => {
+    expect(formerMemberFromRow(gone({ id: 'a', left_at: null }))!.leftOn).toBeNull();
+    expect(formerMemberFromRow(gone({ id: 'a', left_at: undefined as unknown as null }))!.leftOn).toBeNull();
+    expect(formerMemberFromRow(gone({ id: 'a', left_at: 'garbage' }))!.leftOn).toBeNull();
+  });
+
+  it('sort most recent first, unknown dates last, then by name and id', () => {
+    const list = [
+      gone({ id: '1', display_name: 'Zed', left_at: '2026-11-18T12:00:00+00:00' }),
+      gone({ id: '2', display_name: 'Amy', left_at: '2026-11-22T12:00:00+00:00' }),
+      gone({ id: '3', display_name: 'Bob', left_at: null }),
+      gone({ id: '4', display_name: 'Cat', left_at: '2026-11-22T12:00:00+00:00' }),
+    ].map((r) => formerMemberFromRow(r)!);
+    expect(sortFormerMembers(list).map((m) => m.displayName)).toEqual(['Amy', 'Cat', 'Zed', 'Bob']);
+    expect(sortFormerMembers(list).map((m) => m.id)).toEqual(sortFormerMembers([...list].reverse()).map((m) => m.id));
+  });
+
+  it('are described with their day: "Left 20 Nov 2026" / "Removed 20 Nov 2026"', () => {
+    const left = formerMemberFromRow(gone({ id: 'a', left_at: '2026-11-20T12:00:00+00:00' }))!;
+    expect(formerMemberNote(left)).toBe('Left 20 Nov 2026');
+    expect(formerMemberNote({ ...left, status: 'removed' })).toBe('Removed 20 Nov 2026');
+    expect(formerMemberNote({ ...left, leftOn: null })).toBe('Left');
+    expect(formerMemberNote({ ...left, status: 'removed', leftOn: null })).toBe('Removed');
+    expect(formerMemberNote({ ...left, leftOn: '2026-02-30' })).toBe('Left');
+  });
+
+  describe("the day is the viewer's local day", () => {
+    const original = process.env.TZ;
+    afterEach(() => {
+      if (original === undefined) delete process.env.TZ;
+      else process.env.TZ = original;
+    });
+    // 20:30 UTC on 20 Nov is already 21 Nov in India (UTC+5:30) and still 20 Nov in Los Angeles.
+    it.each([
+      ['Asia/Kolkata', '2026-11-21'],
+      ['America/Los_Angeles', '2026-11-20'],
+      ['UTC', '2026-11-20'],
+      ['Pacific/Kiritimati', '2026-11-21'],
+      ['Pacific/Pago_Pago', '2026-11-20'],
+    ])('in %s', (zone, day) => {
+      process.env.TZ = zone;
+      expect(formerMemberFromRow(gone({ id: 'a', left_at: '2026-11-20T20:30:00+00:00' }))!.leftOn).toBe(day);
+    });
+  });
+});
+
+describe('myRole', () => {
+  const d = tripDetailsFromRow({
+    id: 't1', name: 'Goa', destination: 'Goa', start_date: '2026-12-27', end_date: '2026-12-30', description: null, budget_minor: null,
+    currency: 'INR', cover_image_path: null, status: 'active', created_by: 'user-1', created_at: '2026-11-18T00:00:00Z',
+    updated_at: '2026-11-18T00:00:00Z', version: 1,
+    trip_members: [
+      row({ id: '1', role: 'admin' }),
+      row({ id: '2' }),
+      row({ id: '3', role: 'admin', status: 'removed', left_at: '2026-11-20T10:00:00Z' }),
+      row({ id: '4', status: 'left', left_at: '2026-11-20T10:00:00Z' }),
+    ],
+  });
+  it('is the role of a current member', () => {
+    expect(myRole(d, 'user-1')).toBe('admin');
+    expect(myRole(d, 'user-2')).toBe('member');
+  });
+  it('is nothing for strangers, signed-out visitors and people who are no longer on the trip', () => {
+    expect(myRole(d, 'user-9')).toBeNull();
+    expect(myRole(d, null)).toBeNull();
+    expect(myRole(d, 'user-3')).toBeNull();
+    expect(myRole(d, 'user-4')).toBeNull();
   });
 });

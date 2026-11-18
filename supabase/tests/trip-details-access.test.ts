@@ -54,10 +54,10 @@ async function createTrip(creator: string, name: string): Promise<string> {
   return r.rows[0]!.id;
 }
 
-async function addMember(tripId: string, userId: string | null, displayName: string, status = 'active') {
+async function addMember(tripId: string, userId: string | null, displayName: string, status = 'active', leftAt: string | null = null) {
   await users.asAdmin();
-  await db.query(`insert into public.trip_members (trip_id, user_id, display_name, status) values ($1, $2, $3, $4)`, [
-    tripId, userId, displayName, status,
+  await db.query(`insert into public.trip_members (trip_id, user_id, display_name, status, left_at) values ($1, $2, $3, $4, $5)`, [
+    tripId, userId, displayName, status, leftAt,
   ]);
 }
 
@@ -74,8 +74,9 @@ beforeAll(async () => {
   goa = await createTrip(asha, 'Goa Trip 2026');
   await addMember(goa, ravi, 'Ravi Kumar');
   await addMember(goa, null, 'Guest Gita'); // a friend without an account
-  await addMember(goa, rahul, 'Removed Rahul', 'removed');
-  await addMember(goa, dev, 'Departed Dev', 'left');
+  await addMember(goa, rahul, 'Removed Rahul', 'removed', '2026-11-20T10:00:00+00');
+  await addMember(goa, dev, 'Departed Dev', 'left', '2026-11-21T10:00:00+00');
+  await addMember(goa, null, 'Departed Guest', 'removed', '2026-11-19T10:00:00+00');
 
   manali = await createTrip(meera, 'Meera Manali');
   await addMember(manali, null, 'Meera Guest');
@@ -221,12 +222,105 @@ describe('the read adds no new way in', () => {
     )).rows.map((r) => r.proname);
     // M3.1 had create_trip + is_trip_member. M3.3 deliberately added exactly update_trip + set_trip_archived
     // (reviewed in security-audit.test.ts). Reading a trip still uses none of them.
-    expect(fns).toEqual(['create_trip', 'is_trip_member', 'set_trip_archived', 'update_trip']);
+    // M3.4 step (b) later added exactly six member functions (reviewed in security-audit.test.ts and trip-members.test.ts).
+    expect(fns).toEqual(['add_guest_member', 'create_trip', 'is_trip_member', 'leave_trip', 'list_trip_members', 'remove_member', 'rename_guest_member', 'set_member_role', 'set_trip_archived', 'update_trip']);
   });
 
   it('the details read still cannot be used to change anything', async () => {
     await users.asUser(asha);
     await expect(db.query(`update public.trips set name = 'hacked' where id = $1`, [goa])).rejects.toThrow(/permission denied/i);
     await expect(db.query(`update public.trip_members set role = 'admin' where trip_id = $1`, [goa])).rejects.toThrow(/permission denied/i);
+  });
+});
+
+/**
+ * M3.4 step (a): the screen now reads ALL of a trip's members (current and former) in one go and
+ * separates them in the app. Former members are shown to current members as a name and a date.
+ * This proves who can see them, what comes with them, and that nothing else opens up.
+ */
+const ALL_MEMBERS_SQL = `
+  select m.id, m.user_id, m.display_name, m.role, m.status, m.joined_at, m.left_at
+    from public.trips t
+    join public.trip_members m on m.trip_id = t.id
+   where t.id = $1
+   order by m.joined_at, m.display_name`;
+
+interface MemberRow {
+  id: string;
+  user_id: string | null;
+  display_name: string;
+  role: string;
+  status: string;
+  joined_at: string;
+  left_at: string | null;
+}
+const allMembers = async (tripId: string) => (await db.query<MemberRow>(ALL_MEMBERS_SQL, [tripId])).rows;
+
+describe('former members (read side of member management)', () => {
+  it('an administrator sees current AND former members, with how each left and when', async () => {
+    await users.asUser(asha);
+    const rows = await allMembers(goa);
+    expect(rows.map((r) => `${r.display_name}:${r.status}`).sort()).toEqual([
+      'Asha Rao:active',
+      'Departed Dev:left',
+      'Departed Guest:removed',
+      'Guest Gita:active',
+      'Ravi Kumar:active',
+      'Removed Rahul:removed',
+    ]);
+    const former = rows.filter((r) => r.status !== 'active');
+    expect(former.every((r) => r.left_at !== null)).toBe(true);
+    expect(rows.filter((r) => r.status === 'active').every((r) => r.left_at === null)).toBe(true);
+  });
+
+  it('an ordinary member sees exactly the same list', async () => {
+    await users.asUser(asha);
+    const asAdmin = (await allMembers(goa)).map((r) => r.id).sort();
+    await users.asUser(ravi);
+    expect((await allMembers(goa)).map((r) => r.id).sort()).toEqual(asAdmin);
+  });
+
+  it('a former member who was a guest is recognisable as one (no user id)', async () => {
+    await users.asUser(ravi);
+    const guest = (await allMembers(goa)).find((r) => r.display_name === 'Departed Guest')!;
+    expect(guest.user_id).toBeNull();
+  });
+
+  it('strangers, members of other trips, removed and departed people and signed-out visitors see NO members at all', async () => {
+    for (const who of [sam, meera, rahul, dev]) {
+      await users.asUser(who);
+      expect(await allMembers(goa)).toEqual([]);
+    }
+    await users.asAnon();
+    await expect(allMembers(goa)).rejects.toThrow(/permission denied/i);
+  });
+
+  it('being a former member of one trip does not reveal anything about it, even though the person is still signed in', async () => {
+    await users.asUser(rahul);
+    expect(await allMembers(goa)).toEqual([]);
+    expect((await db.query('select id from public.trips')).rows).toEqual([]);
+  });
+
+  it('a trip\'s former members never appear when reading another trip', async () => {
+    await users.asUser(meera);
+    const rows = await allMembers(manali);
+    expect(JSON.stringify(rows)).not.toMatch(/Rahul|Dev|Departed/);
+  });
+
+  it('still no email, UPI or profile data comes with the member rows', async () => {
+    await users.asUser(asha);
+    const text = JSON.stringify(await allMembers(goa)).toLowerCase();
+    for (const forbidden of ['email', 'upi', 'okhdfcbank', '@']) expect(text).not.toContain(forbidden);
+  });
+
+  it('reading changes nothing: the member rows are identical before and after, and cannot be written by the reader', async () => {
+    await users.asAdmin();
+    const before = JSON.stringify((await db.query('select * from public.trip_members order by id')).rows);
+    await users.asUser(asha);
+    await allMembers(goa);
+    await expect(db.query(`update public.trip_members set status = 'removed' where trip_id = $1`, [goa])).rejects.toThrow(/permission denied/i);
+    await expect(db.query(`delete from public.trip_members where trip_id = $1`, [goa])).rejects.toThrow(/permission denied/i);
+    await users.asAdmin();
+    expect(JSON.stringify((await db.query('select * from public.trip_members order by id')).rows)).toBe(before);
   });
 });

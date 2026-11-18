@@ -86,6 +86,8 @@ For ordinary signed-in operations (creating trips, and later changing members, e
 
 **Administrator checks (M3.3):** role-restricted functions (`update_trip`, `set_trip_archived`) look up the caller's role with an internal helper (`trip_role_of`) that only counts ACTIVE members and that the app cannot call. A person who is not on the trip, or a trip that does not exist, always gets the same `trip_not_found` answer, so trip existence is never revealed; a member who is not an administrator gets `not_admin`. Edits take a row lock and check the caller's expected version in the same transaction, so a stale edit can never overwrite a newer one. Archived trips are read-only. The two functions were added to the audit allow-list as a deliberate review step.
 
+**Member management (M3.4 step b):** six more functions (`list_trip_members`, `add_guest_member`, `rename_guest_member`, `set_member_role`, `remove_member`, `leave_trip`) follow the same rules, and share one internal helper (`member_change_context`, not callable by the app) that checks the caller, locks the trip, re-checks membership under the lock, and refuses archived trips (except leaving). No function takes a user id: the caller is only ever `auth.uid()`. A member id from another trip is refused. **At least one active, signed-up administrator always remains**, enforced twice (the functions, and a deferred trigger on `trip_members` as a backstop); guests can never be administrators (a table rule). Nothing is deleted: removing or leaving only changes status and `left_at`. Every change writes one row to the **append-only** `trip_member_events` table (no role can insert, update, delete or truncate it directly; a trigger refuses edits and deletes even for the database owner, except the automatic clean-up if a whole trip is removed). `list_trip_members` returns a former member's name and dates but **not their user id or role**. Residual: a current member can still read the raw `trip_members` rows of their own trip (including former members' user ids and roles) through the database's row-level security; the app does not ask for them. ADR-047 makes it mandatory that M5 blocks removal/leaving with an outstanding balance.
+
 The service-role / secret key is **not used anywhere**. It may be introduced only for a specific trusted backend operation that genuinely needs elevated privileges, with a written justification and the owner's approval (see the ADR-032 conditions and checklist in the decisions log). It must never appear in the frontend, mobile app, public repository or any `EXPO_PUBLIC_` variable.
 
 ## 4. Input validation and sanitisation
@@ -144,7 +146,7 @@ Rules: `.env*` files ignored by Git; a committed `.env.example` documents variab
 - `activity_log`: who did what, written in the same transaction as the change.
 - Both are append-only at the database permission level.
 - `repayments` retain `paid_at`, `confirmed_at`, `cancelled_at` plus actor ids in the activity log.
-- Admin actions (remove member, role change) are logged.
+- Admin actions (add/rename guest, role change, remove, leave) are logged in the append-only `trip_member_events` table (M3.4 step b), with the acting and affected member ids and old/new values.
 
 ---
 

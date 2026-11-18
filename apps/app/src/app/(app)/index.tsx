@@ -26,6 +26,7 @@ export default function HomeScreen() {
   const groups = useMemo(() => (trips ? groupTripsByPhase(trips, todayIso()) : null), [trips]);
   const visibleCount = groups ? groups.ongoing.length + groups.upcoming.length + groups.completed.length : 0;
   const newTrip = () => router.push('/trips/new');
+  const openTrip = (tripId: string) => router.push(`/trips/${tripId}`);
 
   return (
     <Screen>
@@ -71,9 +72,9 @@ export default function HomeScreen() {
               <Button testID="create-trip" label="New trip" onPress={newTrip} />
             </View>
           </View>
-          <Section title="Ongoing" trips={groups.ongoing} />
-          <Section title="Upcoming" trips={groups.upcoming} />
-          <Section title="Completed" trips={groups.completed} />
+          <Section title="Ongoing" trips={groups.ongoing} onOpen={openTrip} />
+          <Section title="Upcoming" trips={groups.upcoming} onOpen={openTrip} />
+          <Section title="Completed" trips={groups.completed} onOpen={openTrip} />
         </>
       )}
 
@@ -82,7 +83,15 @@ export default function HomeScreen() {
   );
 }
 
-function Section({ title, trips }: { title: string; trips: ReturnType<typeof groupTripsByPhase>['ongoing'] }) {
+function Section({
+  title,
+  trips,
+  onOpen,
+}: {
+  title: string;
+  trips: ReturnType<typeof groupTripsByPhase>['ongoing'];
+  onOpen: (tripId: string) => void;
+}) {
   if (trips.length === 0) return null;
   return (
     <View style={{ gap: spacing.sm }} testID={`section-${title.toLowerCase()}`}>
@@ -90,7 +99,7 @@ function Section({ title, trips }: { title: string; trips: ReturnType<typeof gro
         {`${title} (${trips.length})`}
       </AppText>
       {trips.map((t) => (
-        <TripCard key={t.id} trip={t} />
+        <TripCard key={t.id} trip={t} onPress={() => onOpen(t.id)} />
       ))}
     </View>
   );

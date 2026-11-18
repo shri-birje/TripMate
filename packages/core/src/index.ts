@@ -9,3 +9,4 @@ export * from './explain';
 export * from './validation';
 export * from './profile';
 export * from './trip';
+export * from './tripDetails';

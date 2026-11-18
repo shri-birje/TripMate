@@ -13,7 +13,7 @@ Rule: a feature is **Complete** only when it works **and has been tested**. "Cod
 | **M0 — Project foundation** | ✅ **Complete (approved 2026-11-17)** |
 | **M1 — Core money engine (`packages/core`)** | ✅ **Complete (approved 2026-11-17)** |
 | **M2 — Accounts, profiles, theme** | ✅ **Complete** (live check passed and approved 2026-11-18; committed and pushed as `f90d1a6`) |
-| **M3 — Trips and members** | 🔵 **In progress, 5 small features** (see M3 plan): **M3.1 Create a trip ✅ complete (approved 2026-11-18)**; **M3.2 View trip details: plan presented, awaiting your approval of the plan (no code written)**; M3.3-M3.5 not started |
+| **M3 — Trips and members** | 🔵 **In progress, 5 small features** (see M3 plan): **M3.1 Create a trip ✅ complete (approved 2026-11-18)**; **M3.2 View trip details ✅ complete (live-verified and approved 2026-11-18)**; M3.3-M3.5 not started |
 | M4 — Invites + guest claim | Not started |
 | M5 — Expenses + split types | Not started |
 | M6 — Balances + settlement plan | Not started |
@@ -238,7 +238,7 @@ M3 is delivered as five small features, one at a time, each ending with your app
 | # | Feature | Status |
 |---|---|---|
 | **M3.1** | **Create a trip** (+ your trips on Home) | ✅ Complete (live-verified and approved 2026-11-18) |
-| M3.2 | View trip details (dates, budget, members list) | 📝 Plan below; awaiting your approval of the plan |
+| M3.2 | View trip details (dates, budget, members list) | ✅ Complete (live-verified and approved 2026-11-18) |
 | M3.3 | Edit and archive a trip (admin only, conflict-safe) | Not started |
 | M3.4 | Members and roles: add guest members, remove, make/remove admin, leave, last-admin protection | Not started |
 | M3.5 | Invitation links: create, revoke, preview, join | Not started |
@@ -256,7 +256,7 @@ Dependencies: M3.2 needs M3.1; M3.3 and M3.4 need M3.2 (they live on the trip sc
 - **Live migration:** you applied `20261118100000_trips_and_members.sql` to your real Supabase project.
 - **Live verification:** `npm run verify:supabase` passes in all four sections. I re-ran it myself on 2026-11-18 after you applied the migration: 0 failures, 0 warnings. It confirms from the outside that the trips and members tables exist and signed-out visitors are denied, nobody can insert a trip directly, and `create_trip()` cannot be run by signed-out visitors.
 - **Trip creation in the live app:** tested by you and reported working. (I have not seen your live data, only the checks above.)
-- **Not yet committed to git:** M3.1 and the close-out work are in your working folder; the last commit is still `f90d1a6` (M0-M2).
+- **Committed to git** as `0ca32e6` (2026-11-18), as its own commit before M3.2 began; pushed to GitHub together with M3.2.
 - **Close-out addition:** `supabase/tests/security-audit.test.ts` (12 tests) turns the ADR-032 conditions into automatic checks. Five deliberate violations (lost `search_path`, function open to signed-out users, RLS switched off, a new function that skips `auth.uid()`, a direct INSERT grant) were each caught and then removed. Database tests are now 82; the whole repo has 416.
 
 ### What was built
@@ -322,7 +322,63 @@ M3.1 is closed. Next is **M3.2 - View trip details**; its plan is in the next se
 
 ---
 
-## M3.2 — View trip details (PLAN ONLY: awaiting your approval; nothing has been built)
+## M3.2 — View trip details
+
+**Status: complete.** Built and tested; you ran the live check against your real Supabase project (reported passed) and approved M3.2 on 2026-11-18. The plan and all your defaults were approved on 2026-11-18 (combined not-found/access-denied message; current members only; archived trips viewable with a notice; no database change; direct web addresses; deep-link restoration after sign-in out of scope). Two extra requirements were added and met: member privacy and calendar-date correctness.
+
+### What was implemented
+- Tap a trip card on Home to open `/trips/<id>`; the address also works directly and after a reload.
+- The page shows: name, destination, a phase badge (Upcoming / Ongoing / Completed), date range and length in days, description (or "No description"), budget and currency (or "No budget set"), "Created by …" (you / a name / "a former member"), and the people currently on the trip (administrators first, with **Admin**, **You** and **Guest** tags). An "Archived" notice shows for archived trips.
+- States: loading; the **single combined "Trip not available"** message for unknown, not-yours, removed, left and malformed links; a separate connection-failure message with **Try again**; a clear message if the database update were missing.
+- **No database change:** no migration, no function, no new permission, no secret key. The existing row-level security decides who can read a trip and its members.
+- **Member privacy:** the request names its columns (no "select everything"), asks only for current members' id, name, role and join date, and never touches profiles, so no email addresses or UPI IDs are requested or shown. Co-members' profiles stay unreadable. (An unrelated, intentional detail: the database lets a current member read the rows of former members of their own trip; the screen neither requests nor shows them.)
+- **Calendar-date correctness:** trip length is counted with pure calendar arithmetic on plain `YYYY-MM-DD` days, and the phase compares plain calendar days against the person's own local "today". Neither depends on time zone or daylight saving.
+
+### Files changed
+- **New:** `packages/core/src/tripDetails.ts` (+ `tripDetails.test.ts`); `apps/app/src/features/trips/tripDetailsService.ts` (+ test), `tripDetailsApi.ts`, `PhaseBadge.tsx`; `apps/app/src/app/(app)/trips/[tripId].tsx`; `apps/app/src/lib/today.test.ts`; `supabase/tests/trip-details-access.test.ts`.
+- **Changed (as planned, nothing else):** `apps/app/src/features/trips/TripCard.tsx` (tappable card), `apps/app/src/app/(app)/index.tsx` (passes the open handler), `packages/core/src/index.ts` (+1 export line), `scripts/ui-check.ts` (new scenarios), docs.
+- **Verified unchanged since the M3.1 commit (`0ca32e6`):** the M1 money engine, all M2 auth/profile/theme/session code, every migration and existing database test, and the M3.1 service, hooks, create screen and trip rules.
+
+### Tests added and results (all run)
+| Check | Result |
+|---|---|
+| Type-check, all packages | Clean |
+| Whole repo | **518 tests pass**: API 17, app 135 (+28), core 265 (+55), database 101 (+19) |
+| Shared rules (55) | calendar days (leap year, month/year ends, daylight-saving changes), `daysLabel`, trip-id validation (valid and 14 kinds of invalid), member mapping and sorting, creator lookup, only-current-members, no email/UPI in the output, and **time-zone independence in six zones (UTC+14 to UTC-11)** |
+| Data layer (23) | exact query (columns, filters), no `*`, no profile/email columns, zero rows and malformed ids give the identical combined error, malformed ids never reach the server, errors mapped, raw database text and "permission denied" never shown |
+| Time-zone "today" (5) | the same instant is a different day in different places; the day changes at local midnight (India 23:59:59 vs 00:00:00); daylight-saving days; trips starting/ending "today" |
+| Database (19, real Postgres engine) | the exact read as a member, ordinary member, stranger, member of another trip, removed member, member who left, signed out; unknown id looks identical to a hidden one; a co-member's profile and UPI cannot be read; emails unreachable; no email/UPI columns exist; no new function or permission. **4 deliberate weakenings were each caught** (trips/members visible to all, removed members counted, and the M2 profile rule opened up), then restored byte-for-byte. |
+| Date logic mutation | rewriting the day counter to use local midnight made 14 tests fail; restored |
+| Security audit (ADR-032) | all 12 tests pass unchanged against all migrations |
+| Real browser (Edge, `npm run ui:check`) | **133 checks pass** (86 earlier + 47 new, see below) |
+| Live project check (`npm run verify:supabase`) | PASSED, 0 failures, 0 warnings |
+| Production build | succeeds; 0 secret keys, 0 service-role tokens, 0 connection strings; 1 copy of the publishable key (expected, public by design) |
+
+### Browser testing (47 new checks)
+Card opens details (and is a labelled button); every field with and without description/budget; "1 day"; USD budget; Admin/You/Guest tags and ordering; former members hidden **even when the fake server wrongly sends them**; no email/UPI text on the page; the request's columns, filters and login (never a secret key); back, direct address and reload; creator-left and archived pages; **the identical message for someone else's trip, a nonexistent trip and a malformed address, revealing nothing and (for malformed) not contacting the server**; Back to Home; connection failure then Try again; loading state; signed-out visit goes to sign-in and requests no trip data; Dark theme; and **time-zone boundary checks in three zones (Pacific/Kiritimati UTC+14, Pacific/Pago_Pago UTC-11, Asia/Kolkata)**: trips starting today and ending today are Ongoing, starting tomorrow Upcoming, ended yesterday Completed, lengths right, and the Home list agrees with the details page. The fake server answers single-trip requests in the real array form.
+
+### Bugs found
+- No application bugs. Two test-side problems: a typing flaw in a test helper, and a theme check that forgot the account's saved theme wins after sign-in (correct, designed behaviour).
+
+### Not tested / not done / limits
+- **Live check is yours** (steps below). I could not sign in as a real user, so the details page has not been exercised against your real Supabase with a session. I probed the real server as a signed-out caller: the exact request is refused for *permission* (not "relationship not found"), which shows the trips-to-members link resolves, **but my control with a deliberately broken filter was refused the same way, so this probe does not prove the "current members only" filter syntax is accepted.** It is standard PostgREST behaviour, and the screen also filters to current members in code, so the worst case is the filter being ignored with no visible difference.
+- The database tests run the equivalent SQL join, not PostgREST itself.
+- Web only; not tested on a phone or emulator.
+- The phase badge is computed when the page renders; a page left open across midnight updates on the next load.
+- Returning to a deep link after sign-in is not built (you land on Home).
+- No editing, archiving, member changes, invitations, budget progress or expenses (M3.3 to M3.5 and later).
+- Source control: committed separately from M3.1 (which was left unchanged) and pushed to GitHub `main` together with it; see the git history for the hashes.
+
+### Live check (passed by you, 2026-11-18)
+1. `npm run app:web`, sign in, tap a trip card: the details page opens and shows what you entered, you as **Admin** and **You**, "Created by you".
+2. Press reload on that page: it stays.
+3. In a second browser sign in as a **different** account and paste the first account's trip address: you must see "Trip not available", with no trip name anywhere. Paste a made-up address like `/trips/not-a-real-id`: the **same** message.
+4. Check no email address appears on the page.
+
+### Next recommended step
+M3.2 is closed. When you approve starting it: **M3.3 - Edit and archive a trip** (not started).
+
+### Approved plan (as presented, kept for reference)
 
 ### Goal
 Tap a trip card on Home to open that trip's details page showing: name, destination, dates, description (if any), budget and currency (if any), who created it, and the people currently on the trip.

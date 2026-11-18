@@ -104,6 +104,12 @@ interface FakeBackend {
   createMode: 'ok' | 'slow' | 'dates_error' | 'missing_function';
   /** Set to make the trips list fail like a dropped connection. */
   failTripsList: boolean;
+  /** Set to make the single-trip (details) request fail like a dropped connection. */
+  failDetails: boolean;
+  /** Delay, in ms, before the details request is answered (to see the loading state). */
+  slowDetailsMs: number;
+  /** Set to make the fake server wrongly send former members too (the app must still not show them). */
+  leakFormerMembers: boolean;
 }
 
 const USER = { id: '11111111-2222-3333-4444-555555555555', email: 'asha@example.com', aud: 'authenticated', role: 'authenticated' };
@@ -137,7 +143,37 @@ function newBackend(): FakeBackend {
     trips: [],
     createMode: 'ok',
     failTripsList: false,
+    failDetails: false,
+    slowDetailsMs: 0,
+    leakFormerMembers: false,
   };
+}
+
+/** The same trip id each time, in the strict format real trip ids have. */
+const uuid = (n: number) => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
+
+/** A member row as the database returns it for the details query. */
+function memberRow(over: Record<string, any>): Record<string, any> {
+  return {
+    id: `m-${Math.random().toString(36).slice(2, 8)}`,
+    user_id: null,
+    display_name: 'Someone',
+    role: 'member',
+    status: 'active',
+    joined_at: '2026-11-18T10:00:00+00:00',
+    ...over,
+  };
+}
+
+/** Today's calendar day in a given time zone, as YYYY-MM-DD (what a person in that zone sees on their calendar). */
+function todayIn(timeZone: string): string {
+  return new Intl.DateTimeFormat('en-CA', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());
+}
+
+/** Adds days to a YYYY-MM-DD using pure calendar arithmetic. */
+function addDays(iso: string, n: number): string {
+  const [y, m, d] = iso.split('-').map(Number) as [number, number, number];
+  return new Date(Date.UTC(y, m - 1, d + n)).toISOString().slice(0, 10);
 }
 
 /** A trip row exactly as the database would return it, with its member list for the trips query. */
@@ -158,9 +194,15 @@ function tripRow(over: Record<string, any>): Record<string, any> {
     updated_at: '2026-11-18T00:00:00Z',
     version: 1,
     members: [{ id: 'member-1', status: 'active' }],
+    // Underscore fields are the fake server's own notes and are never sent to the app.
+    _members: [memberRow({ id: 'member-1', user_id: USER.id, display_name: 'Asha Rao', role: 'admin' })],
+    _hidden: false,
     ...over,
   };
 }
+
+/** Removes the fake server's private notes before a row is sent. */
+const publicRow = (row: Record<string, any>) => Object.fromEntries(Object.entries(row).filter(([k]) => !k.startsWith('_')));
 
 /** Calendar day relative to today, as YYYY-MM-DD in the browser's (local) calendar. */
 function dayFromToday(offset: number): string {
@@ -207,8 +249,19 @@ async function installFakeSupabase(context: BrowserContext, backend: FakeBackend
       return json(200, backend.profile);
     }
     if (url.pathname === '/rest/v1/trips' && method === 'GET') {
+      const idFilter = url.searchParams.get('id'); // present when the app asks for ONE trip (details)
+      if (idFilter && idFilter.startsWith('eq.')) {
+        if (backend.failDetails) return route.abort('connectionfailed');
+        if (backend.slowDetailsMs > 0) await new Promise((r) => setTimeout(r, backend.slowDetailsMs));
+        const wanted = idFilter.slice(3);
+        const found = backend.trips.find((t) => t.id === wanted && !t._hidden);
+        if (!found) return json(200, []); // unknown trip, someone else's trip, or removed: the database says nothing
+        const activeOnly = url.searchParams.get('trip_members.status') === 'eq.active' && !backend.leakFormerMembers;
+        const members = (found._members as Record<string, any>[]).filter((m) => !activeOnly || m.status === 'active');
+        return json(200, [{ ...publicRow(found), trip_members: members }]); // arrays, exactly as the real server answers
+      }
       if (backend.failTripsList) return route.abort('connectionfailed');
-      return json(200, backend.trips);
+      return json(200, backend.trips.filter((t) => !t._hidden).map(publicRow));
     }
     if (url.pathname === '/rest/v1/rpc/create_trip' && method === 'POST') {
       if (backend.createMode === 'dates_error') {
@@ -228,7 +281,7 @@ async function installFakeSupabase(context: BrowserContext, backend: FakeBackend
         currency: body.p_currency,
       });
       backend.trips.unshift(created);
-      const { members: _members, ...plain } = created;
+      const { members: _members, ...plain } = publicRow(created);
       return json(200, plain);
     }
     backend.unexpected.push(`${method} ${url.pathname}`);
@@ -650,6 +703,220 @@ async function tripFlows(browser: Awaited<ReturnType<typeof chromium.launch>>) {
   }
 }
 
+async function detailFlows(browser: Awaited<ReturnType<typeof chromium.launch>>) {
+  console.log('\nF. Trip details');
+  const site = await startWebsite({ EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY: DUMMY_PUBLISHABLE_KEY, EXPO_PUBLIC_SUPABASE_URL: SUPABASE_URL });
+  try {
+    const GOA = uuid(1);
+    const MINIMAL = uuid(2);
+    const USD = uuid(3);
+    const CREATOR_LEFT = uuid(4);
+    const ARCHIVED = uuid(5);
+    const HIDDEN = uuid(6); // exists, but belongs to someone else
+    const UNKNOWN = uuid(999); // does not exist at all
+    const startIso = dayFromToday(30);
+    const endIso = dayFromToday(33);
+    const OTHER = '99999999-9999-4999-8999-999999999999'; // another person's user id
+
+    const context = await browser.newContext();
+    const backend = newBackend();
+    backend.trips = [
+      tripRow({
+        id: GOA, name: 'Goa Trip 2026', destination: 'Goa, India', start_date: startIso, end_date: endIso,
+        description: 'Beach, food and friends', budget_minor: 6_000_000,
+        members: [{ id: 'g1', status: 'active' }, { id: 'g2', status: 'active' }, { id: 'g3', status: 'active' }],
+        _members: [
+          memberRow({ id: 'g2', user_id: '22222222-2222-4222-8222-222222222222', display_name: 'Ravi Kumar', joined_at: '2026-11-18T11:00:00+00:00' }),
+          memberRow({ id: 'g1', user_id: USER.id, display_name: 'Asha Rao', role: 'admin', joined_at: '2026-11-18T10:00:00+00:00' }),
+          memberRow({ id: 'g3', user_id: null, display_name: 'Gita (guest)', joined_at: '2026-11-18T12:00:00+00:00' }),
+          memberRow({ id: 'g4', user_id: '44444444-4444-4444-8444-444444444444', display_name: 'Removed Rahul', status: 'removed' }),
+          memberRow({ id: 'g5', user_id: '55555555-5555-4555-8555-555555555555', display_name: 'Departed Dev', status: 'left' }),
+        ],
+      }),
+      tripRow({ id: MINIMAL, name: 'Minimal Trip', destination: 'Lonavala', start_date: startIso, end_date: startIso }),
+      tripRow({ id: USD, name: 'Dubai Break', destination: 'Dubai', start_date: startIso, end_date: endIso, budget_minor: 150_000, currency: 'USD' }),
+      tripRow({
+        id: CREATOR_LEFT, name: 'Creator Left', destination: 'Jaipur', start_date: startIso, end_date: endIso, created_by: OTHER,
+        _members: [memberRow({ id: 'c1', user_id: USER.id, display_name: 'Asha Rao', role: 'admin' })],
+      }),
+      tripRow({ id: ARCHIVED, name: 'Archived Trip', destination: 'Hampi', start_date: dayFromToday(-90), end_date: dayFromToday(-88), status: 'archived' }),
+      tripRow({ id: HIDDEN, name: 'Someone Elses Secret Trip', destination: 'Nowhere Private', start_date: startIso, end_date: endIso, _hidden: true }),
+    ];
+    await installFakeSupabase(context, backend);
+    await sessionInStorage(context);
+    const page = await context.newPage();
+    const detailRequests = (id: string) => backend.requests.filter((r) => r.method === 'GET' && r.path.startsWith('/rest/v1/trips') && r.path.includes(`id=eq.${id}`));
+    const body = () => page.locator('body').innerText();
+    const textOf = async (id: string) => (await byId(page, id).innerText().catch(() => '')).replace(/\s+/g, ' ').trim();
+    const open = async (id: string, waitFor: string = 'trip-title') => {
+      await page.goto(`${BASE}/trips/${id}`);
+      return byId(page, waitFor).waitFor({ timeout: 20000 }).then(() => true, () => false);
+    };
+
+    // ---- open from Home
+    await page.goto(BASE);
+    await byId(page, `trip-card-${GOA}`).waitFor({ timeout: 20000 });
+    const label = (await byId(page, `trip-card-${GOA}`).getAttribute('aria-label')) ?? '';
+    check('accessibility: the trip card is a button that names the trip', label.startsWith('Open trip Goa Trip 2026, Goa, India'), label);
+    await byId(page, `trip-card-${GOA}`).click();
+    const opened = await byId(page, 'trip-title').waitFor({ timeout: 15000 }).then(() => true, () => false);
+    check('tapping a trip card opens its details page', opened && pathOf(page) === `/trips/${GOA}`, pathOf(page));
+
+    // ---- what the page shows
+    check('shows the trip name and destination', (await textOf('trip-title')) === 'Goa Trip 2026' && (await textOf('trip-destination')) === 'Goa, India');
+    check('shows the phase (starts in 30 days = Upcoming)', (await textOf('trip-phase')) === 'Upcoming');
+    check('shows the date range and the length in days', (await textOf('trip-dates')) === formatDateRange(startIso, endIso) && (await textOf('trip-length')) === '4 days', `${await textOf('trip-dates')} / ${await textOf('trip-length')}`);
+    check('shows the description', (await textOf('trip-description')) === 'Beach, food and friends');
+    check('shows the budget and the currency', (await textOf('trip-budget')) === '₹60,000' && (await textOf('trip-currency')) === 'INR');
+    check('says who created the trip ("you" for the creator)', (await textOf('trip-creator')) === 'Created by you');
+    check('counts only current people in the heading', await vis(page, 'People (3)').isVisible());
+    const people = await textOf('trip-people');
+    check('lists current people, administrators first', people.indexOf('Asha Rao') < people.indexOf('Ravi Kumar') && people.indexOf('Ravi Kumar') < people.indexOf('Gita (guest)'), people);
+    check('marks the administrator, yourself and a guest', (await textOf('member-g1')).includes('Admin') && (await textOf('member-g1')).includes('You') && !(await textOf('member-g2')).includes('Admin') && (await textOf('member-g3')).includes('Guest'));
+    const all = await body();
+    check('former members (removed, left) are not shown', !/Removed Rahul|Departed Dev/.test(all));
+    check('privacy: no email addresses or UPI IDs anywhere on the page', !/@|example\.com|okhdfcbank|upi/i.test(all.replace(/\bTripMate\b/g, '')), all.slice(0, 200));
+    const req = detailRequests(GOA)[0];
+    const decoded = decodeURIComponent(req?.path ?? '').replace(/\+/g, ' ');
+    check('the request names its columns (no "select everything")', !!req && !decoded.includes('select=*') && decoded.includes('display_name') && decoded.includes('trip_members('), decoded.slice(0, 160));
+    check('the request asks only for CURRENT members', decoded.includes('trip_members.status=eq.active'), decoded);
+    check('the request never touches profiles or emails', !/profiles|email|upi/i.test(decoded));
+    check('it carries the user\'s login, not a secret key', !!req?.auth?.startsWith('Bearer ') && !req.auth.includes('sb_secret'));
+    await shot(page, 'details-light');
+
+    // ---- back, deep link, reload
+    await byId(page, 'trip-back-home').click();
+    check('"← Home" goes back to the trip list', await byId(page, 'greeting').waitFor({ timeout: 8000 }).then(() => true, () => false) && pathOf(page) === '/');
+    check('opening the trip address directly works', await open(GOA) && (await textOf('trip-title')) === 'Goa Trip 2026');
+    await page.reload();
+    check('reloading the page keeps the trip open', await byId(page, 'trip-title').waitFor({ timeout: 20000 }).then(() => true, () => false));
+
+    // ---- other kinds of trip
+    await open(MINIMAL);
+    check('no description and no budget read clearly', (await textOf('trip-description')) === 'No description' && (await textOf('trip-budget')) === 'No budget set');
+    check('a one-day trip says "1 day"; one person on it', (await textOf('trip-length')) === '1 day' && (await vis(page, 'People (1)').isVisible()));
+    await open(USD);
+    check('other currencies show their code', (await textOf('trip-budget')) === 'USD 1,500' && (await textOf('trip-currency')) === 'USD');
+    await open(CREATOR_LEFT);
+    check('if the creator is no longer on the trip: "a former member"', (await textOf('trip-creator')) === 'Created by a former member');
+    await open(ARCHIVED);
+    check('a member can open an archived trip, with a clear notice', (await textOf('trip-archived')) === 'This trip is archived.' && (await textOf('trip-phase')) === 'Completed');
+
+    // ---- not available: ONE message for every cause
+    const message = async () => (await textOf('trip-unavailable'));
+    await open(HIDDEN, 'trip-unavailable');
+    const hiddenMsg = await message();
+    check('someone else\'s trip shows the combined "not available" message', hiddenMsg === "We couldn't open this trip. It may have been removed, or you may not be a member.", hiddenMsg);
+    const hiddenPage = await body();
+    check('...and reveals nothing about that trip', !/Someone Elses Secret Trip|Nowhere Private|People \(|Budget|Created by/.test(hiddenPage));
+    await shot(page, 'details-unavailable');
+    await open(UNKNOWN, 'trip-unavailable');
+    check('a trip that does not exist shows the IDENTICAL message', (await message()) === hiddenMsg);
+    const before = detailRequests('not-a-uuid').length;
+    await open('not-a-uuid', 'trip-unavailable');
+    check('a malformed address shows the IDENTICAL message', (await message()) === hiddenMsg);
+    check('...without asking the server at all', detailRequests('not-a-uuid').length === before);
+    check('the page gives no hint about why (no "denied", "forbidden", "private")', !/denied|forbidden|private|permission/i.test(hiddenMsg + (await textOf('trip-unavailable-title'))));
+    await byId(page, 'trip-unavailable-home').click();
+    check('"Back to Home" works from the not-available page', await byId(page, 'greeting').waitFor({ timeout: 8000 }).then(() => true, () => false) && pathOf(page) === '/');
+
+    // ---- connection trouble is different, and recoverable
+    backend.failDetails = true;
+    await open(GOA, 'trip-error');
+    check('a connection failure is a separate message with "Try again"', (await byId(page, 'trip-error').isVisible()) && (await byId(page, 'trip-retry').isVisible()) && !(await byId(page, 'trip-unavailable').isVisible().catch(() => false)));
+    backend.failDetails = false;
+    await byId(page, 'trip-retry').click();
+    check('"Try again" recovers and shows the trip', await byId(page, 'trip-title').waitFor({ timeout: 10000 }).then(() => true, () => false));
+
+    // ---- loading state
+    backend.slowDetailsMs = 1500;
+    await page.goto(`${BASE}/trips/${MINIMAL}`);
+    check('a loading message shows while the trip is being fetched', await byId(page, 'trip-loading').waitFor({ timeout: 8000 }).then(() => true, () => false));
+    check('...then the trip appears', await byId(page, 'trip-title').waitFor({ timeout: 10000 }).then(() => true, () => false));
+    backend.slowDetailsMs = 0;
+
+    // ---- a misbehaving server cannot make former members appear
+    backend.leakFormerMembers = true;
+    await open(GOA);
+    check('even if the server wrongly sent former members, they are not shown', !/Removed Rahul|Departed Dev/.test(await body()) && (await vis(page, 'People (3)').isVisible()));
+    backend.leakFormerMembers = false;
+
+    check('no unexpected network calls on the details pages', backend.unexpected.length === 0, backend.unexpected.join(', '));
+    await context.close();
+
+    // ---- signed out: sent to sign-in, and no trip data is requested
+    {
+      const anon = await browser.newContext();
+      const anonBackend = newBackend();
+      anonBackend.trips = backend.trips;
+      await installFakeSupabase(anon, anonBackend);
+      const p = await anon.newPage();
+      await p.goto(`${BASE}/trips/${GOA}`);
+      await byId(p, 'email').waitFor({ timeout: 20000 });
+      check('opening a trip address while signed out goes to sign-in', pathOf(p) === '/sign-in', pathOf(p));
+      check('...and no trip data is requested', !anonBackend.requests.some((r) => r.path.startsWith('/rest/v1/trips')));
+      await anon.close();
+    }
+
+    // ---- dark theme
+    {
+      const dark = await browser.newContext();
+      const darkBackend = newBackend();
+      darkBackend.trips = backend.trips;
+      // The account's saved theme wins after sign-in (by design), so this account must have Dark saved too.
+      darkBackend.profile = { ...darkBackend.profile, theme_preference: 'dark' };
+      await installFakeSupabase(dark, darkBackend);
+      await sessionInStorage(dark);
+      await dark.addInitScript(() => window.localStorage.setItem('tripmate.theme-preference', 'dark'));
+      const p = await dark.newPage();
+      await p.goto(`${BASE}/trips/${GOA}`);
+      await byId(p, 'trip-title').waitFor({ timeout: 20000 });
+      check('the details page follows the Dark theme', await waitFor(async () => (await screenBg(p)) === DARK_BG));
+      await shot(p, 'details-dark');
+      await dark.close();
+    }
+
+    // ---- calendar-date boundaries, in time zones far apart, on the REAL browser clock
+    console.log('\nG. Trip status and length at date boundaries, in different time zones');
+    for (const zone of ['Pacific/Kiritimati', 'Pacific/Pago_Pago', 'Asia/Kolkata']) {
+      const ctx = await browser.newContext({ timezoneId: zone });
+      const b = newBackend();
+      const today = todayIn(zone);
+      const cases = [
+        { id: uuid(101), name: 'Starts today', start: today, end: addDays(today, 3), phase: 'Ongoing', days: '4 days' },
+        { id: uuid(102), name: 'Ends today', start: addDays(today, -3), end: today, phase: 'Ongoing', days: '4 days' },
+        { id: uuid(103), name: 'Starts tomorrow', start: addDays(today, 1), end: addDays(today, 4), phase: 'Upcoming', days: '4 days' },
+        { id: uuid(104), name: 'Ended yesterday', start: addDays(today, -4), end: addDays(today, -1), phase: 'Completed', days: '4 days' },
+        { id: uuid(105), name: 'One day today', start: today, end: today, phase: 'Ongoing', days: '1 day' },
+      ];
+      b.trips = cases.map((c) => tripRow({ id: c.id, name: c.name, destination: 'Test', start_date: c.start, end_date: c.end }));
+      await installFakeSupabase(ctx, b);
+      await sessionInStorage(ctx);
+      const p = await ctx.newPage();
+      const results: string[] = [];
+      let allGood = true;
+      for (const c of cases) {
+        await p.goto(`${BASE}/trips/${c.id}`);
+        await byId(p, 'trip-title').waitFor({ timeout: 20000 });
+        const phase = (await byId(p, 'trip-phase').innerText()).trim();
+        const days = (await byId(p, 'trip-length').innerText()).trim();
+        if (phase !== c.phase || days !== c.days) allGood = false;
+        results.push(`${c.name}: ${phase}, ${days}`);
+      }
+      check(`${zone} (today is ${today}): starts-today and ends-today are Ongoing, tomorrow Upcoming, yesterday Completed, lengths right`, allGood, results.join(' | '));
+      await p.goto(BASE);
+      await byId(p, 'section-ongoing').waitFor({ timeout: 20000 });
+      const ongoing = (await byId(p, 'section-ongoing').innerText()).replace(/\s+/g, ' ');
+      const upcoming = (await byId(p, 'section-upcoming').innerText()).replace(/\s+/g, ' ');
+      const completed = (await byId(p, 'section-completed').innerText()).replace(/\s+/g, ' ');
+      check(`${zone}: the Home list agrees with the details page`, ongoing.includes('Starts today') && ongoing.includes('Ends today') && ongoing.includes('One day today') && upcoming.includes('Starts tomorrow') && completed.includes('Ended yesterday') && !ongoing.includes('Starts tomorrow'), ongoing.slice(0, 120));
+      await ctx.close();
+    }
+  } finally {
+    site.stop();
+  }
+}
+
 async function main() {
   const browser = await chromium.launch({ channel: 'msedge', headless: true });
   try {
@@ -657,6 +924,7 @@ async function main() {
     await accountFlows(browser);
     await signedInFlows(browser);
     await tripFlows(browser);
+    await detailFlows(browser);
   } finally {
     await browser.close();
   }

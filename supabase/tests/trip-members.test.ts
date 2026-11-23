@@ -125,16 +125,13 @@ describe('who can run what', () => {
     }
   });
 
-  it('signed-in users can run exactly these six, and the helpers and triggers stay closed', async () => {
+  it('signed-in users can run exactly the reviewed functions (the six member ones plus the later invitation ones), and the helpers and triggers stay closed', async () => {
     await users.asAdmin();
     const callable = (await db.query<{ proname: string }>(
       `select p.proname from pg_proc p join pg_namespace n on n.oid = p.pronamespace
         where n.nspname = 'public' and has_function_privilege('authenticated', p.oid, 'EXECUTE') order by 1`,
     )).rows.map((r) => r.proname);
-    expect(callable).toEqual([
-      'add_guest_member', 'create_trip', 'is_trip_member', 'leave_trip', 'list_trip_members', 'remove_member', 'rename_guest_member',
-      'set_member_role', 'set_trip_archived', 'update_trip',
-    ]);
+    expect(callable).toEqual(['add_guest_member', 'create_invite', 'create_trip', 'decide_join_request', 'get_general_invite_link', 'is_trip_member', 'leave_trip', 'list_join_requests', 'list_trip_invites', 'list_trip_members', 'preview_invite', 'remove_member', 'rename_guest_member', 'request_to_join', 'revoke_invite', 'set_member_role', 'set_trip_archived', 'update_trip']);
     for (const closed of ['member_change_context', 'check_trip_has_admin', 'trip_member_events_append_only', 'trip_role_of', 'bump_trip_version']) {
       const r = await db.query<{ ok: boolean }>(
         `select has_function_privilege('authenticated', p.oid, 'EXECUTE') or has_function_privilege('anon', p.oid, 'EXECUTE') as ok

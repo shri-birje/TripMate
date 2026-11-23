@@ -40,6 +40,36 @@ export const SUPABASE_STAND_IN = `
   $$;
   grant usage on schema auth, public to anon, authenticated;
   grant execute on function auth.uid() to anon, authenticated;
+  -- A STAND-IN for Supabase Vault (the real one only exists on Supabase). Same names and shapes as the parts we use:
+  -- vault.secrets, vault.decrypted_secrets and vault.create_secret(). Like the real Vault, the schema is closed to the
+  -- app roles (no usage granted to anon or authenticated). The "encryption" here is only a reversible encoding: it lets
+  -- the tests prove OUR logic (who may read, what is stored, when it is deleted); real encryption is checked live.
+  create schema vault;
+  create table vault.secrets (
+    id uuid primary key default gen_random_uuid(),
+    name text unique,
+    description text not null default '',
+    secret text not null,
+    key_id uuid,
+    nonce bytea,
+    created_at timestamptz not null default now(),
+    updated_at timestamptz not null default now()
+  );
+  create view vault.decrypted_secrets as
+    select id, name, description, secret,
+           convert_from(decode(substr(secret, 16), 'base64'), 'UTF8') as decrypted_secret,
+           key_id, nonce, created_at, updated_at
+      from vault.secrets;
+  create function vault.create_secret(new_secret text, new_name text default null, new_description text default '', new_key_id uuid default null)
+  returns uuid language plpgsql as $$
+  declare v_id uuid;
+  begin
+    insert into vault.secrets (name, description, secret, key_id)
+    values (new_name, coalesce(new_description, ''), 'standin-base64:' || encode(convert_to(new_secret, 'UTF8'), 'base64'), new_key_id)
+    returning id into v_id;
+    return v_id;
+  end;
+  $$;
   -- Supabase's generous defaults, which the migrations have to tighten:
   alter default privileges in schema public grant all on tables to anon, authenticated;
   alter default privileges in schema public grant all on functions to anon, authenticated;

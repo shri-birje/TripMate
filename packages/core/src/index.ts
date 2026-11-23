@@ -11,6 +11,7 @@ export * from './profile';
 export * from './trip';
 export * from './tripDetails';
 export * from './memberManagement';
+export * from './invite';
 export * from './tripEdit';
 export * from './dateInput';
 export * from './calendar';

@@ -10,6 +10,8 @@ import { ConfirmDialog } from '../../components/ConfirmDialog';
 import { TextField } from '../../components/TextField';
 import { useTheme } from '../../theme/ThemeProvider';
 import { spacing } from '../../theme/tokens';
+import { InvitePanel } from './InvitePanel';
+import { JoinRequestsPanel } from './JoinRequestsPanel';
 import { useAddGuest, useLeaveTrip, useRemoveMember, useRenameGuest, useSetMemberRole } from './tripMemberApi';
 import { TripMemberError, type MemberChange } from './tripMemberService';
 
@@ -57,6 +59,7 @@ export function PeopleCard({ details, userId, reload, onLeft }: Props) {
   const [addError, setAddError] = useState<string | null>(null);
   const [renaming, setRenaming] = useState<{ id: string; text: string; error: string | null } | null>(null);
   const [showFormer, setShowFormer] = useState(false);
+  const [claimFor, setClaimFor] = useState<TripMember | null>(null);
 
   function perform<V>(
     mutation: UseMutationResult<MemberChange, TripMemberError, V>,
@@ -283,6 +286,18 @@ export function PeopleCard({ details, userId, reload, onLeft }: Props) {
                   {actions.canRename && (
                     <Button testID={`member-rename-${m.id}`} label="Rename" variant="secondary" disabled={busy} onPress={() => setRenaming({ id: m.id, text: m.displayName, error: null })} />
                   )}
+                  {actions.canInviteToClaim && (
+                    <Button
+                      testID={`member-invite-${m.id}`}
+                      label="Invite to claim this spot"
+                      variant="secondary"
+                      disabled={busy}
+                      onPress={() => {
+                        setClaimFor(m);
+                        setOpenMenu(null);
+                      }}
+                    />
+                  )}
                   {actions.canRemove && <Button testID={`member-remove-${m.id}`} label="Remove from trip" variant="secondary" disabled={busy} onPress={() => openDialog({ kind: 'remove', member: m })} />}
                 </View>
               )}
@@ -340,6 +355,8 @@ export function PeopleCard({ details, userId, reload, onLeft }: Props) {
           This trip has 50 people, the most it can have. Remove someone to add another.
         </AppText>
       )}
+      <JoinRequestsPanel details={details} userId={userId} reload={reload} />
+      <InvitePanel details={details} userId={userId} claimFor={claimFor} onClaimDone={() => setClaimFor(null)} />
       {isAdmin && archived && (
         <AppText variant="small" tone="secondary" testID="people-archived-note">
           This trip is archived, so people can&apos;t be changed. Restore it to make changes. You can still leave it.

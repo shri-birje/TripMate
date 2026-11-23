@@ -5,6 +5,7 @@ import { useState } from 'react';
 import { LoadingScreen, SetupScreen } from '../components/StatusScreens';
 import { AuthProvider, useAuth } from '../features/auth/AuthProvider';
 import { ThemeProfileSync } from '../features/profile/themeSync';
+import { pendingInvite } from '../lib/pendingInvite';
 import { ThemeProvider, useTheme } from '../theme/ThemeProvider';
 
 /**
@@ -34,6 +35,10 @@ export default function RootLayout() {
  * reach the (auth) screens. Typing a protected address while signed out sends you to
  * sign-in, and opening sign-in while already signed in sends you home.
  *
+ * One screen is open to everyone: /join/<token> (an invitation link). A signed-out person who
+ * opens it is sent to sign in and, once signed in, is brought back to the same link (the token
+ * is kept briefly by lib/pendingInvite, and cleared as soon as it is used or found invalid).
+ *
  * (This protects what the app SHOWS. What a person can actually read or change is
  * enforced separately by the database's security rules.)
  */
@@ -45,6 +50,7 @@ function RouteGuard() {
   if (state.status === 'unconfigured') return <SetupScreen message={state.message} />;
 
   const signedIn = state.status === 'signedIn';
+  const waitingInvite = pendingInvite.peek();
   return (
     <>
       <StatusBar style={scheme === 'dark' ? 'light' : 'dark'} />
@@ -53,10 +59,12 @@ function RouteGuard() {
         <Stack.Protected guard={signedIn} redirectTo="/sign-in">
           <Stack.Screen name="(app)" />
         </Stack.Protected>
-        {/* Signed in + trying to open a sign-in/sign-up screen -> go home */}
-        <Stack.Protected guard={!signedIn} redirectTo="/">
+        {/* Signed in + trying to open a sign-in/sign-up screen -> go home (or back to the invitation they were opening) */}
+        <Stack.Protected guard={!signedIn} redirectTo={waitingInvite ? `/join/${waitingInvite}` : '/'}>
           <Stack.Screen name="(auth)" />
         </Stack.Protected>
+        {/* Invitation links: open to everyone */}
+        <Stack.Screen name="join/[token]" />
       </Stack>
     </>
   );

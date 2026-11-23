@@ -68,6 +68,8 @@ export interface MemberActions {
   canRemoveAdminRights: boolean;
   canRemove: boolean;
   canRename: boolean;
+  /** Make a link that lets this friend (a guest) take over their own place with an account (M3.5). */
+  canInviteToClaim: boolean;
   /** Any of the above. */
   any: boolean;
 }
@@ -80,7 +82,8 @@ export function memberActions(details: TripDetails, userId: string | null, membe
   const canRemoveAdminRights = manage && member.role === 'admin' && otherAdmins(details, member.id).length > 0;
   const canRemove = manage && !me;
   const canRename = manage && member.isGuest;
-  return { canMakeAdmin, canRemoveAdminRights, canRemove, canRename, any: canMakeAdmin || canRemoveAdminRights || canRemove || canRename };
+  const canInviteToClaim = manage && member.isGuest;
+  return { canMakeAdmin, canRemoveAdminRights, canRemove, canRename, canInviteToClaim, any: canMakeAdmin || canRemoveAdminRights || canRemove || canRename || canInviteToClaim };
 }
 
 export type AddState = { canAdd: true } | { canAdd: false; reason: 'not_admin' | 'archived' | 'full' };

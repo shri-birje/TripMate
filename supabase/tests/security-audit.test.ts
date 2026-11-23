@@ -25,9 +25,20 @@ let db: PGlite;
 
 /** Functions that signed-in users are allowed to run. Add a name here ONLY after reviewing the function. */
 const ALLOWED_CALLABLE_FUNCTIONS = [
-  'add_guest_member', 'create_trip', 'is_trip_member', 'leave_trip', 'list_trip_members', 'remove_member',
-  'rename_guest_member', 'set_member_role', 'set_trip_archived', 'update_trip',
-]; // set_trip_archived and update_trip reviewed for M3.3; the six member functions (add_guest_member ... set_member_role) reviewed for M3.4
+  'add_guest_member', 'create_invite', 'create_trip', 'decide_join_request', 'get_general_invite_link', 'is_trip_member', 'leave_trip', 'list_join_requests',
+  'list_trip_invites', 'list_trip_members', 'preview_invite', 'remove_member', 'rename_guest_member', 'request_to_join',
+  'revoke_invite', 'set_member_role', 'set_trip_archived', 'update_trip',
+]; // set_trip_archived and update_trip reviewed for M3.3; the six member functions for M3.4; the invitation and join-request functions for M3.5 (approval-based, ADR-059)
+
+/**
+ * Functions that SIGNED-OUT visitors (anon) may run. Until M3.5 this list was empty. preview_invite is the one
+ * deliberate exception (a person must be able to see what they are being invited to before they sign in). Add a name
+ * here ONLY after a security review; ADR-054 makes edge rate limiting on it mandatory before public deployment.
+ */
+const ALLOWED_SIGNED_OUT_FUNCTIONS = ['preview_invite'];
+
+/** The only columns the signed-out preview may ever return (no ids, no money, no people, no hashes). */
+const PREVIEW_COLUMNS = 'trip_name text, destination text, start_date date, end_date date, inviter_name text, member_count integer, is_claim boolean, claim_name text';
 
 /** Column-level UPDATE rights a signed-in user may have (table -> columns). */
 const ALLOWED_COLUMN_UPDATES: Record<string, string[]> = {
@@ -131,6 +142,54 @@ describe('tables', () => {
   });
 });
 
+describe('invitations table', () => {
+  it('trip_invites and trip_join_requests have NO permission for anyone: not signed-out, not signed-in, not even to read', async () => {
+    for (const table of ['trip_invites', 'trip_join_requests']) {
+      const r = await db.query(
+        `select grantee, privilege_type from information_schema.role_table_grants where table_schema = 'public' and table_name = $1
+           and grantee in ('anon', 'authenticated', 'PUBLIC')`, [table],
+      );
+      expect(r.rows, table).toEqual([]);
+      const cols = await db.query(
+        `select grantee from information_schema.role_column_grants where table_schema = 'public' and table_name = $1 and grantee in ('anon', 'authenticated', 'PUBLIC')`, [table],
+      );
+      expect(cols.rows, table).toEqual([]);
+    }
+  });
+});
+
+describe('the Vault (where the general link\'s token is kept encrypted)', () => {
+  it('is closed to signed-in and signed-out visitors: no schema, table or view access of any kind', async () => {
+    const r = await db.query<{ a: boolean; b: boolean; c: boolean; d: boolean; e: boolean; f: boolean }>(
+      `select has_schema_privilege('anon', 'vault', 'USAGE') as a, has_schema_privilege('authenticated', 'vault', 'USAGE') as b,
+              has_table_privilege('anon', 'vault.secrets', 'SELECT') as c, has_table_privilege('authenticated', 'vault.secrets', 'SELECT') as d,
+              has_table_privilege('anon', 'vault.decrypted_secrets', 'SELECT') as e, has_table_privilege('authenticated', 'vault.decrypted_secrets', 'SELECT') as f`,
+    );
+    expect(r.rows[0]).toEqual({ a: false, b: false, c: false, d: false, e: false, f: false });
+  });
+
+  it('only the reviewed functions touch it, and every one pins its search_path', async () => {
+    const r = await db.query<{ name: string; secdef: boolean; config: string[] | null }>(
+      `select p.proname as name, p.prosecdef as secdef, p.proconfig as config from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+        where n.nspname = 'public' and p.prosrc ilike '%vault.%' order by 1`,
+    );
+    expect(r.rows.map((x) => x.name)).toEqual(['create_invite', 'get_general_invite_link', 'revoke_invite', 'trip_invites_remove_secret']);
+    for (const f of r.rows) {
+      expect(f.secdef, f.name).toBe(true);
+      expect((f.config ?? []).some((c) => c.startsWith('search_path=')), f.name).toBe(true);
+    }
+  });
+
+  it('only get_general_invite_link ever returns a token from it, and the clean-up trigger is closed to the app', async () => {
+    const fns = await functions();
+    const touching = fns.filter((f) => /vault\./i.test(f.body));
+    const returnsTokens = touching.filter((f) => /decrypted_secret/i.test(f.body)).map((f) => f.name);
+    expect(returnsTokens).toEqual(['get_general_invite_link']);
+    expect(fns.find((f) => f.name === 'trip_invites_remove_secret')!.authedCanRun).toBe(false);
+    expect(fns.find((f) => f.name === 'trip_invites_remove_secret')!.anonCanRun).toBe(false);
+  });
+});
+
 describe('functions', () => {
   it('finds the functions it is meant to audit', async () => {
     const names = (await functions()).map((f) => f.name);
@@ -147,18 +206,35 @@ describe('functions', () => {
     expect(loose.map((f) => f.name)).toEqual([]);
   });
 
-  it('5. no function can be run by signed-out visitors or by PUBLIC', async () => {
+  it('5. no function can be run by signed-out visitors or by PUBLIC, except the reviewed signed-out allow-list', async () => {
     const fns = await functions();
-    expect(fns.filter((f) => f.anonCanRun).map((f) => f.name)).toEqual([]);
+    expect(fns.filter((f) => f.anonCanRun).map((f) => f.name)).toEqual(ALLOWED_SIGNED_OUT_FUNCTIONS);
     // A NULL permission list means "default", which includes PUBLIC. An entry starting with "=" is PUBLIC.
     expect(fns.filter((f) => f.acl === null || /(^|[{,])=X\//.test(f.acl)).map((f) => f.name)).toEqual([]);
   });
 
   it('6. every SECURITY DEFINER function a signed-in user can run identifies the caller with auth.uid()', async () => {
     const missing = (await functions())
-      .filter((f) => f.secdef && f.authedCanRun && !/auth\.uid\(\)/.test(f.body))
+      .filter((f) => f.secdef && f.authedCanRun && !ALLOWED_SIGNED_OUT_FUNCTIONS.includes(f.name) && !/auth\.uid\(\)/.test(f.body))
       .map((f) => f.name);
     expect(missing).toEqual([]);
+  });
+
+  it('6b. each signed-out function is held to its own stricter rules: validated token, fixed public columns, nothing else', async () => {
+    for (const name of ALLOWED_SIGNED_OUT_FUNCTIONS) {
+      const fn = (await functions()).find((f) => f.name === name)!;
+      expect(fn.secdef).toBe(true);
+      // it must check the token's hash, expiry, revocation and use count, and the trip's state
+      for (const needle of ['token_hash', 'revoked_at is null', 'expires_at > now()', 'i.use_count = 0', "t.status = 'active'", '^[0-9a-f]{64}$']) {
+        expect(fn.body, `${name} must contain: ${needle}`).toContain(needle);
+      }
+      // it must never reach for money, ids of people, or anything about accounts
+      for (const forbidden of ['budget', 'auth.users', 'upi', 'email', 'profiles']) {
+        expect(fn.body.toLowerCase(), `${name} must not touch: ${forbidden}`).not.toContain(forbidden);
+      }
+      const shape = (await db.query<{ r: string }>(`select pg_get_function_result(p.oid) as r from pg_proc p where p.proname = $1`, [name])).rows[0]!.r;
+      expect(shape).toBe(`TABLE(${PREVIEW_COLUMNS})`);
+    }
   });
 
   it('7. the functions a signed-in user can run are exactly the reviewed allow-list', async () => {
@@ -168,7 +244,7 @@ describe('functions', () => {
 
   it('internal helper functions cannot be run by signed-in users either', async () => {
     const fns = await functions();
-    for (const name of ['handle_new_user', 'set_updated_at']) {
+    for (const name of ['handle_new_user', 'set_updated_at', 'invite_token_hash']) {
       expect(fns.find((f) => f.name === name)!.authedCanRun).toBe(false);
     }
   });

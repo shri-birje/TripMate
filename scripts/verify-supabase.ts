@@ -154,6 +154,9 @@ async function checkTrips(url: string, key: string) {
     const EDIT_MIGRATION = 'supabase/migrations/20261118200000_trip_edit_archive.sql';
     const nobody = '00000000-0000-4000-8000-000000000000';
     const MEMBER_MIGRATION = 'supabase/migrations/20261118300000_member_management.sql';
+    const INVITE_MIGRATION = 'supabase/migrations/20261118400000_invitations.sql';
+    const JOIN_MIGRATION = 'supabase/migrations/20261123000000_join_requests.sql';
+    const LINK_MIGRATION = 'supabase/migrations/20261123100000_reusable_general_link.sql';
     const probes: { name: string; args: Record<string, unknown>; mustBeClosed: boolean; migration?: string }[] = [
       { name: 'update_trip', args: { p_trip_id: nobody, p_expected_version: 1, p_name: 'x', p_destination: 'y', p_start_date: '2030-01-01', p_end_date: '2030-01-02' }, mustBeClosed: true },
       { name: 'set_trip_archived', args: { p_trip_id: nobody, p_archived: true, p_expected_version: 1 }, mustBeClosed: true },
@@ -166,15 +169,41 @@ async function checkTrips(url: string, key: string) {
       { name: 'remove_member', args: { p_trip_id: nobody, p_member_id: nobody }, mustBeClosed: true, migration: MEMBER_MIGRATION },
       { name: 'leave_trip', args: { p_trip_id: nobody }, mustBeClosed: true, migration: MEMBER_MIGRATION },
       { name: 'member_change_context', args: { p_trip_id: nobody, p_uid: nobody, p_need_admin: false, p_allow_archived: false }, mustBeClosed: true, migration: MEMBER_MIGRATION },
+      // ---- Milestone M3.5: invitations. All closed to signed-out visitors EXCEPT preview_invite (checked separately below).
+      { name: 'create_invite', args: { p_trip_id: nobody }, mustBeClosed: true, migration: INVITE_MIGRATION },
+      { name: 'list_trip_invites', args: { p_trip_id: nobody }, mustBeClosed: true, migration: INVITE_MIGRATION },
+      { name: 'revoke_invite', args: { p_trip_id: nobody, p_invite_id: nobody }, mustBeClosed: true, migration: INVITE_MIGRATION },
+      { name: 'invite_token_hash', args: { p_token: 'x' }, mustBeClosed: true, migration: INVITE_MIGRATION },
+      // ---- Milestone M3.5 revision: approval-based joining. Closed to signed-out visitors.
+      { name: 'request_to_join', args: { p_token: 'f'.repeat(64) }, mustBeClosed: true, migration: JOIN_MIGRATION },
+      { name: 'list_join_requests', args: { p_trip_id: nobody }, mustBeClosed: true, migration: JOIN_MIGRATION },
+      { name: 'decide_join_request', args: { p_trip_id: nobody, p_request_id: nobody, p_approve: true }, mustBeClosed: true, migration: JOIN_MIGRATION },
+      // ---- Milestone M3.5 UX finalisation: Copy link. Closed to signed-out visitors (an administrator's call only).
+      { name: 'get_general_invite_link', args: { p_trip_id: nobody }, mustBeClosed: true, migration: LINK_MIGRATION },
     ];
     for (const probe of probes) {
       const r = await call(`${url}/rest/v1/rpc/${probe.name}`, key, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(probe.args) });
       const c = (r.body?.code as string | undefined) ?? '';
       if (r.status >= 200 && r.status < 300) fail(`A signed-out visitor could RUN ${probe.name}(). Security rules are wrong!`);
       else if (c === '42501') ok(`${probe.name}() cannot be run by signed-out visitors (permission denied)`);
-      else if (r.status === 404 || c === 'PGRST202') warn(`${probe.name}() is not available yet. Run ${probe.migration ?? EDIT_MIGRATION} in the Supabase SQL Editor (${probe.migration ? 'managing people' : 'trip editing and archiving'} needs it).`);
+      else if (r.status === 404 || c === 'PGRST202') warn(`${probe.name}() is not available yet. Run ${probe.migration ?? EDIT_MIGRATION} in the Supabase SQL Editor (${probe.migration === JOIN_MIGRATION ? 'approval-based joining' : probe.migration === INVITE_MIGRATION ? 'invitations' : probe.migration ? 'managing people' : 'trip editing and archiving'} needs it).`);
       else warn(`${probe.name}() refused a signed-out visitor, but with an unexpected code (HTTP ${r.status}, ${c || 'none'})`);
     }
+
+    // ---- accept_invite() used to let a link make someone a member at once. It must be GONE once migration 20261123000000 is applied.
+    const accept = await call(`${url}/rest/v1/rpc/accept_invite`, key, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ p_token: 'f'.repeat(64) }) });
+    const acceptCode = (accept.body?.code as string | undefined) ?? '';
+    if (accept.status >= 200 && accept.status < 300) fail('A signed-out visitor could RUN accept_invite(). Security rules are wrong!');
+    else if (accept.status === 404 || acceptCode === 'PGRST202') ok('accept_invite() no longer exists: a link can only make a join request, never a member');
+    else warn(`accept_invite() still exists, so a link could still add a member at once. Run ${JOIN_MIGRATION} in the Supabase SQL Editor (approval-based joining needs it).`);
+
+    // ---- preview_invite is the ONE function a signed-out visitor may run. It must work, and must answer an unknown token with an EMPTY list (not an error, not a hint).
+    const preview = await call(`${url}/rest/v1/rpc/preview_invite`, key, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ p_token: 'f'.repeat(64) }) });
+    const previewCode = (preview.body?.code as string | undefined) ?? '';
+    if (preview.status === 404 || previewCode === 'PGRST202') warn(`preview_invite() is not available yet. Run ${INVITE_MIGRATION} in the Supabase SQL Editor (invitations need it).`);
+    else if (preview.status === 200 && Array.isArray(preview.body) && preview.body.length === 0) ok('preview_invite() is open to signed-out visitors by design, and gives an empty answer for an unknown link');
+    else if (preview.status === 200) fail('preview_invite() returned data for a made-up link. Security rules are wrong!');
+    else warn(`preview_invite() answered unexpectedly (HTTP ${preview.status}, ${previewCode || 'none'})`);
   } catch (e) {
     fail(`Trips check failed: ${e instanceof Error ? e.name : 'error'}`);
   }

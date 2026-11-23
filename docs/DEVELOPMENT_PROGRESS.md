@@ -13,7 +13,7 @@ Rule: a feature is **Complete** only when it works **and has been tested**. "Cod
 | **M0 — Project foundation** | ✅ **Complete (approved 2026-11-17)** |
 | **M1 — Core money engine (`packages/core`)** | ✅ **Complete (approved 2026-11-17)** |
 | **M2 — Accounts, profiles, theme** | ✅ **Complete** (live check passed and approved 2026-11-18; committed and pushed as `f90d1a6`) |
-| **M3 — Trips and members** | 🔵 **In progress, 5 small features** (see M3 plan): **M3.1 Create a trip ✅ complete (approved 2026-11-18)**; **M3.2 View trip details ✅ complete (live-verified and approved 2026-11-18)**; **M3.3 Edit and archive, with the date input and calendar refinement: approved, committed (`84ec09e`) and pushed**; **M3.4 members and roles: plan approved (D1-D10); step (a) read side approved; step (b) write actions, audit trail and People card controls built and tested, awaiting your review (nothing committed; migration #4 not yet applied live)**; M3.5 not started |
+| **M3 — Trips and members** | 🔵 **In progress, 5 small features** (see M3 plan): **M3.1 Create a trip ✅ complete (approved 2026-11-18)**; **M3.2 View trip details ✅ complete (live-verified and approved 2026-11-18)**; **M3.3 Edit and archive, with the date input and calendar refinement: approved, committed (`84ec09e`) and pushed**; **M3.4 members and roles: plan approved (D1-D10); steps (a) and (b) approved, committed (`b3d8baf`), pushed, and migration #4 applied live**; **M3.5 invitations: v1 built (uncommitted; migration #5 applied live); revised to approval-based joining, built and tested, awaiting your review (migration #6 not applied live)**; M3.5 not started |
 | M4 — Invites + guest claim | Not started |
 | M5 — Expenses + split types | Not started. **Must (ADR-043):** make `update_trip` refuse trip date changes that would leave an existing expense outside the trip; refuse expenses and repayments on archived trips; keep currency unchangeable; use the lock + version pattern for every money-changing function |
 | M6 — Balances + settlement plan | Not started |
@@ -240,8 +240,8 @@ M3 is delivered as five small features, one at a time, each ending with your app
 | **M3.1** | **Create a trip** (+ your trips on Home) | ✅ Complete (live-verified and approved 2026-11-18) |
 | M3.2 | View trip details (dates, budget, members list) | ✅ Complete (live-verified and approved 2026-11-18) |
 | M3.3 | Edit and archive a trip (admin only, conflict-safe) | ✅ Complete, approved, committed `84ec09e` and pushed |
-| M3.4 | Members and roles: add guest members, remove, make/remove admin, leave, last-admin protection | 🟡 Plan approved. Step (a) approved. Step (b) built and tested, awaiting your review (uncommitted); migration #4 not yet applied live |
-| M3.5 | Invitation links: create, revoke, preview, join | Not started |
+| M3.4 | Members and roles: add guest members, remove, make/remove admin, leave, last-admin protection | ✅ Complete, approved, committed `b3d8baf`, pushed, migration #4 applied live |
+| M3.5 | Invitation links: create, revoke, preview, join | 🟡 v1 built (uncommitted, migration #5 live). Approval-based revision built and tested; awaiting your review (uncommitted; migration #6 not applied live) |
 
 **Design decision for M3 (recorded as ADR-032):** trip and member changes are **database functions that check who is calling** (`auth.uid()`), not an API using Supabase's secret key. Each is atomic and tested with the same real-Postgres method as profiles. This means **no secret key is needed anywhere**. The original plan (API + secret key, ADR-004) only becomes necessary at expenses (M5) where the money engine must run on a server, and even then the server can forward the user's own login. **ADR-032 was approved by you on 2026-11-18, with eight security conditions** (listed in the decisions log). They are enforced by an automatic audit test (`supabase/tests/security-audit.test.ts`) that runs against every migration.
 
@@ -828,3 +828,312 @@ No `removed_by` column (the events table records who removed whom); `remove_memb
 
 ### Next
 Your review. Then, only on approval: commit/push, and you apply migration #4 (Step 11). M3.5 (invitations) is not started.
+
+
+---
+
+## M3.5 — Invitations and guest claiming (PLAN UPDATED with your decisions; nothing implemented, awaiting approval to build)
+
+**Status: plan updated with your decisions D1-D10. No M3.5 code, migration or test exists yet.** M3.4 (steps a and b) is approved, committed as `b3d8baf` and pushed; migration #4 is live.
+
+**Decisions recorded (approved):** D1 expiry 7 days by default, admin may choose up to 30. D2 single-use by default, admin may choose a higher limit. D3 only admins create invites. D4 duplicate display names ARE allowed for registered accounts (genuine users are never blocked because a name matches); guest-name uniqueness is unchanged; accounts are always identified by authenticated user id, never by display name. D5 no database rate limiting now, **recorded as a mandatory requirement before public deployment**. D10 any admin may revoke any invite (recommended approach approved).
+
+### What I inspected
+`docs/DATABASE_SCHEMA.md` §4.4 (the `trip_invites` table sketched at the architecture stage), `API_DESIGN.md` §5.4 (the original invite endpoints, written before ADR-032), `SECURITY_ARCHITECTURE.md` (the "invite abuse" threat row and residual risks), Q-5/Q-6/Q-8 in the decisions log, and the M3.4 migration, functions, audit table and `PeopleCard` this builds on.
+
+**What M3.5 reuses from M3.4, unchanged:** the row lock + re-check pattern, the last-admin invariant, the 50-person and unique-active-name rules, `trip_member_events`, and the existence-hiding answer for anyone not on a trip. **What is new:** the only database function in the whole project callable by a **signed-out** visitor (the public invite preview), and a cryptographically random token that must never be guessable or stored in the clear.
+
+### 1. Model
+- A **trip invite** is a row in `trip_invites`: a trip, who made it, when it expires, how many times it may be used, how many times it has been, and whether it was revoked. The **raw token is shown to the admin once and never stored**; only its SHA-256 hash is kept, so a database leak cannot be turned into working invites.
+- An invite is either **general** (anyone who opens the link and accepts becomes an ordinary member) or **a claim invite** for one named guest (`claim_member_id` set): accepting it turns that exact guest row into a signed-up member, keeping its id so expense history never moves.
+- Accepting is **idempotent** per person: already being an active member is a safe no-op: the same person clicking twice, or a claim link opened by someone who already joined normally, changes nothing.
+
+### 2. Feature scope
+- **Create an invite** (admin only, D3): a link, an optional expiry (D1) and optional use limit (D2), optionally tied to one existing guest.
+- **List invites** (admin only): active and used-up/expired/revoked ones, with their usage, so an admin can see what is out there.
+- **Revoke an invite** (any admin, D10, consistent with M3.4 D1's peer model).
+- **Public preview** (no account needed): trip name, destination, dates, who invited, how many people are on the trip. No budget, no money, no member list, no email.
+- **Accept** (must be signed in first; if not, the screen sends them to sign up/sign in and back): joins as an ordinary member, or claims the named guest if the invite was made for one. A registered person whose display name matches an existing member is **allowed in** (D4); only guest names stay unique.
+- **Not in scope:** inviting by email/SMS (link-only), changing an invite's expiry/limit after creation (revoke and make a new one instead), and anything about expenses or balances.
+
+### 3. Database migration requirements (one new migration, additive)
+- **`trip_invites`** as sketched in `DATABASE_SCHEMA.md` §4.4: `id`, `trip_id` (cascade), `token_hash` (unique, SHA-256), `claim_member_id` (nullable, → `trip_members.id`), `created_by` (→ `trip_members.id`), `expires_at`, `max_uses` (nullable = unlimited until expiry), `use_count`, `revoked_at`, `created_at`.
+- **RLS, deliberately stricter than `trips`/`trip_members`:** no `SELECT` grant on the table at all, for anyone, including the admin who made it. Nobody but the function layer ever sees `token_hash`, even hashed. Listing and reading invites only ever happens through functions that return the few safe columns.
+- `trip_member_events`'s action list gains `joined` and `guest_claimed` (an additive change to the existing `CHECK`, like adding `set_member_role` was for M3.3→M3.4; every row written so far stays valid).
+- The token is generated with `gen_random_bytes(32)` (pgcrypto, already available) inside the database, base64url-encoded, and returned once; nothing about it is logged anywhere (and the `verify:supabase` script, which never prints keys, sets the pattern to follow).
+
+### 4. Functions (ADR-032 pattern throughout)
+- `create_invite(trip_id, claim_member_id?, expires_in_hours?, max_uses?)` — admin only (via `member_change_context`), archived trips refused; if `claim_member_id` is given it must be an active guest on that trip; returns the raw token once.
+- `list_trip_invites(trip_id)` — admin only; returns id, who it is for (if a claim), expiry, uses, revoked, created — never the hash.
+- `revoke_invite(trip_id, invite_id)` — admin only; safe to repeat.
+- `preview_invite(token)` — **the one function open to signed-out callers (`anon`)**: hashes the token, checks it exists, is not expired, not revoked, not used up, and returns only the public fields. An invalid, expired, revoked, used-up, or entirely made-up token all give the **same** "This invite link isn't valid" answer (existence-hiding, extended to tokens).
+- `accept_invite(token)` — signed-in only: re-validates the token exactly as the preview does, then either reactivates/creates the caller's own membership (general invite) or claims the named guest (claim invite); enforces the 50-person cap and the name-uniqueness rule for a brand-new join; increments `use_count`; writes one `trip_member_events` row (`joined` or `guest_claimed`). Already being an active member is a safe no-op.
+- `security-audit.test.ts` gains a **second, explicit allow-list for `anon`** (today it only asserts anon can run *nothing*; `preview_invite` becomes the first and, I expect, only exception) so this stays a deliberate, reviewed decision rather than a silent one.
+
+### 5. API and frontend changes
+- **core:** `invite.ts` (+test): token/link shaping, expiry and use-limit validation, the RPC argument builders, and a pure `inviteState` helper mirroring `memberManagement.ts`'s button logic.
+- **app:** `tripInviteService.ts` (+test, typed errors on the same pattern as `tripMemberService`), `tripInviteApi.ts` (hooks), an **"Invite people"** section on `PeopleCard` (admins: create/copy/revoke/list; shows the link only once, right after creation, with a clear "copy it now" warning), and a new **public** screen at `/join/:token` that works signed-out (shows the preview and a sign-up/sign-in prompt) and signed-in (shows the preview with an Accept button).
+- **Unchanged:** every M3.1-M3.4 function, screen and test.
+
+### 6. Security and privacy
+- The 256-bit random token is the primary defence against guessing; it is never logged, never returned a second time, and compared only by its hash.
+- `preview_invite` is the **only** anon-callable function in the project; it is pinned to a short, explicit column list (no budget, no members, no admin's user id — only their display name) and reviewed the same way M3.3/M3.4 functions were.
+- No rate limiting exists inside Postgres itself. **Open risk (D5 below):** without an edge/CDN layer, nothing stops many preview or accept attempts per second beyond the token's own entropy. I recommend accepting this for M3.5 and revisiting at deployment (Q-8), since Vercel/Cloudflare can both rate-limit by path with no app code.
+- Claiming a guest never creates a second member row; the claimed row's id, join date and history are unchanged, only `user_id` and (if useful) the name are updated.
+- Revoked/expired/used-up tokens are indistinguishable from fake ones in the preview's answer.
+- **Raw tokens are never logged** anywhere: not in database logs (the functions never write them), not in `trip_member_events`, not in the app's error reporting (the service maps every failure to a fixed message), and not in test output (tests assert the token does not appear in any error text).
+- **Account identity** is always the authenticated user id (`auth.uid()`); display names are presentation only, never used to match or authorise anyone.
+- **Mandatory before public deployment (D5, recorded):** rate limiting on `preview_invite` and `accept_invite` at the edge (Vercel/Cloudflare path-based rules or Supabase's own limits), because the database itself has none.
+
+### 7. Edge cases and failure scenarios
+Expired, revoked, used-up, and syntactically-invalid tokens (same message); an invite opened by an account already on the trip (safe no-op, D4 means a name match is never a reason to refuse); a claim invite whose guest was removed or renamed before it was used (the claim follows the guest's id, not their name); accepting while already an active member (no-op); accepting while the trip is archived (refused, matching the "no new members on an archived trip" rule); the 50-person cap at the moment of accepting (the duplicate-name rule applies to guests only, per D4); a signed-out visitor trying to accept (sent to sign in, then returned to the same link); two people racing to use the last remaining slot of a `max_uses` invite (the trip lock makes this safe, same as every M3.4 write); an admin revoking an invite the instant before someone accepts it.
+
+### 8. Test strategy
+Database tests (PGlite) for every function and every caller kind, including the **first-ever anon-callable function** audit case; a model-based test extending M3.4's random-sequence approach with create/accept/revoke; mutation checks on the token hashing, expiry/use-limit checks, and the claim-vs-general branching; core/app unit tests for validation and error mapping; browser tests covering create → copy → open the link signed-out → sign up → accept, and the claim-a-guest path, plus every failure message.
+
+### 9. Files expected to change
+**New:** one migration; `supabase/tests/trip-invites.test.ts`; `packages/core/src/invite.ts` + test; `apps/app/src/features/trips/tripInviteService.ts` + test, `tripInviteApi.ts`; the `/join/[token]` screen.
+**Changed (additively):** `PeopleCard.tsx` (an "Invite people" section), `security-audit.test.ts` (the new anon allow-list and the extended authenticated one), `scripts/verify-supabase.ts`, `scripts/ui-check.ts`, docs.
+**Not touched:** M1, M2, and every M3.1-M3.4 database function, screen and test.
+
+### 10. Dependencies and decisions
+Needs M3.4 (done). No further milestone depends on exactly this one, though M5 (expenses) will want every active member — joined by invite or not — to be an equal payer/share-holder, which is already true by construction.
+
+**Decisions approved (recorded above and in ADR-054):** D1 expiry 7 days, admin may choose up to 30; D2 single-use by default; D3 admins only create invites; D4 duplicate display names allowed for registered accounts, guest names unique, identity always by user id; D5 no database rate limiting now, mandatory before public deployment; D10 any admin may revoke any invite.
+
+**Remaining decisions needing your approval:** none for the design. Approving the plan means I may start building M3.5 (migration, functions, service, UI, tests) when you say so.
+
+
+---
+
+## M3.5 — Invitations and guest claiming (built and tested; awaiting your review; nothing committed)
+
+**Scope:** invitation links (create, copy, list, cancel), the public preview, accepting a link, and claiming a guest's place with history preserved. Built in the four parts you asked for. Implements your approved D1-D5 and D10, ADR-054, and records ADR-055 to ADR-058. **Not started: M4 or any other milestone.** M1 engine, M2 code and every M3.1-M3.4 function, screen and test are unchanged except where listed under "Files".
+
+### Part 1 - Database (migration `20261118400000_invitations.sql`, migration #5 for you to run)
+- **`trip_invites`**: stores only the **SHA-256 hash** of a **256-bit random token**; the table has **no grants and no policy for anyone**, not even the administrator who made an invitation. Limits: 1 hour to 30 days (default 7 days), 1 to 50 uses (default 1), a claim link always 1, at most 50 outstanding links per trip, `revoked_by` recorded. The audit trail gains `joined` and `guest_claimed` (never a token).
+- **Five functions**, `SECURITY DEFINER`, `search_path` pinned: `create_invite`, `list_trip_invites`, `revoke_invite` (administrator of an active trip; any admin may cancel any link), `accept_invite` (signed in; locks the trip then the invitation), and `preview_invite`.
+- **`preview_invite` is the only function in the project signed-out visitors may run.** It returns at most one row of eight fixed facts (trip name, place, dates, inviter's name, head-count, whether it is for a friend, that friend's name): no ids, budget, people, account data or hashes. Every unusable token (unknown, malformed, expired, cancelled, used up, archived trip, claimed guest gone) gives the **identical empty answer**; `accept_invite` gives the single `invite_invalid`. No error text, log line or audit row ever contains a token.
+- The security audit now has an **explicit signed-out allow-list** (just `preview_invite`) with its own stricter rules (token format and hash, expiry, cancellation, use count, active trip; fixed result shape; no budget/account data) and asserts the invitations table has no permission for anyone.
+
+### Part 2 - Rules, service and hooks
+Core `invite.ts` (token pattern, options and limits, link and token-from-pasted-text helpers, argument builders, wording); `tripInviteService.ts` (typed errors with **fixed sentences only**: a token can never reach a message even if the database text contains it); `tripInviteApi.ts` (hooks; the preview's cache entry is dropped when the screen closes, the created token lives only in the mutation result that the screen clears); `lib/pendingInvite.ts` (remembers a link across sign-in: well-formed tokens only, expires after 1 hour, cleared once used or found invalid, memory fallback).
+
+### Part 3 - Screens
+- **Invite people** (administrators, active trips) inside the People card: choose 1 day / 7 days / 30 days and 1 / 5 / 10 people (defaults 7 days, 1 person, reset for every new link), **Create link**; the link is shown **once** with a clear warning, **Copy link** (Share sheet on phones), **Done** drops it. Active links listed ("For anyone · 0 of 1 used · Expires in 7 days") with **Cancel this link** (asks first); past links in a collapsed list. Failures explained (50 links, connection, rights changed).
+- **Public `/join/<token>` screen:** works signed out and signed in. Signed out: a preview card, then **Sign in to join** or **Create an account**; the link is remembered and the person is **brought straight back after signing in**. Joining is **always an explicit press**. Every unusable link shows the same "This invite link isn't valid" page. Failures (trip full, claim conflict, connection) are explained and retryable.
+
+### Part 4 - Guest claiming and history
+**Invite to claim this spot** on a friend added by name makes a single-use link for that friend. Accepting turns **that same row** into the person: same member id, join date, name and role (ordinary member), now tied to the account; nobody is added, so the 50-person limit does not apply and anything that points at the member stays intact (tested with a stand-in ledger). A **returning** person gets their old row back with role reset to member; someone **already on the trip** is a safe no-op that does not use the link up; a person who was on the trip before cannot take a friend's place (`claim_conflict`, they need a general link); two links for one friend: the first claims, the second is useless. **Duplicate display names never block a registered account (D4)**; guest-name uniqueness is unchanged; accounts are matched by user id only.
+
+### Verification (only what this change affects)
+| Check | Result |
+|---|---|
+| Type-check | Clean |
+| Whole repo | **927 tests pass**: API 17, app 223 (+32), core 415 (+12), database 272 (+49) |
+| Database (real Postgres engine, 47 new in `trip-invites.test.ts`) | allow/deny per function for every caller kind incl. signed-out; the table is unreadable; tokens are 64 hex, hashed, appear nowhere in the database, and 200 tokens are all different; create rules and limits; list/revoke; **preview** shows exactly the fixed facts and gives the identical empty answer for every kind of unusable token; accept: join, single/multi use, expiry boundary, cancellation, archived, full trip, already-member, returning person, same-name accounts, **claim keeps member id/name/join date/role**, claim conflicts, two links one friend, stand-in ledger stays valid; no error text contains a token; earlier features unaffected; a **model test** (25 random sequences of 40 create/accept/revoke/expire/leave actions) against an independent copy of the rules, checking after every step who is on the trip, one row per person, always an administrator, and each invitation's use count |
+| Security audit | allow-lists updated (15 signed-in functions, 1 signed-out); no secret key anywhere; `verify:supabase` PASSED with 0 failures and **6 warnings** = migration #5 not yet applied to your live project (it also probes that `preview_invite` gives an empty answer for an unknown link once applied) |
+| **Mutation check (51 deliberate breaks)** | **all 51 caught**, every file restored: 39 in the SQL (non-admin/archived creation, missing limits, token not random, raw token stored, hash not a hash, cross-trip cancel, preview and accept ignoring expiry/cancellation/use count/archived/claimed guest, missing token check, unlocked trip/invitation, no-op treated as new, claim over an account or an old row, missing cap, administrator not demoted on return, joiner made admin, unrecorded join, uncounted use, overwritten friend name, signed-out grants, readable table, missing audit word) plus 6 in the shared rules, 4 in the service and 2 in the remembered link |
+| Real browser (Edge), `npm run ui:check` | **554 checks pass** (480 earlier + 74 new, scenario L): create/copy/done/reload (the token is nowhere afterwards: not in the page, not in browser storage, not in any response from the list), options and defaults, claim links, cancel (Keep it vs confirm), failures, who sees the panel, double taps; **signed-out preview** (exact facts, no budget/people/ids, only the token in the request body, public key not a login, no other requests), seven kinds of unusable link look **identical** and malformed ones never contact the server; **sign in from the link, brought back, Join is explicit, joined, remembered link cleared, no duplicate on a second use**; claiming (same member, name kept, tagged You not Guest, nobody added); full trip, claim conflict, connection failure and retry, link used up between preview and Join, double-tap Join; **no token ever in the console or a request URL, no user id in any invitation request**; phone width (44 px targets) and Dark theme |
+
+### Found while testing (and fixed)
+- A freshly made 7-day link would have read "Expires in 6 days" (rounding down); days now round to the nearest day.
+- The options panel kept the previous choice (a 30-day setting leaked into the next, claim link); options now reset to the defaults for every new link.
+- A browser test switched a network failure on before the join page had loaded (so the preview failed instead of the Join press); the test was reordered, the app was right.
+- Test data: the browser harness's fake members needed UUID-shaped ids (as real ones are).
+
+### Deviations from the plan (all recorded as ADR-058)
+`max_uses` is NOT NULL between 1 and 50 (no "unlimited"); a `revoked_by` column; a cap of 50 outstanding links per trip; the link base is the app's own address (until a web address is chosen, Q-8).
+
+### Limitations / unresolved
+- **Migration #5 is not applied live.** Until you run Step 12 of `SUPABASE_SETUP.md`, creating a link says "Invitations aren't set up on the server yet". A real second account (and a third for a claim) is needed for the live check; the screens and every rule are otherwise tested.
+- **Rate limiting is NOT implemented and is mandatory before public deployment (ADR-054).** The database has none; add edge rate limits on `preview_invite` and `accept_invite`.
+- Real simultaneous callers cannot be run in this test engine; races are covered by "second caller after the first" simulations, source checks that every write takes the trip lock first, and Postgres's own row lock.
+- The token is in the page address of a link (`/join/<token>`) and, for a signed-out visitor, in browser local storage for up to an hour; cleared as soon as it is used or found invalid.
+- Browser tests use a simulated Supabase in Edge only: not run on a phone or emulator (the native Share sheet, native back button and an email-confirmation round trip for new accounts are unverified).
+- The link base is the address the app runs on until a domain is chosen (Q-8), so a link made on `localhost` only works on that computer.
+- No screen shows the audit trail yet.
+- ADR-047 (block removal/leaving with a balance) and ADR-043 remain mandatory for M5.
+
+### Files
+**New:** `supabase/migrations/20261118400000_invitations.sql`; `supabase/tests/trip-invites.test.ts`; `packages/core/src/invite.ts` + test; `apps/app/src/features/trips/tripInviteService.ts` + test, `tripInviteApi.ts`, `InvitePanel.tsx`; `apps/app/src/lib/pendingInvite.ts` + test; `apps/app/src/app/join/[token].tsx`.
+**Changed (additively):** `PeopleCard.tsx` (Invite section, Invite to claim this spot), `app/_layout.tsx` (open `/join` route, return to the link after sign-in), `packages/core/src/memberManagement.ts` + test (`canInviteToClaim`), `core/index.ts` (+1 line), `supabase/tests/security-audit.test.ts` (signed-out allow-list, new rules) and the function lists in `trip-details-access.test.ts`, `trip-edit.test.ts`, `trip-members.test.ts`; `scripts/verify-supabase.ts` (probes), `scripts/ui-check.ts` (fake invitation functions, scenario L, `UI_ONLY=L`); docs (progress, decisions log ADR-054 status + ADR-055 to 058, database schema, API design, security architecture, Supabase setup Step 12).
+**Not touched:** M1 engine, M2 code, migrations 1 to 4, trip create/edit/archive code.
+
+### Next
+Your review. Then, only on approval: commit/push, and you apply migration #5 (Step 12) and try it with real accounts. No other milestone is started.
+
+
+---
+
+## M3.5 revision — Approval-based joining (REVISED PLAN ONLY: nothing implemented, awaiting your approval)
+
+**Status: plan.** Requested 2026-11-23. The M3.5 v1 implementation above (multi-use general links joined immediately) is built and tested but **not committed**; HEAD is `b3d8baf`. **Migration #5 (`20261118400000_invitations.sql`) is already applied to the live project** (`verify:supabase` finds all its functions with 0 warnings), so it must **not** be edited; the revision is a new, forward-only **migration #6**.
+
+### 1. Revised workflow
+1. An admin creates the trip's **one** general invitation link (expiry 1 / 7 / 30 days, default 7; no usage limit).
+2. The admin shares it anywhere (WhatsApp...). The link is shown once (only a hash is stored).
+3. A visitor opens `/join/<token>`, sees the narrow public preview (unchanged), signs in or creates an account, and is brought back.
+4. The visitor presses **Request to join**. This creates a **pending join request**. It does **not** create any membership, so the visitor still cannot read anything about the trip (no row in `trip_members` means the existing row-level security hides the trip, its people and, later, its money).
+5. Admins see **Join requests (n)** in the People section and **Approve** or **Reject**.
+6. Only approval creates (or restores) the membership, atomically, with all checks re-run under the trip lock.
+
+Admins can **revoke** the link or **replace** it (a new link, the old one stops working). Revoking or replacing never removes anyone and never deletes requests.
+
+### 2. General link versus guest claiming
+| | General link | Guest-claim link (kept) |
+|---|---|---|
+| Made from | Invite people → Create link | the guest's Manage → Invite to claim this spot |
+| How many | one live link per trip | one live link per guest |
+| Uses | unlimited until expiry or revocation | single use (consumed when a request is made with it) |
+| Result of using it | a **join request** | a **claim request** for that guest |
+| On approval | a new ordinary member, or the person's own old row restored (role reset to member) | **the guest's own row** gets the account: same member id, name, join date, role, history; nobody added |
+| Refused when | trip archived, link unusable, 50 members on approval | guest gone or already claimed, account already on the trip, account has a former row (`claim_conflict`) |
+
+**Recommendation for claims (decision A below): claims also need admin approval.** The claim link is still tied to one guest and single use, but the person who uses it only *requests* to take the spot; an admin sees "Ravi Kumar (account) wants to claim Gita's place" and approves. This stops a forwarded or leaked claim link from handing a guest's history to the wrong person, gives one approval queue for everything, and needs no email lookup. (The identity-bound alternative, binding the link to an email or phone in advance, needs access to account emails, which TripMate deliberately never exposes; not recommended.)
+
+### 3. Database changes (migration #6, forward-only)
+- **`trip_invites` (kept):** keep `token_hash`, `claim_member_id`, `created_by`, `expires_at`, `revoked_at`, `revoked_by`, `use_count` (now just "requests made"). **Drop `max_uses`** and its two constraints. **One live general link per trip** enforced by a partial unique index (`trip_id` where it is general and not revoked); `create_invite` revokes the previous general link in the same locked transaction ("replace"). Same for one live claim link per guest. Existing links on the live project are **all revoked** by the migration (they were made under the old rules); members who joined through them stay members.
+- **New `trip_join_requests`:** `id`, `trip_id`, `invite_id`, `user_id` (the requester's auth id; never shown to anyone), `requester_name` (profile name snapshot, shown to admins), `claim_member_id` (null for a general request), `status` (`pending` / `approved` / `rejected`), `created_at`, `decided_at`, `decided_by` (admin's member id), `member_id` (the membership that approval created or restored). Unique **one pending request per account per trip**, and **one pending claim per guest**. At most 50 pending requests per trip. RLS on, **no grants at all** (functions only, like `trip_invites`); rows are never deleted.
+- **Functions:** `create_invite(trip, claim_member?, expires_in_hours)` (no uses argument), `list_trip_invites`, `revoke_invite`, `preview_invite` (unchanged; still the only signed-out function), **`request_to_join(token)`** (signed in; replaces `accept_invite`), **`list_join_requests(trip)`** (admins; name, when, which guest for a claim; no user ids), **`decide_join_request(trip, request, approve)`** (admins). **`accept_invite` is dropped.**
+- **Audit:** request creation, approval and rejection live on the request row (`created_at`, `decided_at`, `decided_by`, `status`); link creation and revocation on the invite row (`created_by`, `revoked_by`); the resulting membership change in `trip_member_events` (`joined` / `guest_claimed`, now with the **approving admin as the actor** and the request id as the value).
+
+### 4. Security and authorization
+- All rules inside the functions; caller only from `auth.uid()`; no secret key; ADR-032 pattern (definer, pinned `search_path`, explicit grants, audit allow-lists updated).
+- **`request_to_join`:** token format and hash, link not expired or revoked, trip active, claim guest still an unclaimed guest; already an active member: safe no-op; already pending: returns the same request (no duplicate). Never creates membership.
+- **`decide_join_request`:** uses the existing member-change helper (active admin, trip row locked, archived refused), then **re-checks under the lock**: request is in this trip and still pending (a second admin deciding at the same moment gets "already decided", no double membership), requester's profile still exists, requester not already active (then the request is marked approved with no change), **50-member cap**, and for claims: guest still an active unclaimed guest, requester has no other row on the trip. Approval and membership change are one transaction.
+- **Pending people get nothing:** no membership row, so every existing trip, member and (future) expense rule already hides everything. Tested explicitly.
+- Tokens: unchanged (256-bit, SHA-256 only, shown once, never logged; preview identical empty answer for any unusable link). Rate limiting stays **mandatory before public deployment (ADR-054)**.
+
+### 5. UI changes
+- **Invite people:** no link yet: expiry choice (1 / 7 / 30 days, default 7) and **Create invitation link**. Link exists: "Invitation link · expires in 6 days · created ...", **Replace link** and **Revoke link** (both ask first). The show-once box stays (with a note: to share again later, Replace it; the old link stops working). Usage-limit chips and wording removed. Claim links listed per guest.
+- **Join requests (n)** (admins, collapsed by default, count always visible): name, when, "wants to claim Gita's place" for claims; **Approve** / **Reject** with confirmation; clear messages for full trip, already decided, archived, guest gone.
+- **Join screen:** signed in: **Request to join** (or **Request to claim Gita's place**); afterwards "Request sent. An admin needs to approve it; the trip will appear on your Home screen when they do." Re-opening shows the same. Already a member: goes to the trip. Rejected: "This request wasn't accepted."
+
+### 6. What is reused (as is)
+Token generation and hashing, `preview_invite`, `trip_invites` (minus `max_uses`), `invite_token_hash`, `revoke_invite`, `list_trip_invites` (smaller result), `member_change_context`, the signed-out allow-list and its stricter audit rules, the membership-restoring and claim logic of `accept_invite` (moved into `decide_join_request`), `tripInviteService` error pattern and fixed messages, `pendingInvite` and the return-after-sign-in route guard, the `/join/[token]` screen shell, `InvitePanel` (show-once box, copy, expiry chips, collapsible lists, creation time), the guest "Invite to claim this spot" button, the fake-server and browser-scenario structure, DB test helpers and the mutation runner.
+
+### 7. What changes or is removed
+- **Removed:** usage limits (`max_uses`, `USE_CHOICES`, "Maximum people who can join using this link", the 50-outstanding-links cap), `accept_invite` and its immediate-join path, the multi-use tests.
+- **Changed:** `create_invite` (no uses, replace semantics), `list_trip_invites` result, core `invite.ts` (options without uses; request outcomes), `tripInviteService`/`tripInviteApi` (`requestToJoin`, `listJoinRequests`, `decideJoinRequest`), `InvitePanel`, `PeopleCard` (Join requests section), the join screen, `security-audit.test.ts` allow-lists, `trip-invites.test.ts` (accept sections rewritten as request + decide), scenario L (join part), docs.
+- **Invalidated assumptions:** "using a link makes you a member" (now never); "a general link has a use limit"; ADR-054 D2 and ADR-057's general-join rule (superseded); ADR-058's `max_uses` deviation (superseded).
+
+### 8. Migration strategy
+- Keep migration #5 exactly as applied. New **migration #6** (`20261123000000_join_requests.sql`): drop `accept_invite`; drop and recreate `create_invite` and `list_trip_invites` (their signatures change); revoke all existing links; drop `max_uses`; add the one-live-link indexes; create `trip_join_requests`; add `request_to_join`, `list_join_requests`, `decide_join_request`. Safe to run more than once; nothing about trips, members or the audit trail is deleted.
+- Order for you: run #6 after #5 (Step 13 in `SUPABASE_SETUP.md`); `verify:supabase` will probe the new functions and confirm `accept_invite` is gone.
+- One commit for all of M3.5 (v1 + revision) after your review, as before.
+
+### 9. Essential tests and edge cases
+Pending requester reads nothing (trips, members, invites, requests); duplicate request returns the same one; two admins deciding the same request (the second is "already decided", one membership); approval at 50 members refused and the request stays pending; approval after the requester joined another way; requester's profile deleted; rejected then re-request (per decision B); link revoked or replaced while a request is pending (per decision C); archived trip refuses requests and decisions; one live general link and one live claim link per guest enforced by the database; replacing a link stops the old one; claim: same member id and history kept, guest removed or claimed before approval, requester already a member, requester with a former row, two people trying to claim one guest; returning member gets the old row back as an ordinary member; audit rows have the right actor; no user id or token in any admin-facing answer; tokens never in logs, URLs or errors; signed-out allow-list still exactly `preview_invite`; mutation checks on each rule; browser: create/replace/revoke, request flow with sign-in return, admin approve/reject, pending visitor sees nothing, phone and Dark.
+
+### 10. Decisions needing your approval
+- **A. Guest claims:** require admin approval (recommended) or keep the immediate claim of v1?
+- **B. After a rejection:** the same account cannot request again with the **same link**; it needs the replacement link (recommended, stops re-request spam). Alternative: may re-request any time.
+- **C. Pending requests when a link is revoked or replaced:** stay in the queue for an admin to decide (recommended; approval is the real gate). Alternative: revoking auto-rejects them.
+- **D. Show-once link:** because only a hash is stored, an admin can copy the general link only when it is created; to share it again later they must **Replace** it (the old one stops working). Recommended (as your security rules require); please confirm this is acceptable.
+- **E. Existing live links:** migration #6 revokes all links made under the old rules (recommended; members who joined through them stay).
+
+
+---
+
+## M3.5 revision — Approval-based joining (BUILT AND TESTED; awaiting your review; nothing committed; migration #6 NOT applied to live Supabase)
+
+**Scope:** one reusable general invitation link per trip; using a link only ever creates a **pending join request**; an active administrator approves or rejects it; guest claims also need approval and keep the guest's member record and history. Implements your approved plan, ADR-059, decisions A to E and the additional rule (ADR-060). M1 engine, M2 code and M3.1 to M3.4 behaviour are unchanged. **Not started: M4.**
+
+### What was built
+- **Database (forward-only migration #6, `20261123000000_join_requests.sql`; migration #5 is untouched):** `accept_invite` is removed; `trip_invites` loses `max_uses`; one live general link per trip and one live claim link per guest (the database refuses a second); `create_invite` now replaces the previous link of its kind; new `trip_join_requests` table (no grants for anyone); new functions `request_to_join`, `list_join_requests`, `decide_join_request`. All links made under the old rules are revoked once, the first time it runs (memberships untouched; running the file again never cancels newer links).
+- **Core** (`invite.ts`): options are only "how long it lasts" (1 / 7 / 30 days, 7 default), argument builders for the new functions, request and approval wording, local-time labels ("Created ...", "Asked ...").
+- **Service and hooks:** `createInvite` (replace semantics), `listInvites`, `revokeInvite`, `previewInvite`, **`requestToJoin`**, **`listJoinRequests`**, **`decideJoinRequest`**; fixed-sentence errors only (a token can never reach a message); hooks refresh only what an *approval* changes.
+- **Screens:**
+  - **Invite people:** no usage-limit chips; one link: **Create invitation link / Replace link / Revoke link** (the link is shown once; to share again, replace it); friend links from **Invite to claim this spot** (single use); Active and Past invitations collapsible with creation times.
+  - **Join requests (n)** in the People section (admins; collapsed by default, count visible): name, when asked, and "Wants to take Gita's place"; **Approve** / **Reject** each ask first in plain words; clear messages for a full trip, "another admin already answered", missing account, and connection retry.
+  - **Join screen:** **Request to join** (or "Ask to take Gopal's place") -> "Request sent. An admin needs to approve it...", with "until then you cannot see anything about the trip"; asking again says "already asked".
+
+### How each decision is enforced (all inside the database)
+- **A, claims need approval:** a claim link only creates a claim request; the friend's row is untouched until approval, then it becomes the person (same member id, name, join date, role; nobody added; the 50-person limit does not apply). Tested with a stand-in ledger pointing at the guest.
+- **B, no second ask with the same link after a rejection:** one request per account per link (`request_used`); a replacement link allows a new request. Also true after approval followed by leaving.
+- **C and the additional rule, expiry/revocation/replacement never touch submitted requests:** they only stop new requests; an administrator can still approve a request made with a link that has since expired, been revoked or replaced (tested).
+- **D:** the link is shown once; if lost, replace it. **E:** the migration revokes old links once.
+- **Pending people see nothing:** no membership row, so every trip, member, link, request and audit rule hides everything (tested against every trip function, including that they cannot approve themselves).
+- **Races:** deciding locks the trip, then the request, and re-checks everything (still pending, trip active, requester's profile, the 50-member limit, the friend's place still free). Two administrators on one request: the second is told "already decided", one membership, one audit event with the **approving administrator as the actor**.
+- **Duplicates:** one pending request per account per trip (a person waiting through an old link who opens the replacement is told it is the same request); one pending claim per guest; at most 50 waiting requests per trip.
+
+### Verification (only what this change affects)
+| Check | Result |
+|---|---|
+| Type-check | Clean |
+| Whole repo | **967 tests pass**: API 17, app 234 (+11), core 424 (+9), database 292 (+20 over the earlier 272) |
+| Database (real Postgres engine; `trip-invites.test.ts`, 67 tests) | every caller kind incl. signed out; tables unreadable and unwritable by anyone; tokens (64 hex, hash only, nowhere in the database, 150 distinct); one live link per trip / per friend and replacement; limits (1 hour to 30 days); preview shows exactly the fixed facts and gives one identical empty answer for every unusable token; requests never make a membership; a pending person sees nothing (every trip function refuses or returns nothing); duplicate and same-link rules; the 50-pending cap; approval, rejection, returning member (old row, role reset), claim (same row kept), full trip, archived trip, missing account, two administrators, expiry/revocation after asking; audit actors; model test of random request / approve / reject / replace / revoke / expire / leave sequences |
+| Security audit | allow-lists updated (17 signed-in functions, still exactly one signed-out function: `preview_invite`); no grants on the invitations or requests tables; `accept_invite` proven gone |
+| **Mutation checks** | **51 database / rules / service breaks, all caught** (one survivor, "approval can take over a person with an account", led to a new test and is now caught), plus **4 screen breaks, all caught** (Approve sending a rejection, asking taking the person straight to the trip, join offered without signing in, secret link left on screen); every file restored. Includes: asking also creating a membership, a rejected person asking again, two people queuing for one place, ignoring expiry/cancellation/archived, an ordinary member deciding, a returning administrator keeping admin, a missing audit actor, signed-out grants |
+| Real browser (Edge), `npm run ui:check` | **585 checks pass**, scenario L 105: create / copy / done / reload (token nowhere), replace (old link dead, one active), revoke (asks, requests stay), friend links, failures, who sees what; join requests (collapsed with count, local times, claim wording, approve / reject with confirmations, exact requests, no user ids, stale "already answered", retry, full trip, archived); visitor flow (signed-out preview, eight kinds of unusable link look identical, sign in and come back, explicit Request to join, **no membership, trip invisible and absent from Home until approval**, asking twice, claim request leaves the friend untouched, rejected / waiting / earlier-member / connection / cancelled-in-between / double-tap); no token in console or URL, no user id in any request; phone width and Dark theme |
+| Live check (`verify:supabase`) | PASSED, 0 failures, **4 warnings** = migration #6 not applied yet (three new functions missing, `accept_invite` still exists); once applied it checks all four |
+| Secret scan | clean (only the known fake test key and a doc sentence) |
+
+### Found while testing (and fixed)
+- A claim by someone already linked elsewhere had no test; added, with the database check proven.
+- Test data: guests on different fake trips shared an id (real ids are unique per row).
+- Earlier UI request, kept: Active / Past invitations collapsible, creation times, options reset to 7 days.
+
+### Limitations / unresolved
+- **Migration #6 is applied live** (Step 13; it cancelled the old links). The real-account check (ask, approve, claim) was carried out as part of the final M3.5 test (see the UX finalisation section). Until then the live app would still show the old M3.5 v1 behaviour.
+- **Rate limiting is NOT implemented and is mandatory before public deployment (ADR-054):** the database has none.
+- A waiting person has no indication on their own Home screen (the database gives them no way to see anything about the trip, including their request); they see "Request sent" once, and when approved the trip appears.
+- Real simultaneous callers cannot be run in this test engine: races are covered by "second caller after the first" simulations and source checks that every write locks first.
+- Browser tests use a simulated Supabase in Edge only: not run on a phone or emulator (native Share sheet, back button and the email-confirmation round trip for new accounts are unverified).
+- The link base is the address the app runs on until a domain is chosen (Q-8): a link made on `localhost` only works on that computer.
+- The token is in the page address, and for a signed-out visitor in browser local storage for up to an hour (cleared once they ask or the link proves invalid).
+- A rejected friend-claim needs a fresh claim link (single use), a direct result of decision B.
+- No screen shows the audit trail yet.
+- ADR-047 (block removal/leaving with a balance) and ADR-043 remain mandatory for M5.
+
+### Files
+**New:** `supabase/migrations/20261123000000_join_requests.sql`; `apps/app/src/features/trips/JoinRequestsPanel.tsx`.
+**Rewritten for the approval model:** `supabase/tests/trip-invites.test.ts`; `packages/core/src/invite.ts` + `invite.test.ts`; `tripInviteService.ts` + test, `tripInviteApi.ts`; `InvitePanel.tsx`; `apps/app/src/app/join/[token].tsx`.
+**Changed:** `PeopleCard.tsx` (Join requests section); the audit and function lists in `supabase/tests/security-audit.test.ts`, `trip-details-access.test.ts`, `trip-edit.test.ts`, `trip-members.test.ts`; `scripts/verify-supabase.ts` (new probes, `accept_invite` must be gone); `scripts/ui-check.ts` (approval-based fake functions, scenario L rewritten); docs (progress, decisions log ADR-059 approved and ADR-060, database schema, API design, security architecture, Supabase setup Step 13).
+**Not touched:** migrations 1 to 5, M1 engine, M2 code, trip create/edit/archive code.
+
+### Next
+Your review. Then, only on approval: you apply migration #6 (Step 13) and try it with real accounts, and I commit and push (M3.5 v1 and the revision together). M4 is not started.
+
+
+---
+
+## M3.5 UX finalisation: one reusable, copyable link (proposal, approved as Option 1 = Supabase Vault; see the built report at the end)
+
+**Requested 2026-11-23:** one WhatsApp-style general link per trip that an admin can **copy repeatedly (the same token)**; Replace link removed; Revoke link kept; Past invitations section removed; Former members, guests and guest claim links untouched; submitted requests never invalidated; approval always mandatory.
+
+### The one thing that needs a design decision
+Today `create_invite` builds the token inside the database, stores **only its SHA-256** and returns the raw token **once**; nothing can ever give it back. **Repeated copying of the same link is therefore impossible with the current design:** a hash cannot be turned back into a token. Something must keep the token in recoverable form. The minimal options:
+
+| Option | How | Security | Cost |
+|---|---|---|---|
+| **1. Supabase Vault (recommended if your project has it)** | Keep the token as an **encrypted** secret in Supabase Vault (the encryption key is managed by Supabase and is not readable through SQL/tables); the invitation row only stores the secret's id. A new admin-only function returns it on demand; Revoke (and replacing an expired link) deletes the secret. Validation still uses the hash exactly as now | Encrypted at rest with a key outside the tables; hash validation unchanged; only admins of that trip can fetch; never logged; the browser drops it right after copying | new migration #7; a platform feature to confirm is enabled (`select extname from pg_extension where extname = 'supabase_vault'`); cannot be exercised by the local test engine, so tests use a stand-in and the real encryption is checked live |
+| **2. Plain column** | Store the raw token in a column, readable only through the admin-only function | **Weakens the hash-only rule**: a database leak or backup shows live links. Harm is limited because every request still needs admin approval (an attacker can only queue up to 50 requests and see the public preview) | smallest change; fully testable; needs your explicit approval because it relaxes an earlier rule |
+| **3. Remember it in the browser** | The creating device keeps the token | Token sits in browser storage; other admins and other devices cannot copy it; lost with the browser data | no database change but does not meet "any admin, every time" |
+
+**Recommendation:** Option 1, with Option 2 only if Vault is unavailable and you accept the trade-off in writing. Only the **general** link would be stored this way; guest claim links stay show-once and hash-only.
+
+### Everything else (independent of that decision)
+- **Migration #7 (forward-only, #1 to #6 untouched):** needed for the token storage and the function. It would also change `create_invite` so that creating a general link **refuses when a live one exists** (`invite_exists`); with Replace gone, a stale screen must not be able to silently kill a link people already received. An expired or revoked link can be followed by Create invitation link.
+- **Expiry:** keep 1 / 7 / 30 days, default 7. **No never-expiring link:** with a reusable, retrievable link, expiry is the only automatic safety net (a leaked link would otherwise stay usable forever; each use is still approval-gated and capped at 50 waiting requests). Admins can create a fresh link after expiry.
+- **UI:** `InvitePanel.tsx`: remove Replace link and its notes; remove the Past invitations section; add **Copy link** to the active link (fetches the link on click, copies it, never shows it or keeps it in memory); keep Revoke link, claim links and the creation time. `PeopleCard`, `JoinRequestsPanel`, the join screen: unchanged.
+- **Core/service/hooks:** wording and a `getInviteLink` call and hook.
+- **Tests:** database (retrieval admin-only, same token every time, hash unchanged, gone after revoke, one live link refused, requests survive revoke/expiry), security audit allow-list, mutation checks, scenario L, type-check.
+- **Not touched:** former members, guest add/claim/approval, the financial engine, member rules, RLS, requests and approval logic, the existing migrations.
+
+---
+
+## M3.5 UX finalisation: COMPLETE (migration #7 applied live and verified; real-account test passed; approved and committed)
+
+**What changed for an admin:** the trip has one reusable invitation link; **Copy link** works every time and gives the **same link**; **Revoke link** ends it for good; **Replace link** and **Past invitations** are gone; creating a link is refused while a valid one exists (revoke first, or wait for expiry); a link made before this update stays valid but shows a note that it cannot be copied (revoke it and create a new one); friends' single-use links stay show-once and are listed under **Links for friends**. Expiry 1/7/30 days (default 7). Joining still needs admin approval; submitted requests are never touched by revoke or expiry. Former members, guest creation, guest claiming and approval flows are unchanged.
+
+**How repeated copying works securely (ADR-061/062):** the general link's token is stored only as an **encrypted Supabase Vault secret**; the invitation row keeps its SHA-256 hash (validation unchanged) and the secret's id. `get_general_invite_link(trip)` is `SECURITY DEFINER`, `search_path = ''`, uses `auth.uid()`, requires an **active administrator**, and returns the token only for a live, unexpired link on an active trip whose SHA-256 matches the stored hash. Revoking (or making a new link after expiry, or deleting the trip) deletes the secret. The app asks on each press, copies, then drops the token from memory; it is never in a list, URL, log, cache or error message.
+
+**Migration #7** (`20261123100000_reusable_general_link.sql`, forward-only; #1 to #6 untouched) is needed because a hash cannot be reversed: it adds `token_secret_id`, the claim-link constraint, the clean-up trigger, `get_general_invite_link`, and updates `create_invite`, `revoke_invite`, `list_trip_invites`. It refuses to run unless the Vault exists and `anon`/`authenticated` cannot read it. **You apply it with Step 14 of `SUPABASE_SETUP.md`**, which includes read-only Vault permission checks.
+
+**Tests:** database suite 313 pass (new Vault tests: secret creation, retrieval, expiry, deletion, trip cascade; unauthorised callers; repeated copy returns exactly the same link; two admins get the same link; revoked/expired links cannot be retrieved or used; legacy links; claim links never stored; swapped-secret integrity; Vault closed to the app; no raises containing tokens) plus new Vault rules in the security audit; app 238, core 425, API 17 pass; type-check clean; scenario L 109 browser checks pass; mutation checks: 7 breaks of the new migration (no admin check, ignoring expiry, ignoring revocation, no hash check, signed-out grant, secret kept after revoke, no one-link refusal) all caught (one survivor led to a new test); `verify:supabase` PASSED with 1 warning until #7 is applied.
+
+**Live status (2026-11-23):** migration #7 applied in the Supabase SQL Editor; Step 14 Vault permission checks all `false` for signed-in and signed-out roles; `npm run verify:supabase` PASSED with 0 failures and 0 warnings; real-account test passed (copy repeated, same link; second admin; join request; pending user sees nothing; approval; revoke; new link; guest claim preserves the guest record).
+
+**Limitations:** real Vault encryption was verified live only by the permission checks and the real-account test (the local engine uses a stand-in); anyone with dashboard/service-role access can read Vault secrets; a leaked live link only allows requests (admin-approved, 50 waiting maximum) until it expires; rate limiting (ADR-054) is still mandatory before public deployment; ADR-047 and ADR-043 remain mandatory for M5. M4 not started.

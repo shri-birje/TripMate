@@ -218,12 +218,31 @@ Display states "Upcoming / Ongoing / Completed" are **derived from dates**, not 
 | `claim_member_id` | uuid | NULL, FK → `trip_members(id)` — if set, accepting the invite claims that guest member |
 | `created_by` | uuid | NOT NULL, FK → `trip_members(id)` |
 | `expires_at` | timestamptz | NOT NULL |
-| `max_uses` | int | NULL (NULL = unlimited until expiry) |
+| `max_uses` | int | NOT NULL DEFAULT 1, CHECK between 1 and 50 (as built in M3.5: there is no "unlimited"; single use by default; a claim invite must be 1) |
 | `use_count` | int | NOT NULL DEFAULT 0, CHECK `use_count <= max_uses` when max_uses set |
 | `revoked_at` | timestamptz | NULL |
+| `revoked_by` | uuid | NULL, FK → `trip_members(id)` (added in M3.5: who cancelled it) |
 | `created_at` | timestamptz | |
 
-**Indexes:** UNIQUE `(token_hash)`, `(trip_id)`.
+**Indexes:** UNIQUE `(token_hash)`, `(trip_id, created_at)`.
+
+> **Revised (2026-11-23, ADR-059, built):** general links are ONE reusable link per trip and using a link only creates an admin-approved JOIN REQUEST (new `trip_join_requests` table; `max_uses` dropped; `accept_invite` removed) by forward-only migration `20261123000000_join_requests.sql`. The text below describes migration #5 as originally applied; **the paragraphs after it ("As built, approval-based joining") are current.**
+
+**As built (M3.5, migration `20261118400000_invitations.sql`):**
+- `token_hash` is the SHA-256 (64 lower-case hex characters, checked by a constraint) of a **256-bit random token** (three random UUIDs reduced by SHA-256). The raw token is returned once by `create_invite` and never stored or logged.
+- **The table has no grants and no policy for anyone**: not even the administrator who made an invitation can `SELECT` it. Everything goes through functions, so even the hash is never exposed.
+- `expires_at` is 1 hour to 30 days from creation (default 7 days); `use_count <= max_uses`; `expires_at > created_at`; at most 50 outstanding invitations per trip (checked in the function).
+- The audit trail `trip_member_events` gained two actions: `joined` and `guest_claimed` (`new_value` = the invitation's id, never its token).
+- **Functions:** `create_invite(trip, claim_member?, expires_in_hours, max_uses)`, `list_trip_invites(trip)`, `revoke_invite(trip, invite)`, `preview_invite(token)` (**the only function callable by signed-out visitors**), `accept_invite(token)`. Internal: `invite_token_hash`.
+- **Accepting:** a general link adds the person as an ordinary member under their profile name (a **returning** person gets their old row back with role reset to `member`); a claim link turns the named guest's row into the person (same member id, join date, name and role, `user_id` set) and adds nobody. Accounts are identified by user id: a matching display name never blocks joining (ADR-054).
+
+**As built, approval-based joining (M3.5 revision, migration `20261123000000_join_requests.sql`):**
+- `trip_invites` loses `max_uses` (and its constraints); `use_count` now counts the **requests made** with the link. Partial unique indexes allow **one live general link per trip** and **one live claim link per guest**; `create_invite` replaces the previous link of the same kind in the same locked transaction. A claim link is single use: usable only while `use_count = 0`. Every link made under the old rules was revoked once, when the migration first ran; memberships were untouched.
+- **Reusable, copyable general link (migration #7, `20261123100000_reusable_general_link.sql`, ADR-061/062):** `trip_invites` gains `token_secret_id uuid` (the id of an **encrypted Supabase Vault secret** holding the general link's token; no foreign key, Vault is a separate schema). A check constraint `trip_invites_claim_hash_only` forbids a secret on a friend's claim link (claim links stay show-once and hash-only). The Vault secret is named `trip-invite-<invite id>` (no secret in the name). `token_hash` (SHA-256) is still what validates a link. A row-delete trigger (`trip_invites_remove_secret`, not callable by the app) removes the secret when an invitation row (or its whole trip) is deleted. `create_invite` now **refuses** a second general link while a valid one exists (`invite_exists`; an expired one is cleared away first). New `get_general_invite_link(trip)` returns the live general link's original token to an **active administrator** only. `list_trip_invites` gains `copyable`. `revoke_invite` also deletes the Vault secret.
+- **`trip_join_requests`** (no grants, no policy: functions only; rows never deleted): `id`, `trip_id` (cascade), `invite_id`, `user_id` (the requester's auth id: **never returned to anyone**), `requester_name` (profile name when they asked), `claim_member_id` (null for an ordinary request), `status` (`pending` / `approved` / `rejected`), `created_at`, `decided_at`, `decided_by` (the deciding administrator's member id), `member_id` (the membership approval created, restored or claimed). A constraint keeps the decision fields consistent with the status. Unique: one **pending** request per account per trip, one **pending** claim per guest, and one request per account per **link** (decision B: after a rejection the same link cannot be used again; a replacement link can).
+- **Functions** (all definer, pinned `search_path`, `auth.uid()`): `create_invite(trip, claim_member?, expires_in_hours)`, `list_trip_invites(trip)`, `revoke_invite(trip, invite)`, `preview_invite(token)` (the only signed-out function), **`request_to_join(token)`** (signed in; outcomes `requested`, `already_requested`, `already_member`; **never creates a membership**), **`list_join_requests(trip)`** (administrators; name, time, and for a claim the friend's place; no user ids), **`decide_join_request(trip, request, approve)`** (administrators; outcomes `approved`, `rejected`, `already_decided`, `already_member`).
+- **Deciding** locks the trip (the member-change helper), then the request, and re-checks: still pending, trip not archived, requester's profile exists, the 50-member limit (ordinary approval), and for a claim that the guest is still an active unclaimed guest and the requester has no other row. **Approving a claim** turns that guest row into the person (same member id, name, join date, role); approving an ordinary request adds a member or restores the person's own old row with role reset to `member`. The audit event (`joined` / `guest_claimed`) has the **approving administrator as the actor** and the request id as its value.
+- Expiry, revocation or replacement of a link stops new requests only; requests already made stay for an administrator to decide.
 
 ### 4.5 `categories`
 **Purpose:** System and custom expense categories.

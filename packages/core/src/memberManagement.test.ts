@@ -88,15 +88,19 @@ describe('what an administrator is offered', () => {
   const d = details([row('1', { role: 'admin' }), row('2'), row('3', { role: 'admin' }), row('g', { user_id: null }), row('x', { status: 'left', left_at: '2026-11-20T10:00:00Z' })]);
 
   it('on an ordinary member: make admin, remove (not remove admin rights, not rename)', () => {
-    expect(memberActions(d, 'user-1', person(d, '2'))).toEqual({ canMakeAdmin: true, canRemoveAdminRights: false, canRemove: true, canRename: false, any: true });
+    expect(memberActions(d, 'user-1', person(d, '2'))).toEqual({ canMakeAdmin: true, canRemoveAdminRights: false, canRemove: true, canRename: false, canInviteToClaim: false, any: true });
   });
 
   it('on another administrator: remove admin rights, remove', () => {
     expect(memberActions(d, 'user-1', person(d, '3'))).toMatchObject({ canMakeAdmin: false, canRemoveAdminRights: true, canRemove: true });
   });
 
-  it('on a guest: rename and remove, never make admin', () => {
-    expect(memberActions(d, 'user-1', person(d, 'g'))).toMatchObject({ canMakeAdmin: false, canRename: true, canRemove: true });
+  it('on a guest: rename, remove and invite them to claim their place, never make admin', () => {
+    expect(memberActions(d, 'user-1', person(d, 'g'))).toMatchObject({ canMakeAdmin: false, canRename: true, canRemove: true, canInviteToClaim: true });
+  });
+
+  it('people with an account can never be offered a claim link', () => {
+    for (const id of ['1', '2', '3']) expect(memberActions(d, 'user-1', person(d, id)).canInviteToClaim, id).toBe(false);
   });
 
   it('on themselves: may step down (another admin exists) but not remove themselves', () => {

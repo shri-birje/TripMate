@@ -20,9 +20,11 @@
  * use `npm run verify:supabase` and the manual checklist in the docs.
  */
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { chromium, type BrowserContext, type Page, type Request, type Route } from 'playwright-core';
+import { askedLabel, createdLabel } from '../packages/core/src/invite';
 import { formatDateRange } from '../packages/core/src/trip';
 
 const PORT = 8099;
@@ -116,6 +118,14 @@ interface FakeBackend {
   memberFail: null | string;
   /** Delay, in ms, before the member functions answer (to test double taps). */
   slowMemberMs: number;
+  /** The invitations that exist (the fake keeps the raw token; the real database keeps only its hash). */
+  invites: Record<string, any>[];
+  /** The join requests that exist (waiting, approved or rejected). */
+  joinRequests: Record<string, any>[];
+  /** Force the invitation functions to answer with this database message (or drop the connection). */
+  inviteFail: null | string;
+  /** Delay, in ms, before the invitation functions answer (to test double taps). */
+  slowInviteMs: number;
 }
 
 const USER = { id: '11111111-2222-3333-4444-555555555555', email: 'asha@example.com', aud: 'authenticated', role: 'authenticated' };
@@ -155,6 +165,10 @@ function newBackend(): FakeBackend {
     slowRpcMs: 0,
     memberFail: null,
     slowMemberMs: 0,
+    invites: [],
+    joinRequests: [],
+    inviteFail: null,
+    slowInviteMs: 0,
   };
 }
 
@@ -226,6 +240,25 @@ const asDmy = (iso: string) => iso.split('-').reverse().join('/');
 
 /** Counts the friends added through the fake add_guest_member, so each gets its own id. */
 let memberSeq = 0;
+let inviteSeq = 0;
+let joinSeq = 0;
+let requestSeq = 0;
+
+/** An invitation as the fake server keeps it. */
+function seedInvite(over: Record<string, any>): Record<string, any> {
+  return {
+    id: uuid(9600 + ++inviteSeq), tripId: '', token: randomBytes(32).toString('hex'), claimMemberId: null, createdBy: '',
+    expiresAt: Date.now() + 7 * 86_400_000, useCount: 0, revoked: false, createdAt: Date.now(), ...over,
+  };
+}
+
+/** A join request as the fake server keeps it. */
+function seedRequest(over: Record<string, any>): Record<string, any> {
+  return {
+    id: uuid(9800 + ++requestSeq), tripId: '', inviteId: uuid(9599), userId: '', requesterName: 'Someone', claimMemberId: null, status: 'pending',
+    createdAt: Date.now(), decidedBy: null, memberId: null, ...over,
+  };
+}
 
 async function installFakeSupabase(context: BrowserContext, backend: FakeBackend) {
   await context.route(/supabase\.co/, async (route: Route, request: Request) => {
@@ -385,6 +418,149 @@ async function installFakeSupabase(context: BrowserContext, backend: FakeBackend
       me.left_at = new Date().toISOString();
       t._hidden = true; // the person can no longer see the trip at all
       return done(me, true);
+    }
+    // ---- invitations and join requests: the fake enforces the SAME rules as the real database functions.
+    const inviteFn = url.pathname.replace('/rest/v1/rpc/', '');
+    if (url.pathname.startsWith('/rest/v1/rpc/') && ['create_invite', 'get_general_invite_link', 'list_trip_invites', 'revoke_invite', 'preview_invite', 'request_to_join', 'list_join_requests', 'decide_join_request'].includes(inviteFn) && method === 'POST') {
+      const failWith = (message: string) => json(400, { code: 'P0001', message, details: null, hint: null });
+      const authHeader = request.headers()['authorization'] ?? '';
+      const signedIn = authHeader !== '' && authHeader !== `Bearer ${DUMMY_PUBLISHABLE_KEY}`;
+      if (backend.inviteFail === 'network') return route.abort('connectionfailed');
+      if (backend.slowInviteMs > 0) await new Promise((r) => setTimeout(r, backend.slowInviteMs));
+      if (backend.inviteFail) return failWith(backend.inviteFail);
+
+      const live = (token: unknown) => {
+        const i = typeof token === 'string' && /^[0-9a-f]{64}$/.test(token) ? backend.invites.find((x) => x.token === token) : undefined;
+        const t = i && backend.trips.find((x) => x.id === i.tripId);
+        if (!i || !t || i.revoked || i.expiresAt <= Date.now() || t.status !== 'active') return null;
+        if (i.claimMemberId !== null) {
+          if (i.useCount > 0) return null; // a friend's link is single use: spent once a request has been made with it
+          const g = (t._members as Record<string, any>[]).find((m) => m.id === i.claimMemberId);
+          if (!g || g.status !== 'active' || g.user_id !== null) return null;
+        }
+        return { i, t };
+      };
+
+      if (inviteFn === 'preview_invite') {
+        const l = live(body.p_token);
+        if (!l) return json(200, []);
+        const ms = l.t._members as Record<string, any>[];
+        const target = l.i.claimMemberId ? ms.find((m) => m.id === l.i.claimMemberId) : undefined;
+        return json(200, [{
+          trip_name: l.t.name, destination: l.t.destination, start_date: l.t.start_date, end_date: l.t.end_date,
+          inviter_name: ms.find((m) => m.id === l.i.createdBy)?.display_name ?? 'Someone',
+          member_count: ms.filter((m) => m.status === 'active').length, is_claim: !!target, claim_name: target?.display_name ?? null,
+        }]);
+      }
+      if (!signedIn) return json(401, { code: '42501', message: `permission denied for function ${inviteFn}` });
+
+      if (inviteFn === 'request_to_join') {
+        const l = live(body.p_token);
+        if (!l) return failWith('invite_invalid');
+        const ms = l.t._members as Record<string, any>[];
+        const own = ms.find((m) => m.user_id === USER.id);
+        if (own && own.status === 'active') return json(200, [{ trip_id: l.t.id, request_id: null, outcome: 'already_member' }]);
+        const onThisLink = backend.joinRequests.find((r) => r.inviteId === l.i.id && r.userId === USER.id);
+        if (onThisLink) return onThisLink.status === 'pending' ? json(200, [{ trip_id: l.t.id, request_id: onThisLink.id, outcome: 'already_requested' }]) : failWith('request_used');
+        const waiting = backend.joinRequests.find((r) => r.tripId === l.t.id && r.userId === USER.id && r.status === 'pending');
+        if (waiting) return json(200, [{ trip_id: l.t.id, request_id: waiting.id, outcome: 'already_requested' }]);
+        if (l.i.claimMemberId !== null) {
+          if (own) return failWith('claim_conflict');
+          if (backend.joinRequests.some((r) => r.claimMemberId === l.i.claimMemberId && r.status === 'pending')) return failWith('claim_pending');
+        }
+        if (backend.joinRequests.filter((r) => r.tripId === l.t.id && r.status === 'pending').length >= 50) return failWith('too_many_requests');
+        const made = seedRequest({ tripId: l.t.id, inviteId: l.i.id, userId: USER.id, requesterName: String(backend.profile.display_name), claimMemberId: l.i.claimMemberId });
+        backend.joinRequests.push(made);
+        l.i.useCount += 1;
+        return json(200, [{ trip_id: l.t.id, request_id: made.id, outcome: 'requested' }]);
+      }
+
+      // everything else: an active administrator of the trip only
+      const t = backend.trips.find((x) => x.id === body.p_trip_id && !x._hidden);
+      const ms = ((t?._members ?? []) as Record<string, any>[]);
+      const me = ms.find((m) => m.user_id === USER.id && m.status === 'active');
+      if (!t || !me) return failWith('trip_not_found');
+      if (me.role !== 'admin') return failWith('not_admin');
+      const statusOf = (i: Record<string, any>) => (i.revoked ? 'revoked' : i.claimMemberId !== null && i.useCount > 0 ? 'used' : i.expiresAt <= Date.now() ? 'expired' : 'active');
+
+      // the general link's token is kept (encrypted, in the real database) only while the link is live and was made with reusable links
+      const copyableNow = (i: Record<string, any>) => i.claimMemberId === null && !i.revoked && !i.legacy && i.expiresAt > Date.now();
+      if (inviteFn === 'get_general_invite_link') {
+        if (t.status !== 'active') return json(200, []);
+        const g = backend.invites.find((i) => i.tripId === t.id && copyableNow(i));
+        return json(200, g ? [{ token: g.token, expires_at: new Date(g.expiresAt).toISOString() }] : []);
+      }
+      if (inviteFn === 'list_trip_invites') {
+        return json(200, backend.invites.filter((i) => i.tripId === t.id).sort((a2, b2) => b2.createdAt - a2.createdAt).map((i) => ({
+          invite_id: i.id, claim_member_id: i.claimMemberId, claim_name: ms.find((m) => m.id === i.claimMemberId)?.display_name ?? null,
+          created_by_name: ms.find((m) => m.id === i.createdBy)?.display_name ?? 'Someone', expires_at: new Date(i.expiresAt).toISOString(),
+          use_count: i.useCount, revoked_at: i.revoked ? new Date().toISOString() : null, created_at: new Date(i.createdAt).toISOString(), status: statusOf(i), copyable: copyableNow(i),
+        })));
+      }
+      if (inviteFn === 'list_join_requests') {
+        return json(200, backend.joinRequests.filter((r) => r.tripId === t.id && r.status === 'pending').sort((a2, b2) => a2.createdAt - b2.createdAt).map((r) => ({
+          request_id: r.id, requester_name: r.requesterName, claim_member_id: r.claimMemberId, claim_name: ms.find((m) => m.id === r.claimMemberId)?.display_name ?? null,
+          created_at: new Date(r.createdAt).toISOString(),
+        })));
+      }
+      if (t.status === 'archived') return failWith('trip_archived');
+
+      if (inviteFn === 'revoke_invite') {
+        const i = backend.invites.find((x) => x.id === body.p_invite_id && x.tripId === t.id);
+        if (!i) return failWith('invite_not_found');
+        if (i.revoked) return json(200, [{ invite_id: i.id, changed: false }]);
+        i.revoked = true;
+        return json(200, [{ invite_id: i.id, changed: true }]);
+      }
+      if (inviteFn === 'create_invite') {
+        const hours = body.p_expires_in_hours;
+        if (!Number.isInteger(hours) || hours < 1 || hours > 720) return failWith('invalid_request');
+        if (body.p_claim_member_id) {
+          const g = ms.find((m) => m.id === body.p_claim_member_id && m.status === 'active');
+          if (!g) return failWith('member_not_found');
+          if (g.user_id !== null) return failWith('not_a_guest');
+          for (const old of backend.invites) if (old.claimMemberId === body.p_claim_member_id && !old.revoked) old.revoked = true; // one live claim link per friend
+        } else {
+          // one valid general link per trip: creating another is refused (an expired one is cleared away)
+          if (backend.invites.some((old) => old.tripId === t.id && old.claimMemberId === null && !old.revoked && old.expiresAt > Date.now())) return failWith('invite_exists');
+          for (const old of backend.invites) if (old.tripId === t.id && old.claimMemberId === null && !old.revoked) old.revoked = true;
+        }
+        const made = seedInvite({ tripId: t.id, claimMemberId: body.p_claim_member_id ?? null, createdBy: me.id, expiresAt: Date.now() + hours * 3_600_000 });
+        backend.invites.push(made);
+        return json(200, [{ invite_id: made.id, token: made.token, expires_at: new Date(made.expiresAt).toISOString() }]);
+      }
+
+      // decide_join_request
+      const r = backend.joinRequests.find((x) => x.id === body.p_request_id && x.tripId === t.id);
+      if (!r) return failWith('request_not_found');
+      if (typeof body.p_approve !== 'boolean') return failWith('invalid_request');
+      if (r.status !== 'pending') return json(200, [{ request_id: r.id, outcome: 'already_decided', member_id: r.memberId }]);
+      if (!body.p_approve) {
+        Object.assign(r, { status: 'rejected', decidedBy: me.id });
+        return json(200, [{ request_id: r.id, outcome: 'rejected', member_id: null }]);
+      }
+      const own = ms.find((m) => m.user_id === r.userId);
+      const approved = (m: Record<string, any>, outcome: string) => {
+        Object.assign(r, { status: 'approved', decidedBy: me.id, memberId: m.id });
+        t.members = ms.filter((x) => x.status === 'active').map((x) => ({ id: x.id, status: x.status }));
+        return json(200, [{ request_id: r.id, outcome, member_id: m.id }]);
+      };
+      if (own && own.status === 'active') return approved(own, 'already_member');
+      if (r.claimMemberId !== null) {
+        const g = ms.find((m) => m.id === r.claimMemberId && m.status === 'active' && m.user_id === null);
+        if (!g) return failWith('claim_unavailable');
+        if (own) return failWith('claim_conflict');
+        g.user_id = r.userId;
+        return approved(g, 'approved');
+      }
+      if (ms.filter((m) => m.status === 'active').length >= 50) return failWith('trip_full');
+      if (own) {
+        Object.assign(own, { status: 'active', role: 'member', left_at: null, display_name: r.requesterName });
+        return approved(own, 'approved');
+      }
+      const created = memberRow({ id: uuid(9700 + ++joinSeq), user_id: r.userId, display_name: r.requesterName, role: 'member', status: 'active', joined_at: new Date().toISOString() });
+      ms.push(created);
+      return approved(created, 'approved');
     }
     // ---- update_trip / set_trip_archived: the fake enforces the SAME rules as the real database functions.
     if ((url.pathname === '/rest/v1/rpc/update_trip' || url.pathname === '/rest/v1/rpc/set_trip_archived') && method === 'POST') {
@@ -2190,11 +2366,483 @@ async function memberFlows(browser: Awaited<ReturnType<typeof chromium.launch>>)
   }
 }
 
+async function inviteFlows(browser: Awaited<ReturnType<typeof chromium.launch>>) {
+  console.log('\nL. Invitations and join requests (a link only ever creates a request; an admin approves)');
+  const site = await startWebsite({ EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY: DUMMY_PUBLISHABLE_KEY, EXPO_PUBLIC_SUPABASE_URL: SUPABASE_URL });
+  try {
+    const ID = { me: uuid(9801), ravi: uuid(9802), gita: uuid(9803), boss: uuid(9804), gopal: uuid(9805), dev: uuid(9807), gopal3: uuid(9808), gopal4: uuid(9809) } as const;
+    const T = {
+      A: uuid(801), MEM: uuid(802), ARCH: uuid(803), DOUBLE: uuid(804), FULL: uuid(805),
+      J1: uuid(811), J2: uuid(812), J3: uuid(813), J4: uuid(814), J6: uuid(816), JARCH: uuid(817),
+    };
+    const OTHER_USER = (n: number) => `aaaaaaaa-aaaa-4aaa-8aaa-${String(n).padStart(12, '0')}`;
+    const start = dayFromToday(20);
+    const end = dayFromToday(23);
+    const mine = (id: string, role = 'admin', status = 'active') => memberRow({ id, user_id: USER.id, display_name: 'Asha Rao', role, status, left_at: status === 'active' ? null : '2026-11-10T10:00:00+00:00', joined_at: '2026-11-18T09:00:00+00:00' });
+    const ravi = () => memberRow({ id: ID.ravi, user_id: '22222222-2222-4222-8222-222222222222', display_name: 'Ravi Kumar', joined_at: '2026-11-18T10:00:00+00:00' });
+    const gita = () => memberRow({ id: ID.gita, user_id: null, display_name: 'Gita', joined_at: '2026-11-18T11:00:00+00:00' });
+    const gopal = (id: string = ID.gopal) => memberRow({ id, user_id: null, display_name: 'Gopal', joined_at: '2026-11-18T11:30:00+00:00' });
+    const boss = () => memberRow({ id: ID.boss, user_id: '88888888-8888-4888-8888-888888888888', display_name: 'Boss Bhavna', role: 'admin', joined_at: '2026-11-18T08:00:00+00:00' });
+    const trip = (id: string, name: string, members: Record<string, any>[], over: Record<string, any> = {}) =>
+      tripRow({ id, name, destination: 'Udaipur', start_date: start, end_date: end, budget_minor: 9_999_900, members: members.filter((m) => m.status === 'active').map((m) => ({ id: m.id, status: m.status })), _members: members, ...over });
+    const request = (tripId: string, over: Record<string, any>) => seedRequest({ tripId, ...over });
+
+    const logs: string[] = [];
+    const watch = (page: Page) => {
+      page.on('console', (m) => logs.push(m.text()));
+      page.on('pageerror', (e) => logs.push(String(e)));
+    };
+    const textOf = async (page: Page, id: string) => (await byId(page, id).innerText().catch(() => '')).replace(/\s+/g, ' ').trim();
+    const has = async (page: Page, id: string) => (await byId(page, id).count()) > 0;
+    const body = (page: Page) => page.locator('body').innerHTML();
+    const settle = (fn: () => Promise<boolean> | boolean) => waitFor(fn, 8000);
+    const iso = (ms: number) => new Date(ms).toISOString();
+
+    // =============== the administrator's side ===============
+    const adminCtx = await browser.newContext({ permissions: ['clipboard-read', 'clipboard-write'] });
+    const ab = newBackend();
+    ab.trips = [
+      trip(T.A, 'Invite Trip', [mine(ID.me), ravi(), gita()]),
+      trip(T.MEM, 'Member Trip', [mine(ID.me, 'member'), boss()]),
+      trip(T.ARCH, 'Archived Invite Trip', [mine(ID.me), ravi()], { status: 'archived' }),
+      trip(T.DOUBLE, 'Double Invite Trip', [mine(ID.me), gita()]),
+      trip(T.FULL, 'Full Trip', [mine(ID.me), ...Array.from({ length: 49 }, (_, i) => memberRow({ id: uuid(9900 + i), user_id: null, display_name: `Guest ${i + 2}` }))]),
+    ];
+    const reqNina = request(T.A, { userId: OTHER_USER(1), requesterName: 'Nina Shah', createdAt: Date.now() - 3 * 3_600_000 });
+    const reqPriya = request(T.A, { userId: OTHER_USER(2), requesterName: 'Priya Rao', claimMemberId: ID.gita, createdAt: Date.now() - 2 * 3_600_000 });
+    const reqOmar = request(T.A, { userId: OTHER_USER(3), requesterName: 'Omar Khan', createdAt: Date.now() - 1 * 3_600_000 });
+    const reqArch = request(T.ARCH, { userId: OTHER_USER(4), requesterName: 'Waiting Wendy' });
+    const reqFull = request(T.FULL, { userId: OTHER_USER(5), requesterName: 'Too Late Tara' });
+    ab.joinRequests = [reqNina, reqPriya, reqOmar, reqArch, reqFull];
+    await installFakeSupabase(adminCtx, ab);
+    await sessionInStorage(adminCtx);
+    const page = await adminCtx.newPage();
+    watch(page);
+    const listBodies: string[] = [];
+    const requestBodies: string[] = [];
+    page.on('response', async (r) => {
+      if (r.url().includes('/rpc/list_trip_invites')) listBodies.push(await r.text().catch(() => ''));
+      if (r.url().includes('/rpc/list_join_requests')) requestBodies.push(await r.text().catch(() => ''));
+    });
+    const calls = (fn: string) => ab.requests.filter((r) => r.method === 'POST' && r.path === `/rest/v1/rpc/${fn}`);
+    const go = async (id: string, wait = 'trip-people') => {
+      await page.goto(`${BASE}/trips/${id}`);
+      return byId(page, wait).waitFor({ timeout: 20000 }).then(() => true, () => false);
+    };
+    const selected = async (id: string) => (await byId(page, id).getAttribute('aria-checked')) === 'true';
+    const tripA = () => ab.trips.find((t) => t.id === T.A)!;
+    const lastInvite = () => ab.invites.at(-1)!;
+
+    check('opens a trip as an administrator and sees the Invite people section', (await go(T.A)) && (await has(page, 'invite-section')));
+    check('it says plainly that nobody joins until an admin approves', /Nobody joins until an admin approves their request/.test(await textOf(page, 'invite-approval-note')));
+    check('with no link yet the button says "Create invitation link"', (await textOf(page, 'invite-open')) === 'Create invitation link');
+    await byId(page, 'invite-open').click();
+    check('visible caption: Link lasts; only the expiry is a choice (1, 7, 30 days; 7 by default); there is NO usage limit', (await textOf(page, 'invite-expiry-caption')) === 'Link lasts' && (await selected('invite-expiry-168')) && (await has(page, 'invite-expiry-24')) && (await has(page, 'invite-expiry-720')) && !(await has(page, 'invite-uses-1')) && !(await has(page, 'invite-uses-caption')) && !/Maximum people|usage limit/i.test(await textOf(page, 'invite-options')));
+    check('the panel says the link can be copied again any time and ended with Revoke link, and the button says Create link', /copy this link again any time/.test(await textOf(page, 'invite-replace-note')) && (await textOf(page, 'invite-create')) === 'Create link');
+    const createsBefore = calls('create_invite').length;
+    await byId(page, 'invite-create').click();
+    check('creating the link sends exactly the trip and how long it lasts, with no usage limit and no user id', (await settle(() => calls('create_invite').length === createsBefore + 1)) && JSON.stringify(calls('create_invite').at(-1)!.body) === JSON.stringify({ p_trip_id: T.A, p_claim_member_id: null, p_expires_in_hours: 168 }), JSON.stringify(calls('create_invite').at(-1)?.body));
+    await byId(page, 'invite-link').waitFor({ timeout: 8000 });
+    const firstToken = lastInvite().token as string;
+    const linkText = await textOf(page, 'invite-link');
+    check('the link is shown as <address>/join/<64-character token>, and says it can be copied again later', new RegExp(`^${BASE.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/join/[0-9a-f]{64}$`).test(linkText) && linkText.endsWith(firstToken) && /copy it again any time/.test(await textOf(page, 'invite-once-warning')) && !/shown only once/.test(await textOf(page, 'invite-once-warning')), linkText);
+    check('it explains that people only send a request', /only sends a request|only send a request/.test(await textOf(page, 'invite-created-note')) && !/Replace link/.test(await textOf(page, 'invite-created-note')));
+    await byId(page, 'invite-copy').click();
+    check('Copy link puts the link on the clipboard and says so', (await byId(page, 'invite-copied').waitFor({ timeout: 5000 }).then(() => true, () => false)) && (await page.evaluate(() => navigator.clipboard.readText())) === linkText);
+    await shot(page, 'invite-created-light');
+    await byId(page, 'invite-done').click();
+    await settle(async () => !(await has(page, 'invite-link')));
+    check('after Done the secret link is gone from the page', !(await has(page, 'invite-link')) && !(await body(page)).includes(firstToken));
+    const generalId = lastInvite().id as string;
+    check('the active link is on screen with when it was made (local time) and what it is, and offers Copy link and Revoke link, and NO Replace link', (await settle(async () => (await has(page, 'invite-copy-link')))) && (await textOf(page, `invite-created-at-${generalId}`)) === createdLabel(iso(lastInvite().createdAt)) && /^Invitation link · No requests yet · Expires in 7 days$/.test(await textOf(page, `invite-summary-${generalId}`)) && (await textOf(page, 'invite-copy-link')) === 'Copy link' && (await textOf(page, `invite-revoke-${generalId}`)) === 'Revoke link' && !(await has(page, 'invite-replace')) && !(await has(page, 'invite-open')), await textOf(page, `invite-summary-${generalId}`));
+    check('there is no Past invitations section', !(await has(page, 'invite-past-toggle')) && !/Past invitations/.test(await body(page)));
+    await page.reload();
+    await byId(page, 'trip-people').waitFor({ timeout: 20000 });
+    await byId(page, 'invite-copy-link').waitFor({ timeout: 15000 });
+    check('after a reload the token is nowhere: not on the page, not in browser storage', !(await body(page)).includes(firstToken) && !(await page.evaluate(() => JSON.stringify([Object.entries(localStorage), Object.entries(sessionStorage)]))).includes(firstToken));
+    check('the list the server sends back never contains the token (read from the real responses)', listBodies.length >= 2 && listBodies.every((b) => !b.includes(firstToken) && !/"token"/i.test(b)), `${listBodies.length} answers`);
+
+    // ---- Copy link: the same link every time
+    await page.evaluate(() => navigator.clipboard.writeText('nothing yet'));
+    const getsBefore = calls('get_general_invite_link').length;
+    const copies: string[] = [];
+    for (let n = 0; n < 3; n++) {
+      await byId(page, 'invite-copy-link').click();
+      await settle(() => calls('get_general_invite_link').length === getsBefore + n + 1);
+      await settle(async () => (await page.evaluate(() => navigator.clipboard.readText())) !== (copies.at(-1) ?? 'nothing yet'));
+      copies.push(await page.evaluate(() => navigator.clipboard.readText()));
+    }
+    check('Copy link, pressed three times, puts the very same link on the clipboard every time: the one that was created', copies.length === 3 && copies.every((c) => c === linkText), JSON.stringify(copies));
+    check('each press asks only for this trip, and says it copied', calls('get_general_invite_link').slice(getsBefore).every((c) => JSON.stringify(c.body) === JSON.stringify({ p_trip_id: T.A })) && (await has(page, 'invite-copied')));
+    check('copying makes no new link, and the token is not left on the page or in browser storage', calls('create_invite').length === createsBefore + 1 && !(await body(page)).includes(firstToken) && !(await page.evaluate(() => JSON.stringify([Object.entries(localStorage), Object.entries(sessionStorage)]))).includes(firstToken));
+    ab.inviteFail = 'network';
+    await byId(page, 'invite-copy-link').click();
+    check('a connection failure while copying is explained, and nothing is copied', await settle(async () => /Can't reach the server/.test(await textOf(page, 'invite-error'))));
+    ab.inviteFail = null;
+
+    // ---- an older link (made before links could be copied again)
+    lastInvite().legacy = true;
+    await page.reload();
+    await byId(page, 'trip-people').waitFor({ timeout: 20000 });
+    await byId(page, 'invite-legacy-note').waitFor({ timeout: 15000 });
+    check('a link made before this update cannot be copied: it says so, offers no Copy link, and still offers Revoke link', !(await has(page, 'invite-copy-link')) && /can't be copied/.test(await textOf(page, 'invite-legacy-note')) && (await has(page, `invite-revoke-${generalId}`)));
+    lastInvite().legacy = false;
+    await page.reload();
+    await byId(page, 'invite-copy-link').waitFor({ timeout: 15000 });
+
+    // ---- revoke
+    const revokesBefore = calls('revoke_invite').length;
+    await byId(page, `invite-revoke-${generalId}`).click();
+    check('revoking asks first: the link stops for good, requests already made stay, people already on the trip stay, a new link can be made', (await textOf(page, 'confirm-title')) === 'Revoke the invitation link?' && /stops working for good/.test(await textOf(page, 'confirm-message')) && /Requests already made stay in Join requests/.test(await textOf(page, 'confirm-message')) && /Created \d/.test(await textOf(page, 'confirm-message')));
+    await byId(page, 'confirm-cancel').click();
+    await settle(async () => !(await has(page, 'confirm-dialog')));
+    check('"Keep it" sends nothing, and the link can still be copied', calls('revoke_invite').length === revokesBefore && (await has(page, `invite-revoke-${generalId}`)) && (await has(page, 'invite-copy-link')));
+    await byId(page, `invite-revoke-${generalId}`).click();
+    await byId(page, 'confirm-confirm').click();
+    check('confirming sends exactly the trip and the link', (await settle(() => calls('revoke_invite').length === revokesBefore + 1)) && JSON.stringify(calls('revoke_invite').at(-1)!.body) === JSON.stringify({ p_trip_id: T.A, p_invite_id: generalId }));
+    check('with no live link Copy link and Revoke link are gone, Create invitation link is back, and nothing about old links is listed', (await settle(async () => (await has(page, 'invite-open')))) && !(await has(page, 'invite-copy-link')) && !(await has(page, `invite-revoke-${generalId}`)) && !(await has(page, 'invite-past-toggle')));
+    check('requests that were already waiting are untouched by revoking', ab.joinRequests.filter((r) => r.tripId === T.A && r.status === 'pending').length === 3);
+    // a stale screen: another admin made a link a moment ago, so this one is refused with a clear message and nothing is replaced
+    const raced = seedInvite({ tripId: T.A, createdBy: ID.me });
+    ab.invites.push(raced);
+    await byId(page, 'invite-open').click();
+    await byId(page, 'invite-create').click();
+    check('creating while a valid link already exists (another admin made one) is refused clearly, and that link is untouched', (await settle(async () => /already has an active invitation link/.test(await textOf(page, 'invite-error')))) && !raced.revoked);
+    check('the screen then shows that link with Copy link (refreshed after the refusal)', await settle(async () => (await has(page, 'invite-copy-link'))));
+    ab.invites.splice(ab.invites.indexOf(raced), 1);
+    await page.reload();
+    await byId(page, 'invite-open').waitFor({ timeout: 15000 });
+    // a new link can be made after revoking: a different link from the old one
+    await byId(page, 'invite-open').click();
+    await byId(page, 'invite-expiry-720').click();
+    await byId(page, 'invite-create').click();
+    check('after revoking a new link can be made (30 days = 720 hours)', (await settle(() => calls('create_invite').length === createsBefore + 3)) && JSON.stringify(calls('create_invite').at(-1)!.body) === JSON.stringify({ p_trip_id: T.A, p_claim_member_id: null, p_expires_in_hours: 720 }));
+    await byId(page, 'invite-link').waitFor({ timeout: 8000 });
+    check('it is a different link from the revoked one', lastInvite().token !== firstToken && (await textOf(page, 'invite-link')).endsWith(lastInvite().token as string));
+    await byId(page, 'invite-done').click();
+    await byId(page, 'invite-copy-link').waitFor({ timeout: 8000 });
+    // and that one is revoked again so the claim-link steps below start with no general link
+    await byId(page, `invite-revoke-${lastInvite().id}`).click();
+    await byId(page, 'confirm-confirm').click();
+    await settle(async () => (await has(page, 'invite-open')));
+
+    // ---- a friend's claim link
+    await byId(page, `member-manage-${ID.gita}`).click();
+    check('only a friend without an account can be offered a claim link', (await has(page, `member-invite-${ID.gita}`)) && !(await (async () => { await byId(page, `member-manage-${ID.ravi}`).click(); return has(page, `member-invite-${ID.ravi}`); })()));
+    await byId(page, `member-manage-${ID.ravi}`).click();
+    await byId(page, `member-manage-${ID.gita}`).click();
+    await byId(page, `member-invite-${ID.gita}`).click();
+    check('the claim panel says whose place it is for, that it is single use, and that an admin still approves', /This link is for Gita/.test(await textOf(page, 'invite-claim-note')) && /an admin approves/.test(await textOf(page, 'invite-claim-note')) && (await textOf(page, 'invite-claim-single-use')) === 'Single use: only Gita can use this link.');
+    await byId(page, 'invite-create').click();
+    check('the claim link is sent with the friend (no usage limit)', (await settle(() => calls('create_invite').length === createsBefore + 4)) && JSON.stringify(calls('create_invite').at(-1)!.body) === JSON.stringify({ p_trip_id: T.A, p_claim_member_id: ID.gita, p_expires_in_hours: 168 }));
+    await byId(page, 'invite-link').waitFor({ timeout: 8000 });
+    check('the created claim link repeats that it is single use and still needs approval', /Single use: only Gita can use this link, and an admin still has to approve/.test(await textOf(page, 'invite-created-note')));
+    const claimFirstId = lastInvite().id as string;
+    await byId(page, 'invite-done').click();
+    check('it is listed under Links for friends as for Gita, with Cancel this invitation', await settle(async () => /^For Gita · No request yet · Expires in 7 days$/.test(await textOf(page, `invite-summary-${claimFirstId}`))) && (await textOf(page, `invite-revoke-${claimFirstId}`)) === 'Cancel this invitation');
+    await byId(page, `member-manage-${ID.gita}`).click();
+    await byId(page, `member-invite-${ID.gita}`).click();
+    await byId(page, 'invite-create').click();
+    await byId(page, 'invite-link').waitFor({ timeout: 8000 });
+    check('a second claim link for the same friend replaces the first (one live claim link per friend)', !!ab.invites.find((i) => i.id === claimFirstId)!.revoked && !lastInvite().revoked);
+    await byId(page, 'invite-done').click();
+    const claimId = lastInvite().id as string;
+    await settle(async () => (await has(page, `invite-revoke-${claimId}`)));
+    await byId(page, `invite-revoke-${claimId}`).click();
+    check('cancelling a friend\'s link asks in its own words', (await textOf(page, 'confirm-title')) === 'Cancel this invitation?' && /Only this invitation stops working/.test(await textOf(page, 'confirm-message')));
+    await byId(page, 'confirm-cancel').click();
+
+    // ---- failures
+    ab.inviteFail = 'network';
+    await byId(page, 'invite-open').click();
+    await byId(page, 'invite-create').click();
+    check('a connection failure is explained and the options stay so it can be retried', (await settle(async () => /Can't reach the server/.test(await textOf(page, 'invite-error')))) && (await has(page, 'invite-create')));
+    ab.inviteFail = 'not_admin';
+    await byId(page, 'invite-create').click();
+    check('"only admins" is explained', await settle(async () => (await textOf(page, 'invite-error')) === 'Only trip admins can do that.'));
+    ab.inviteFail = null;
+    await byId(page, 'invite-cancel-options').click();
+
+    // =============== join requests: the administrator decides ===============
+    check('Join requests is collapsed by default with the count always visible', (await textOf(page, 'requests-toggle')).includes('▸ Join requests (3)') && !(await has(page, 'requests-list')));
+    await byId(page, 'requests-toggle').click();
+    check('it lists who asked, when (local time), and whose place a claim is for; never a user id', (await textOf(page, `request-name-${reqNina.id}`)) === 'Nina Shah' && (await textOf(page, `request-when-${reqNina.id}`)) === askedLabel(iso(reqNina.createdAt)) && (await textOf(page, `request-claim-${reqPriya.id}`)) === "Wants to take Gita's place" && !(await has(page, `request-claim-${reqNina.id}`)));
+    check('the requests the server sent contain no user id', requestBodies.length >= 1 && requestBodies.every((b) => !/user/i.test(b) && ![OTHER_USER(1), OTHER_USER(2), OTHER_USER(3)].some((u) => b.includes(u))));
+    check('asking never added anyone: none of the three is on the trip yet', !(await textOf(page, 'trip-people')).match(/Nina|Priya|Omar/));
+    const decidesBefore = calls('decide_join_request').length;
+    await byId(page, `request-approve-${reqNina.id}`).click();
+    check('Approve asks first, in plain words', (await textOf(page, 'confirm-title')) === 'Add Nina Shah to this trip?' && /will become a member/.test(await textOf(page, 'confirm-message')));
+    await byId(page, 'confirm-cancel').click();
+    await settle(async () => !(await has(page, 'confirm-dialog')));
+    check('"Not yet" sends nothing and adds nobody', calls('decide_join_request').length === decidesBefore && !(await textOf(page, 'trip-people')).includes('Nina'));
+    await byId(page, `request-approve-${reqNina.id}`).click();
+    await byId(page, 'confirm-confirm').click();
+    check('approving sends exactly the trip, the request and the answer (no user id)', (await settle(() => calls('decide_join_request').length === decidesBefore + 1)) && JSON.stringify(calls('decide_join_request').at(-1)!.body) === JSON.stringify({ p_trip_id: T.A, p_request_id: reqNina.id, p_approve: true }));
+    check('only now is she on the trip, as an ordinary member; the count drops; a confirmation is shown', (await vis(page, 'People (4)').waitFor({ timeout: 8000 }).then(() => true, () => false)) && (await textOf(page, 'trip-people')).includes('Nina Shah') && (await textOf(page, 'requests-notice')) === 'Nina Shah was added to the trip.' && /Join requests \(2\)/.test(await textOf(page, 'requests-toggle')));
+    check('she was added as a member, never an admin', (tripA()._members as Record<string, any>[]).find((m) => m.user_id === OTHER_USER(1))!.role === 'member');
+    await byId(page, `request-reject-${reqOmar.id}`).click();
+    check('Reject asks first and says they cannot ask again with the current link', (await textOf(page, 'confirm-title')) === "Reject Omar Khan's request?" && /cannot ask again with the current link/.test(await textOf(page, 'confirm-message')));
+    await byId(page, 'confirm-confirm').click();
+    check('rejecting sends approve=false, adds nobody, and says so', (await settle(() => calls('decide_join_request').length === decidesBefore + 2)) && calls('decide_join_request').at(-1)!.body.p_approve === false && (await settle(async () => (await textOf(page, 'requests-notice')) === "Omar Khan's request was rejected.")) && !(await textOf(page, 'trip-people')).includes('Omar'));
+    await byId(page, `request-approve-${reqPriya.id}`).click();
+    check('a claim is put in its own words: the friend\'s place and history', (await textOf(page, 'confirm-title')) === "Let Priya Rao take Gita's place?" && /with everything already recorded for Gita\. Nobody else is added/.test(await textOf(page, 'confirm-message')));
+    await byId(page, 'confirm-confirm').click();
+    check('approving a claim says she took the place; Gita is no longer a guest and nobody was added', (await settle(async () => (await textOf(page, 'requests-notice')) === "Priya Rao took Gita's place.")) && !(await textOf(page, `member-${ID.gita}`)).includes('Guest') && (await vis(page, 'People (4)').isVisible()));
+    check('the friend\'s row is the same member, now with an account, still an ordinary member', (() => { const g = (tripA()._members as Record<string, any>[]).find((m) => m.id === ID.gita)!; return g.user_id === OTHER_USER(2) && g.role === 'member' && g.display_name === 'Gita'; })());
+    check('with nothing waiting the list disappears, and the confirmation stays', !(await has(page, 'requests-toggle')) && (await has(page, 'requests-notice')));
+
+    // an administrator with a stale list: someone else already answered
+    ab.joinRequests.push(request(T.A, { userId: OTHER_USER(6), requesterName: 'Stale Sam' }));
+    await page.reload();
+    await byId(page, 'requests-toggle').waitFor({ timeout: 15000 });
+    await byId(page, 'requests-toggle').click();
+    const stale = ab.joinRequests.at(-1)!;
+    stale.status = 'approved'; // another administrator answered it while this screen was open
+    stale.memberId = ID.ravi;
+    await byId(page, `request-approve-${stale.id}`).click();
+    await byId(page, 'confirm-confirm').click();
+    check('if another admin already answered, you are told so and nothing happens twice', (await settle(async () => (await textOf(page, 'requests-notice')) === 'Another admin already answered this request.')) && (tripA()._members as Record<string, any>[]).filter((m) => m.display_name === 'Stale Sam').length === 0);
+
+    // failures while deciding
+    const retry = request(T.A, { userId: OTHER_USER(7), requesterName: 'Retry Ria' });
+    ab.joinRequests.push(retry);
+    await page.reload();
+    await byId(page, 'requests-toggle').waitFor({ timeout: 15000 });
+    await byId(page, 'requests-toggle').click();
+    ab.inviteFail = 'network';
+    await byId(page, `request-approve-${retry.id}`).click();
+    await byId(page, 'confirm-confirm').click();
+    check('a connection failure keeps the dialog open with a message, so it can simply be retried', (await byId(page, 'confirm-error').waitFor({ timeout: 8000 }).then(() => true, () => false)) && /Can't reach the server/.test(await textOf(page, 'confirm-error')) && (await has(page, 'confirm-dialog')));
+    ab.inviteFail = null;
+    await byId(page, 'confirm-confirm').click();
+    check('retrying from the same dialog works', await settle(async () => (await textOf(page, 'requests-notice')) === 'Retry Ria was added to the trip.'));
+    check('on a full trip an approval is refused and the request stays waiting', await (async () => {
+      await go(T.FULL);
+      await byId(page, 'requests-toggle').click();
+      await byId(page, `request-approve-${reqFull.id}`).click();
+      await byId(page, 'confirm-confirm').click();
+      return (await byId(page, 'requests-error').waitFor({ timeout: 8000 }).then(() => true, () => false)) && /already has 50 people/.test(await textOf(page, 'requests-error')) && reqFull.status === 'pending' && (await has(page, 'requests-reload'));
+    })());
+    check('Reload latest clears the message and re-reads', await (async () => { await byId(page, 'requests-reload').click(); return settle(async () => !(await has(page, 'requests-error'))); })());
+
+    // who sees what
+    check('an ordinary member sees no invitation controls and no join requests', (await go(T.MEM)) && !(await has(page, 'invite-section')) && !(await has(page, 'requests-section')));
+    check('on an archived trip an administrator sees neither (requests wait until it is restored)', (await go(T.ARCH)) && !(await has(page, 'invite-section')) && !(await has(page, 'requests-section')) && reqArch.status === 'pending');
+
+    // double tap
+    await go(T.DOUBLE);
+    ab.slowInviteMs = 1200;
+    await byId(page, 'invite-open').click();
+    const doubleBefore = calls('create_invite').length;
+    await byId(page, 'invite-create').click();
+    await byId(page, 'invite-create').click({ timeout: 800, force: true }).catch(() => {});
+    await page.waitForTimeout(1800);
+    check('tapping Create twice sends only one request', calls('create_invite').length === doubleBefore + 1, String(calls('create_invite').length - doubleBefore));
+    ab.slowInviteMs = 0;
+    check('no unexpected network calls on the administrator side', ab.unexpected.length === 0, ab.unexpected.join(', '));
+    await adminCtx.close();
+
+    // =============== a visitor opens a link ===============
+    const jb = newBackend();
+    jb.trips = [
+      trip(T.J1, 'Goa Joiners', [boss(), ravi()], { _hidden: true }),
+      trip(T.J2, 'Claim Trip', [boss(), gopal()], { _hidden: true }),
+      trip(T.J3, 'Conflict Trip', [boss(), gopal(ID.gopal3), mine(ID.dev, 'member', 'left')], { _hidden: true }),
+      trip(T.J4, 'Other Trip', [boss(), gopal(ID.gopal4)], { _hidden: true }),
+      trip(T.J6, 'Gone Trip', [boss()], { _hidden: true }),
+      trip(T.JARCH, 'Archived Join Trip', [boss()], { _hidden: true, status: 'archived' }),
+    ];
+    const inv = (tripId: string, over: Record<string, any> = {}) => seedInvite({ tripId, createdBy: ID.boss, ...over });
+    const iGeneral = inv(T.J1);
+    const iClaim = inv(T.J2, { claimMemberId: ID.gopal });
+    const iConflict = inv(T.J3, { claimMemberId: ID.gopal3 });
+    const iUsedClaim = inv(T.J4, { claimMemberId: ID.gopal4 });
+    const iRevoked = inv(T.J6, { revoked: true });
+    const iReplacedOld = inv(T.J6, { revoked: true });
+    const iExpired = inv(T.J6, { expiresAt: Date.now() - 1000 });
+    const iArchived = inv(T.JARCH);
+    const iRejected = inv(T.J6, {}); // this person was rejected once with this link
+    jb.invites = [iGeneral, iClaim, iConflict, iUsedClaim, iRevoked, iReplacedOld, iExpired, iArchived, iRejected];
+    const rejectedBefore = request(T.J6, { inviteId: iRejected.id, userId: USER.id, requesterName: 'Asha Rao', status: 'rejected' });
+    const othersClaim = request(T.J4, { inviteId: iUsedClaim.id, userId: OTHER_USER(9), requesterName: 'Someone Else', claimMemberId: ID.gopal4 });
+    jb.joinRequests = [rejectedBefore, othersClaim];
+    iUsedClaim.useCount = 1;
+
+    const outCtx = await browser.newContext();
+    await installFakeSupabase(outCtx, jb);
+    const out = await outCtx.newPage();
+    watch(out);
+    const open = async (p: Page, token: string, wait: string) => {
+      await p.goto(`${BASE}/join/${token}`);
+      return byId(p, wait).waitFor({ timeout: 20000 }).then(() => true, () => false);
+    };
+    check('a signed-out visitor can open a link and see what it is for', await open(out, iGeneral.token, 'join-trip-name'));
+    check('it shows the trip, place, dates, who invited them and how many are on it', (await textOf(out, 'join-trip-name')) === 'Goa Joiners' && (await textOf(out, 'join-destination')) === 'Udaipur' && (await textOf(out, 'join-dates')) === formatDateRange(start, end) && (await textOf(out, 'join-inviter')) === 'Invited by Boss Bhavna' && (await textOf(out, 'join-count')) === '2 people are on this trip');
+    const pageText = await out.locator('body').innerText();
+    check('and nothing else: no budget, no people\'s names, no ids, no token', !/99,999|9999900|Ravi|Gopal|[0-9a-f]{32}/i.test(pageText) && !(await body(out)).includes(iGeneral.token), pageText.slice(0, 160));
+    check('it says they can ASK to join and that an admin has to approve before they can see the trip', /ask to join\. An admin has to approve your request before you can see the trip/.test(await textOf(out, 'join-approval-note')) && /need a TripMate account/.test(await textOf(out, 'join-needs-account')));
+    check('it offers sign in or create an account, and no join button yet', (await has(out, 'join-signin')) && (await has(out, 'join-signup')) && !(await has(out, 'join-request')));
+    const previews = jb.requests.filter((r) => r.path === '/rest/v1/rpc/preview_invite');
+    check('the preview request carries only the token, as the public key (not a login)', previews.length >= 1 && JSON.stringify(previews[0]!.body) === JSON.stringify({ p_token: iGeneral.token }) && previews[0]!.auth === `Bearer ${DUMMY_PUBLISHABLE_KEY}`);
+    check('no trip, member or request call is made while signed out, and no URL contains the token', !jb.requests.some((r) => r.path.startsWith('/rest/v1/trips') || r.path.includes('list_trip_members') || r.path.includes('request_to_join')) && !jb.requests.some((r) => r.path.includes(iGeneral.token)));
+    await shot(out, 'join-preview-signed-out');
+    await open(out, iClaim.token, 'join-trip-name');
+    check('a link made for a friend says so, and that an admin approves', /This invitation is for Gopal/.test(await textOf(out, 'join-claim-note')) && /If an admin approves your request/.test(await textOf(out, 'join-claim-note')));
+
+    // every unusable link looks exactly the same
+    const invalidTexts: string[] = [];
+    const reqsBefore = jb.requests.length;
+    for (const [label, token] of [
+      ['cancelled', iRevoked.token], ['replaced', iReplacedOld.token], ['expired', iExpired.token], ['trip archived', iArchived.token],
+      ['already used (a friend\'s link)', iUsedClaim.token], ['never existed', 'f'.repeat(64)], ['malformed (short)', 'abc'], ['malformed (upper case)', 'F'.repeat(64)],
+    ] as const) {
+      const shown = await open(out, token, 'join-invalid');
+      invalidTexts.push(`${await textOf(out, 'join-invalid-title')} | ${await textOf(out, 'join-invalid')}`);
+      check(`a ${label} link shows the "not valid" page`, shown);
+    }
+    check('all eight look exactly the same (nothing says which)', new Set(invalidTexts).size === 1, invalidTexts[0]);
+    check('the two malformed links never contacted the server', jb.requests.slice(reqsBefore).filter((r) => r.path.includes('preview_invite')).length === 6);
+
+    // sign in from the link, be brought back, and ASK
+    await open(out, iGeneral.token, 'join-signin');
+    await byId(out, 'join-signin').click();
+    await byId(out, 'email').waitFor({ timeout: 10000 });
+    check('Sign in remembers the link in this browser (briefly)', pathOf(out) === '/sign-in' && (await out.evaluate(() => (localStorage.getItem('tripmate.pending-invite') ?? '').length > 0)));
+    await byId(out, 'email').fill('asha@example.com');
+    await byId(out, 'password').fill('a-good-password-1');
+    await byId(out, 'submit').click();
+    check('after signing in they are brought straight back to the link, now with a Request to join button', (await byId(out, 'join-request').waitFor({ timeout: 15000 }).then(() => true, () => false)) && pathOf(out) === `/join/${iGeneral.token}` && (await textOf(out, 'join-request')) === 'Request to join', pathOf(out));
+    check('asking is never automatic: nothing was sent yet', !jb.requests.some((r) => r.path.includes('request_to_join')));
+    await byId(out, 'join-request').click();
+    check('pressing it sends only the token, with their login', (await settle(() => jb.requests.some((r) => r.path.includes('request_to_join')))) && JSON.stringify(jb.requests.find((r) => r.path.includes('request_to_join'))!.body) === JSON.stringify({ p_token: iGeneral.token }) && !!jb.requests.find((r) => r.path.includes('request_to_join'))!.auth?.startsWith('Bearer ey'));
+    check('they see "Request sent": an admin needs to approve it, and until then they can see nothing about the trip', (await byId(out, 'join-requested').waitFor({ timeout: 10000 }).then(() => true, () => false)) && /Your request has been sent\. An admin needs to approve it/.test(await textOf(out, 'join-requested')) && /cannot see anything about the trip/.test(await textOf(out, 'join-requested-privacy')));
+    const j1 = jb.trips.find((t) => t.id === T.J1)!;
+    check('NO membership was created: the trip\'s people are exactly as before, and one request is waiting', (j1._members as Record<string, any>[]).length === 2 && !(j1._members as Record<string, any>[]).some((m) => m.user_id === USER.id) && jb.joinRequests.filter((r) => r.tripId === T.J1 && r.status === 'pending').length === 1);
+    check('the remembered link is cleared once used', await out.evaluate(() => localStorage.getItem('tripmate.pending-invite') === null));
+    await out.goto(BASE);
+    await byId(out, 'greeting').waitFor({ timeout: 15000 });
+    check('the trip does NOT appear on their Home screen', !(await has(out, `trip-card-${T.J1}`)));
+    await out.goto(`${BASE}/trips/${T.J1}`);
+    check('opening the trip itself gives the single "not available" answer (a pending person sees nothing)', await byId(out, 'trip-unavailable').waitFor({ timeout: 15000 }).then(() => true, () => false));
+    check('and nothing about the trip appears on that page', !/Goa Joiners|Udaipur|Boss Bhavna|Ravi/.test(await out.locator('body').innerText()));
+    await open(out, iGeneral.token, 'join-request');
+    await byId(out, 'join-request').click();
+    check('asking again says they already asked; no second request is made', (await byId(out, 'join-requested').waitFor({ timeout: 10000 }).then(() => true, () => false)) && /already asked to join/.test(await textOf(out, 'join-requested')) && jb.joinRequests.filter((r) => r.tripId === T.J1).length === 1);
+    // an administrator approves (simulated directly), and only then does the trip appear
+    const pendingJ1 = jb.joinRequests.find((r) => r.tripId === T.J1)!;
+    (j1._members as Record<string, any>[]).push(memberRow({ id: uuid(9990), user_id: USER.id, display_name: 'Asha Rao', role: 'member' }));
+    j1.members = (j1._members as Record<string, any>[]).map((m) => ({ id: m.id, status: m.status }));
+    j1._hidden = false;
+    pendingJ1.status = 'approved';
+    await out.goto(BASE);
+    check('after an administrator approves, the trip appears on their Home screen', await byId(out, `trip-card-${T.J1}`).waitFor({ timeout: 15000 }).then(() => true, () => false));
+    await shot(out, 'join-after-approval');
+
+    // a claim request: the friend's place is not touched until approval
+    const claimBefore = JSON.stringify((jb.trips.find((t) => t.id === T.J2)!._members as Record<string, any>[]).find((m) => m.id === ID.gopal));
+    await open(out, iClaim.token, 'join-request');
+    check('a friend\'s link offers "Ask to take Gopal\'s place"', (await textOf(out, 'join-request')) === "Ask to take Gopal's place");
+    await byId(out, 'join-request').click();
+    check('it makes a CLAIM request and says an admin approves', (await byId(out, 'join-requested').waitFor({ timeout: 10000 }).then(() => true, () => false)) && jb.joinRequests.some((r) => r.tripId === T.J2 && r.claimMemberId === ID.gopal && r.status === 'pending'));
+    check('the friend\'s place is exactly as it was: still a guest, nobody added', JSON.stringify((jb.trips.find((t) => t.id === T.J2)!._members as Record<string, any>[]).find((m) => m.id === ID.gopal)) === claimBefore && (jb.trips.find((t) => t.id === T.J2)!._members as unknown[]).length === 2);
+    check('a friend\'s link is single use: once asked with, it no longer opens for anyone', await (async () => { await out.goto(`${BASE}/join/${iClaim.token}`); return byId(out, 'join-invalid').waitFor({ timeout: 15000 }).then(() => true, () => false); })());
+
+    // refusals, in plain words
+    await open(out, iRejected.token, 'join-request');
+    await byId(out, 'join-request').click();
+    check('a person rejected once cannot ask again with the same link (they need the new one)', (await byId(out, 'join-error').waitFor({ timeout: 8000 }).then(() => true, () => false)) && /already asked to join with this link/.test(await textOf(out, 'join-error')) && /ask an admin for their new link/.test(await textOf(out, 'join-error')));
+    const iClaimNew = inv(T.J4, { claimMemberId: ID.gopal4 }); // a replacement claim link while someone else is already waiting for that place
+    jb.invites.push(iClaimNew);
+    await open(out, iClaimNew.token, 'join-request');
+    await byId(out, 'join-request').click();
+    check('a place somebody else is already waiting for is refused clearly', (await byId(out, 'join-error').waitFor({ timeout: 8000 }).then(() => true, () => false)) && /Someone has already asked to take this place/.test(await textOf(out, 'join-error')));
+    await open(out, iConflict.token, 'join-request');
+    await byId(out, 'join-request').click();
+    check('someone who was on the trip before is told to ask for the general link', (await byId(out, 'join-error').waitFor({ timeout: 8000 }).then(() => true, () => false)) && /general invite link/.test(await textOf(out, 'join-error')));
+    const iNet = inv(T.J6, {});
+    iRejected.revoked = true;
+    jb.invites.push(iNet);
+    await open(out, iNet.token, 'join-request');
+    jb.inviteFail = 'network';
+    await byId(out, 'join-request').click();
+    check('a connection failure keeps the button so it can be retried', (await byId(out, 'join-error').waitFor({ timeout: 8000 }).then(() => true, () => false)) && /Can't reach the server/.test(await textOf(out, 'join-error')) && (await has(out, 'join-request')));
+    jb.inviteFail = null;
+    await byId(out, 'join-request').click();
+    check('retrying works', await byId(out, 'join-requested').waitFor({ timeout: 10000 }).then(() => true, () => false));
+    check('a link cancelled between opening and asking shows the "not valid" page', await (async () => {
+      const late = inv(T.J6, {});
+      jb.invites.push(late);
+      jb.joinRequests = jb.joinRequests.filter((r) => !(r.tripId === T.J6 && r.userId === USER.id && r.status === 'pending'));
+      await open(out, late.token, 'join-request');
+      late.revoked = true;
+      await byId(out, 'join-request').click();
+      return byId(out, 'join-invalid').waitFor({ timeout: 8000 }).then(() => true, () => false);
+    })());
+    check('double-tapping Request to join sends one request', await (async () => {
+      jb.joinRequests = jb.joinRequests.filter((r) => !(r.tripId === T.J6 && r.userId === USER.id));
+      const fresh = inv(T.J6, {});
+      jb.invites.push(fresh);
+      jb.slowInviteMs = 1200;
+      await open(out, fresh.token, 'join-request');
+      const before = jb.requests.filter((r) => r.path.includes('request_to_join')).length;
+      await byId(out, 'join-request').click();
+      await byId(out, 'join-request').click({ timeout: 800, force: true }).catch(() => {});
+      await out.waitForTimeout(1800);
+      jb.slowInviteMs = 0;
+      return jb.requests.filter((r) => r.path.includes('request_to_join')).length === before + 1;
+    })());
+
+    // =============== secrecy, everywhere ===============
+    const everyToken = jb.invites.map((i) => i.token as string).concat(ab.invites.map((i) => i.token as string));
+    check('no token was ever written to the browser console', !logs.some((l) => everyToken.some((t) => l.includes(t))));
+    check('no request URL anywhere contains a token', !jb.requests.concat(ab.requests).some((r) => everyToken.some((t) => r.path.includes(t))));
+    check('no request to an invitation function carries a user id', jb.requests.concat(ab.requests).filter((r) => /rpc\/(create_invite|list_trip_invites|revoke_invite|preview_invite|request_to_join|list_join_requests|decide_join_request)/.test(r.path)).every((r) => !JSON.stringify(r.body ?? {}).includes(USER.id) && !/user/i.test(Object.keys(r.body ?? {}).join())));
+    check('no unexpected network calls on the visitor side', jb.unexpected.length === 0, jb.unexpected.join(', '));
+    await outCtx.close();
+
+    // =============== phone and Dark ===============
+    {
+      const ctx = await browser.newContext({ viewport: { width: 360, height: 780 }, isMobile: true, hasTouch: true, deviceScaleFactor: 2 });
+      const b = newBackend();
+      b.trips = [trip(T.J1, 'Goa Joiners', [boss(), ravi()], { _hidden: true })];
+      const phoneInvite = inv(T.J1);
+      b.invites = [phoneInvite];
+      await installFakeSupabase(ctx, b);
+      const p = await ctx.newPage();
+      await open(p, phoneInvite.token, 'join-trip-name');
+      check('Phone: the invitation page does not scroll sideways', await p.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1));
+      const box = await byId(p, 'join-signin').boundingBox();
+      check('Phone: the buttons are comfortable touch targets (44 px)', !!box && box.height >= 44, JSON.stringify(box));
+      await shot(p, 'join-phone');
+      await ctx.close();
+    }
+    {
+      const ctx = await browser.newContext();
+      const b = newBackend();
+      b.trips = [trip(T.J1, 'Goa Joiners', [boss(), ravi()], { _hidden: true })];
+      b.profile = { ...b.profile, theme_preference: 'dark' };
+      const darkInvite = inv(T.J1);
+      b.invites = [darkInvite];
+      await installFakeSupabase(ctx, b);
+      await ctx.addInitScript(() => window.localStorage.setItem('tripmate.theme-preference', 'dark'));
+      const p = await ctx.newPage();
+      await open(p, darkInvite.token, 'join-trip-name');
+      check('Dark theme: the invitation page follows the theme', await waitFor(async () => (await screenBg(p)) === DARK_BG));
+      await shot(p, 'join-dark');
+      await ctx.close();
+    }
+  } finally {
+    site.stop();
+  }
+}
+
 async function main() {
   const browser = await chromium.launch({ channel: 'msedge', headless: true });
   try {
     if (process.env.UI_ONLY === 'K') {
-      await memberFlows(browser); // quick re-run of the people scenario alone while developing
+      await memberFlows(browser); // quick re-run of one scenario alone while developing
+    } else if (process.env.UI_ONLY === 'L') {
+      await inviteFlows(browser);
     } else {
       await setupScreens(browser);
       await accountFlows(browser);
@@ -2204,6 +2852,7 @@ async function main() {
       await editFlows(browser);
       await dateFlows(browser);
       await memberFlows(browser);
+      await inviteFlows(browser);
     }
   } finally {
     await browser.close();

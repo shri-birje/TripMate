@@ -146,6 +146,53 @@ M3.4 step (b) adds a fourth database update. **Run it after Step 10.**
 4. Try it: `npm run app:web`, sign in, open a trip you created. Under **People**: add a friend by name, rename them, **Remove** them (read the confirmation), then expand **Former members**. With a second admin or member you cannot create yet (invitations arrive in M3.5), the role buttons and **Leave trip** can only be tried on trips where you have another admin; the screen explains why **Leave trip** is disabled when you are the only admin.
 5. If you open the trip page *before* running this update, the app says "Members aren't set up on the server yet" instead of failing mysteriously.
 
+## Step 12 - Invitations (added with Milestone M3.5; already applied on your project)
+
+Run `supabase/migrations/20261118400000_invitations.sql` in the SQL Editor (safe to run again). It is already applied on your project; **leave that file as it is** and continue with Step 13.
+
+## Step 13 - Approval-based joining (the M3.5 revision)
+
+This sixth database update changes how invitation links work: **a link only lets someone ASK to join, and an admin approves each request.** **Run it after Step 12.**
+
+1. In VS Code open `supabase/migrations/20261123000000_join_requests.sql`, select all, copy.
+2. Supabase dashboard -> **SQL Editor -> New query**, paste, **Run**. Expect "Success. No rows returned". It is safe to run again. **It cancels every invitation link made before it** (people who already joined through them stay on their trips); you then make one new link per trip.
+3. Check it from the outside:
+
+   ```powershell
+   npm run verify:supabase
+   ```
+
+   Expect `PASSED` with **0 warnings**. It now confirms the three new functions are closed to signed-out visitors, that `preview_invite()` still gives an empty answer for an unknown link, and that the old `accept_invite()` **no longer exists**. (Before this step you will see four warnings, which is expected.)
+4. Try it with two accounts. First account: open a trip you created, **People -> Invite people -> Create invitation link** (choose how long it lasts), **Copy link**, **Done**. Second account (a private window): open the link, see the trip's name and dates, sign in or create an account, press **Request to join**. The second account sees "Request sent" and **cannot see the trip**. First account: open **Join requests (1)**, **Approve** (read the question). Only now does the trip appear on the second account's Home screen. To test a friend's place: add a friend by name, **Manage -> Invite to claim this spot**, send that link to a third account, which asks to take the place; approve it, and the friend's place becomes that account's.
+5. If you try to create a link or ask to join *before* running this update, the app says "Invitations aren't set up on the server yet".
+6. **Before you put TripMate in front of real users you must add rate limiting** on the invitation preview and join-request calls (ADR-054). The database does not do it.
+
+## Step 14 - Reusable, copyable invitation link (migration #7, Supabase Vault)
+
+This seventh database update lets an admin **copy the trip's invitation link as often as they like** (the same link every time). The link's token is kept **encrypted in Supabase Vault** (already installed on your project). **Run it after Step 13.** Do not edit the earlier files.
+
+1. In VS Code open `supabase/migrations/20261123100000_reusable_general_link.sql`, select all, copy.
+2. Supabase dashboard -> **SQL Editor -> New query**, paste, **Run**. Expect "Success. No rows returned". If it stops with a message about the Vault, do not continue: send me the message. Existing links stay valid but **cannot be copied again** (the app says so); revoke one and create a new link to get a copyable one.
+3. Check the Vault permissions yourself (read-only, changes nothing). Paste and Run; **every value must be `false`**:
+
+   ```sql
+   select has_schema_privilege('anon', 'vault', 'USAGE')                          as anon_schema,
+          has_schema_privilege('authenticated', 'vault', 'USAGE')                 as signed_in_schema,
+          has_table_privilege('anon', 'vault.decrypted_secrets', 'SELECT')        as anon_reads_secrets,
+          has_table_privilege('authenticated', 'vault.decrypted_secrets', 'SELECT') as signed_in_reads_secrets,
+          has_table_privilege('authenticated', 'vault.secrets', 'SELECT')         as signed_in_reads_table;
+   ```
+
+   Then, also read-only, who can run the new function (expect `anon_can_run = false`, `signed_in_can_run = true`):
+
+   ```sql
+   select has_function_privilege('anon', 'public.get_general_invite_link(uuid)', 'EXECUTE')          as anon_can_run,
+          has_function_privilege('authenticated', 'public.get_general_invite_link(uuid)', 'EXECUTE') as signed_in_can_run;
+   ```
+4. Run `npm run verify:supabase`: expect `PASSED` with **0 warnings** (it now also checks `get_general_invite_link` is closed to signed-out visitors).
+5. Try it with a real admin account: **People -> Invite people -> Create invitation link**, **Done**, then press **Copy link** several times and paste each time: it is the same link. Open it in a private window to confirm it still works. **Revoke link**: Copy link disappears and the old link says it is not valid. The Vault secret is deleted too (you can confirm in the dashboard under Integrations -> Vault: no `trip-invite-...` secret remains for a revoked link).
+6. Rate limiting is still required before real users (ADR-054).
+
 ## Troubleshooting
 
 | You see | Meaning and fix |

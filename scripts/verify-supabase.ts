@@ -157,6 +157,8 @@ async function checkTrips(url: string, key: string) {
     const INVITE_MIGRATION = 'supabase/migrations/20261118400000_invitations.sql';
     const JOIN_MIGRATION = 'supabase/migrations/20261123000000_join_requests.sql';
     const LINK_MIGRATION = 'supabase/migrations/20261123100000_reusable_general_link.sql';
+    const EXPENSE_MIGRATION = 'supabase/migrations/20261123200000_expenses.sql';
+    const SPLIT_MIGRATION = 'supabase/migrations/20261125000000_expense_split_methods.sql';
     const probes: { name: string; args: Record<string, unknown>; mustBeClosed: boolean; migration?: string }[] = [
       { name: 'update_trip', args: { p_trip_id: nobody, p_expected_version: 1, p_name: 'x', p_destination: 'y', p_start_date: '2030-01-01', p_end_date: '2030-01-02' }, mustBeClosed: true },
       { name: 'set_trip_archived', args: { p_trip_id: nobody, p_archived: true, p_expected_version: 1 }, mustBeClosed: true },
@@ -180,6 +182,18 @@ async function checkTrips(url: string, key: string) {
       { name: 'decide_join_request', args: { p_trip_id: nobody, p_request_id: nobody, p_approve: true }, mustBeClosed: true, migration: JOIN_MIGRATION },
       // ---- Milestone M3.5 UX finalisation: Copy link. Closed to signed-out visitors (an administrator's call only).
       { name: 'get_general_invite_link', args: { p_trip_id: nobody }, mustBeClosed: true, migration: LINK_MIGRATION },
+      // ---- Milestone M5 (Checkpoint 1): expenses. Every one is closed to signed-out visitors.
+      { name: 'create_expense', args: { p_trip_id: nobody, p_expense_id: nobody, p_title: 'x', p_amount_minor: 1, p_spent_on: '2026-01-01', p_category_key: null, p_notes: null, p_split_method: 'equal', p_participants: [], p_payers: [] }, mustBeClosed: true, migration: EXPENSE_MIGRATION },
+      { name: 'update_expense', args: { p_trip_id: nobody, p_expense_id: nobody, p_expected_version: 1, p_title: 'x', p_amount_minor: 1, p_spent_on: '2026-01-01', p_category_key: null, p_notes: null, p_split_method: 'equal', p_participants: [], p_payers: [] }, mustBeClosed: true, migration: EXPENSE_MIGRATION },
+      { name: 'delete_expense', args: { p_trip_id: nobody, p_expense_id: nobody, p_expected_version: 1 }, mustBeClosed: true, migration: EXPENSE_MIGRATION },
+      { name: 'restore_expense', args: { p_trip_id: nobody, p_expense_id: nobody, p_expected_version: 1 }, mustBeClosed: true, migration: EXPENSE_MIGRATION },
+      { name: 'trip_member_balances', args: { p_trip_id: nobody }, mustBeClosed: true, migration: EXPENSE_MIGRATION },
+      { name: 'allocate_equal', args: { p_total: 1, p_member_ids: [] }, mustBeClosed: true, migration: EXPENSE_MIGRATION },
+      // ---- Milestone M5 (Checkpoint 5): split methods. Internal helpers, closed to everyone.
+      { name: 'allocate_weighted', args: { p_total: 1, p_member_ids: [], p_weights: [] }, mustBeClosed: true, migration: SPLIT_MIGRATION },
+      { name: 'expense_derive_shares', args: { p_method: 'equal', p_total: 1, p_ids: [], p_values: [] }, mustBeClosed: true, migration: SPLIT_MIGRATION },
+      // (The Checkpoint 2 guards, migrations 20261124000000 and 20261124100000, are TRIGGER functions. The API never exposes trigger functions,
+      //  so they cannot be probed from outside: they are checked with the read-only SQL in SUPABASE_SETUP.md instead.)
     ];
     for (const probe of probes) {
       const r = await call(`${url}/rest/v1/rpc/${probe.name}`, key, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(probe.args) });
@@ -188,6 +202,17 @@ async function checkTrips(url: string, key: string) {
       else if (c === '42501') ok(`${probe.name}() cannot be run by signed-out visitors (permission denied)`);
       else if (r.status === 404 || c === 'PGRST202') warn(`${probe.name}() is not available yet. Run ${probe.migration ?? EDIT_MIGRATION} in the Supabase SQL Editor (${probe.migration === JOIN_MIGRATION ? 'approval-based joining' : probe.migration === INVITE_MIGRATION ? 'invitations' : probe.migration ? 'managing people' : 'trip editing and archiving'} needs it).`);
       else warn(`${probe.name}() refused a signed-out visitor, but with an unexpected code (HTTP ${r.status}, ${c || 'none'})`);
+    }
+
+    // ---- The expense tables (Milestone M5): they must exist after migration 20261123200000 and give a signed-out visitor nothing.
+    for (const table of ['categories', 'expenses', 'expense_payers', 'expense_splits', 'expense_revisions']) {
+      const read = await call(`${url}/rest/v1/${table}?select=*&limit=1`, key);
+      const code = (read.body?.code as string | undefined) ?? '';
+      if (read.status === 404 || code === 'PGRST205' || code === '42P01') warn(`The ${table} table does not exist yet. Run ${EXPENSE_MIGRATION} in the Supabase SQL Editor.`);
+      else if (read.status === 200 && Array.isArray(read.body) && read.body.length === 0) ok(`${table} exists and a signed-out visitor sees no rows`);
+      else if (read.status === 200) fail(`A signed-out visitor can READ ${table} rows. Row-level security is wrong!`);
+      else if (read.status === 401 || read.status === 403 || code === '42501') ok(`${table} exists and signed-out visitors are denied access`);
+      else warn(`Unexpected answer reading ${table} (HTTP ${read.status}, code ${code || 'none'})`);
     }
 
     // ---- accept_invite() used to let a link make someone a member at once. It must be GONE once migration 20261123000000 is applied.

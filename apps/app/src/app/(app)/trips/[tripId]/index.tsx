@@ -9,6 +9,7 @@ import { Card } from '../../../../components/Card';
 import { ConfirmDialog } from '../../../../components/ConfirmDialog';
 import { Screen } from '../../../../components/Screen';
 import { useUserId } from '../../../../features/auth/AuthProvider';
+import { ExpensesCard } from '../../../../features/trips/ExpensesCard';
 import { PeopleCard } from '../../../../features/trips/PeopleCard';
 import { PhaseBadge } from '../../../../features/trips/PhaseBadge';
 import { useTripDetails } from '../../../../features/trips/tripDetailsApi';
@@ -191,6 +192,8 @@ function Details({ details, reload }: { details: TripDetails; reload: () => void
           </AppText>
         )}
       </Card>
+
+      <ExpensesCard details={details} userId={userId} />
 
       <Card>
         <AppText variant="heading">About</AppText>

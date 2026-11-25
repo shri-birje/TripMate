@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { Pressable } from 'react-native';
-import { formatDateInput, isoToDmy, parseDateInput, rawCursorAfterEdit } from '@tripmate/core';
+import { applyDateEdit, isoToDmy, parseDateInput } from '@tripmate/core';
 import { CalendarIcon } from '../../components/CalendarIcon';
 import { DatePickerModal } from '../../components/DatePickerModal';
 import { TextField } from '../../components/TextField';
@@ -18,6 +18,10 @@ interface Props {
   testID: string;
   /** The calendar will not let days before this ISO day be chosen (used for the end date). */
   minIso?: string | null;
+  /** The calendar will not let days after this ISO day be chosen (used for an expense, which must fall inside the trip). */
+  maxIso?: string | null;
+  /** When true, typing and pasting are limited to days between minIso and maxIso, exactly like the calendar. */
+  limitTyping?: boolean;
   /** Which month the calendar opens on when the box does not hold a real date yet. */
   initialViewIso?: string | null;
 }
@@ -32,19 +36,24 @@ interface Props {
  *
  * Shaping the text never judges it: the existing validation still decides whether a date is real.
  */
-export function DateField({ label, value, onChangeText, error, helper, placeholder, testID, minIso = null, initialViewIso = null }: Props) {
+export function DateField({ label, value, onChangeText, error, helper, placeholder, testID, minIso = null, maxIso = null, limitTyping = false, initialViewIso = null }: Props) {
   const { colors } = useTheme();
   const [open, setOpen] = useState(false);
   // Only set when the formatting moved the cursor somewhere other than where the browser/phone put it.
   const [forcedCursor, setForcedCursor] = useState<{ start: number; end: number } | undefined>(undefined);
 
   function handleChange(next: string) {
-    const typedCursor = rawCursorAfterEdit(value, next);
-    const shaped = formatDateInput(next, typedCursor);
+    // Impossible dates (day 32, month 13, 29 February in a common year, and with limitTyping any day outside the trip) are
+    // refused here, while typing and pasting. A refused edit leaves the box as it was. Removing text is always allowed.
+    const range = limitTyping && minIso && maxIso ? { minIso, maxIso } : undefined;
+    const shaped = applyDateEdit(value, next, range);
+    if (shaped === null) return;
     onChangeText(shaped.text);
-    // If the text is exactly what was typed and the cursor is where it was typed, leave the cursor alone.
-    const untouched = shaped.text === next && shaped.cursor === typedCursor;
-    setForcedCursor(untouched ? undefined : { start: shaped.cursor, end: shaped.cursor });
+    // The cursor only needs steering when the reshaping moved it away from where the browser or phone put it AND it is not simply at the end
+    // (at the end, setting the new text already leaves the cursor there; forcing a selection then can swallow the next key press).
+    const typedCursor = shaped.cursor;
+    const atEnd = typedCursor === shaped.text.length;
+    setForcedCursor(shaped.text === next || atEnd ? undefined : { start: typedCursor, end: typedCursor });
   }
 
   const chosen = parseDateInput(value); // an ISO day if the box holds a real date, otherwise null
@@ -87,6 +96,7 @@ export function DateField({ label, value, onChangeText, error, helper, placehold
         title={label}
         selectedIso={chosen}
         minIso={minIso}
+        maxIso={maxIso}
         initialViewIso={initialViewIso}
         onSelect={(iso) => {
           onChangeText(isoToDmy(iso));

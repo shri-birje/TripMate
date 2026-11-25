@@ -25,10 +25,10 @@ let db: PGlite;
 
 /** Functions that signed-in users are allowed to run. Add a name here ONLY after reviewing the function. */
 const ALLOWED_CALLABLE_FUNCTIONS = [
-  'add_guest_member', 'create_invite', 'create_trip', 'decide_join_request', 'get_general_invite_link', 'is_trip_member', 'leave_trip', 'list_join_requests',
+  'add_guest_member', 'create_expense', 'create_invite', 'create_trip', 'decide_join_request', 'delete_expense', 'get_general_invite_link', 'is_trip_member', 'leave_trip', 'list_join_requests',
   'list_trip_invites', 'list_trip_members', 'preview_invite', 'remove_member', 'rename_guest_member', 'request_to_join',
-  'revoke_invite', 'set_member_role', 'set_trip_archived', 'update_trip',
-]; // set_trip_archived and update_trip reviewed for M3.3; the six member functions for M3.4; the invitation and join-request functions for M3.5 (approval-based, ADR-059)
+  'restore_expense', 'revoke_invite', 'set_member_role', 'set_trip_archived', 'trip_member_balances', 'update_expense', 'update_trip',
+]; // set_trip_archived and update_trip reviewed for M3.3; the six member functions for M3.4; the invitation and join-request functions for M3.5 (approval-based, ADR-059); the four expense write functions and trip_member_balances for M5 (ADR-063)
 
 /**
  * Functions that SIGNED-OUT visitors (anon) may run. Until M3.5 this list was empty. preview_invite is the one
@@ -187,6 +187,60 @@ describe('the Vault (where the general link\'s token is kept encrypted)', () => 
     expect(returnsTokens).toEqual(['get_general_invite_link']);
     expect(fns.find((f) => f.name === 'trip_invites_remove_secret')!.authedCanRun).toBe(false);
     expect(fns.find((f) => f.name === 'trip_invites_remove_secret')!.anonCanRun).toBe(false);
+  });
+});
+
+describe('the expense tables (M5, ADR-063)', () => {
+  const EXPENSE_TABLES = ['categories', 'expenses', 'expense_payers', 'expense_splits', 'expense_revisions'];
+
+  it('exist, have row-level security, and signed-in users may only READ them (no write right and no write policy)', async () => {
+    const t = await db.query<{ relname: string; relrowsecurity: boolean }>(
+      `select c.relname, c.relrowsecurity from pg_class c join pg_namespace n on n.oid = c.relnamespace
+        where n.nspname = 'public' and c.relname = any($1) order by 1`, [EXPENSE_TABLES]);
+    expect(t.rows.map((r) => r.relname).sort()).toEqual([...EXPENSE_TABLES].sort());
+    expect(t.rows.every((r) => r.relrowsecurity)).toBe(true);
+    const grants = await db.query<{ table_name: string; privilege_type: string; grantee: string }>(
+      `select table_name, privilege_type, grantee from information_schema.role_table_grants
+        where table_schema = 'public' and table_name = any($1) and grantee in ('anon', 'authenticated', 'PUBLIC') order by 1, 2, 3`, [EXPENSE_TABLES]);
+    expect(grants.rows.every((g) => g.grantee === 'authenticated' && g.privilege_type === 'SELECT')).toBe(true);
+    expect(new Set(grants.rows.map((g) => g.table_name))).toEqual(new Set(EXPENSE_TABLES));
+    const policies = await db.query<{ tablename: string; cmd: string }>(`select tablename, cmd from pg_policies where schemaname = 'public' and tablename = any($1)`, [EXPENSE_TABLES]);
+    expect(policies.rows.every((p) => p.cmd === 'SELECT')).toBe(true);
+  });
+
+  it('only the reviewed functions write them, and only the four expense functions are callable', async () => {
+    const fns = await functions();
+    const writers = fns.filter((f) => /\b(insert\s+into|update|delete\s+from)\s+public\.(expenses|expense_payers|expense_splits|expense_revisions)\b/i.test(f.body)).map((f) => f.name).sort();
+    expect(writers).toEqual(['create_expense', 'delete_expense', 'expense_record_revision', 'restore_expense', 'update_expense']);
+    const callable = fns.filter((f) => f.authedCanRun && /expense/.test(f.name)).map((f) => f.name).sort();
+    expect(callable).toEqual(['create_expense', 'delete_expense', 'restore_expense', 'update_expense']);
+  });
+
+  it('every internal helper and trigger function is closed to signed-in and signed-out callers', async () => {
+    const internal = [
+      'allocate_equal', 'member_net_minor', 'assert_member_settled', 'assert_expenses_within_dates', 'assert_former_members_settled',
+      'trip_members_balance_guard', 'trips_dates_guard', 'expenses_check_category', 'check_expense_sums', 'expense_revisions_append_only',
+      'expense_parse_payers', 'expense_check_shape', 'expense_check_state', 'expense_payers_json', 'expense_splits_json',
+      'expense_canonical', 'expense_stored_canonical', 'expense_record_revision',
+      'trips_currency_guard', 'expense_rows_member_guard', 'check_expense_equal_split',
+      'allocate_weighted', 'expense_parse_split_inputs', 'expense_derive_shares', 'expense_derive_from_request', 'expense_splits_json_v2', 'check_expense_split_inputs',
+    ];
+    const fns = await functions();
+    for (const name of internal) {
+      const f = fns.find((x) => x.name === name);
+      expect(f, name).toBeDefined();
+      expect(f!.authedCanRun, name).toBe(false);
+      expect(f!.anonCanRun, name).toBe(false);
+    }
+  });
+
+  it('trip_member_balances identifies the caller and checks active membership of the REQUESTED trip itself (not row-level security alone)', async () => {
+    const f = (await functions()).find((x) => x.name === 'trip_member_balances')!;
+    expect(f.secdef).toBe(true);
+    expect(f.body).toContain('auth.uid()');
+    expect(f.body).toContain('trip_role_of(p_trip_id, v_uid)');
+    expect(f.anonCanRun).toBe(false);
+    expect(f.authedCanRun).toBe(true);
   });
 });
 

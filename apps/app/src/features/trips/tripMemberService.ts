@@ -49,6 +49,7 @@ export type TripMemberErrorKind =
   | 'archived' // the trip is archived (read-only)
   | 'not_found' // that person is no longer on this trip
   | 'guest_admin' // a friend without an account cannot be an administrator
+  | 'balance' // ADR-047: the person still has a balance in the trip's expenses, so they cannot be removed or leave yet
   | 'use_leave' // an administrator cannot remove themselves
   | 'cannot_rename' // only friends added by name can be renamed
   | 'unavailable' // not on the trip / no such trip: the single combined answer
@@ -68,6 +69,8 @@ export const MEMBER_MESSAGES = {
   archived: "This trip is archived, so people can't be changed. You can still leave it.",
   not_found: 'That person is no longer on this trip. Reload to see the latest.',
   guest_admin: "A friend without an account can't be an admin.",
+  balance: "This person still has a balance in the trip's expenses (they paid more or less than their share), so they can't be removed yet. Settle up, or edit or delete the expenses that involve them, until their balance is zero.",
+  balance_leave: "You still have a balance in the trip's expenses (you paid more or less than your share), so you can't leave yet. Settle up, or have the expenses that involve you edited, until your balance is zero.",
   use_leave: 'To remove yourself, use Leave trip.',
   cannot_rename: 'Only friends added by name can be renamed.',
   auth: 'Please sign in again to continue.',
@@ -100,6 +103,7 @@ function toError(error: PgError, fn?: MemberFunction): TripMemberError {
   if (text.includes('guest_cannot_be_admin')) return E('guest_admin', MEMBER_MESSAGES.guest_admin);
   if (text.includes('name_taken')) return E('name_taken', MEMBER_MESSAGES.name_taken);
   if (text.includes('trip_full')) return E('full', MEMBER_MESSAGES.full);
+  if (text.includes('balance_not_settled')) return E('balance', fn === 'leave_trip' ? MEMBER_MESSAGES.balance_leave : MEMBER_MESSAGES.balance);
   if (text.includes('use_leave_instead')) return E('use_leave', MEMBER_MESSAGES.use_leave);
   if (text.includes('cannot_rename')) return E('cannot_rename', MEMBER_MESSAGES.cannot_rename);
   if (text.includes('invalid_request') || code === '23514' || code === '23502') return E('invalid', MEMBER_MESSAGES.invalid);

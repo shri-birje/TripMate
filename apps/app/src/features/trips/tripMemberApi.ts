@@ -3,6 +3,7 @@ import { supabase } from '../../lib/supabase';
 import { useUserId } from '../auth/AuthProvider';
 import { tripDetailsKey } from './tripDetailsApi';
 import { tripsKey } from './tripApi';
+import { memberChangeExpenseKeys } from './memberChangeKeys';
 import {
   TripMemberError,
   addGuestMember,
@@ -39,6 +40,7 @@ function useRefresh(tripId: string) {
     Promise.all([
       queryClient.invalidateQueries({ queryKey: tripsKey(userId) }),
       queryClient.invalidateQueries({ queryKey: tripDetailsKey(userId, tripId) }),
+      ...memberChangeExpenseKeys(userId, tripId).map((queryKey) => queryClient.invalidateQueries({ queryKey })),
     ]);
   const afterLeaving = () => {
     void queryClient.invalidateQueries({ queryKey: tripsKey(userId) });

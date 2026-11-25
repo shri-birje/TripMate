@@ -223,7 +223,7 @@ describe('the read adds no new way in', () => {
     // M3.1 had create_trip + is_trip_member. M3.3 deliberately added exactly update_trip + set_trip_archived
     // (reviewed in security-audit.test.ts). Reading a trip still uses none of them.
     // M3.4 step (b) later added exactly six member functions, and M3.5 five invitation functions (all reviewed in security-audit.test.ts).
-    expect(fns).toEqual(['add_guest_member', 'create_invite', 'create_trip', 'decide_join_request', 'get_general_invite_link', 'is_trip_member', 'leave_trip', 'list_join_requests', 'list_trip_invites', 'list_trip_members', 'preview_invite', 'remove_member', 'rename_guest_member', 'request_to_join', 'revoke_invite', 'set_member_role', 'set_trip_archived', 'update_trip']);
+    expect(fns).toEqual(['add_guest_member', 'create_expense', 'create_invite', 'create_trip', 'decide_join_request', 'delete_expense', 'get_general_invite_link', 'is_trip_member', 'leave_trip', 'list_join_requests', 'list_trip_invites', 'list_trip_members', 'preview_invite', 'remove_member', 'rename_guest_member', 'request_to_join', 'restore_expense', 'revoke_invite', 'set_member_role', 'set_trip_archived', 'trip_member_balances', 'update_expense', 'update_trip']);
   });
 
   it('the details read still cannot be used to change anything', async () => {

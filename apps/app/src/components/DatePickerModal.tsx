@@ -26,6 +26,8 @@ interface Props {
   selectedIso: string | null;
   /** Days before this one cannot be chosen (used so an end date cannot be before the start date). */
   minIso?: string | null;
+  /** Days after this one cannot be chosen (an expense cannot be dated after the trip ends). */
+  maxIso?: string | null;
   /** Which month to open on when nothing is selected (for example the start date's month for the end date). */
   initialViewIso?: string | null;
   onSelect: (iso: string) => void;
@@ -43,7 +45,7 @@ const viewOf = (iso: string | null | undefined): YearMonth | null => {
  * (The standard native date picker does not exist on the web.) It works on plain calendar days,
  * so time zones cannot shift a date.
  */
-export function DatePickerModal({ visible, title, selectedIso, minIso = null, initialViewIso = null, onSelect, onClose }: Props) {
+export function DatePickerModal({ visible, title, selectedIso, minIso = null, maxIso = null, initialViewIso = null, onSelect, onClose }: Props) {
   const { colors } = useTheme();
   const today = todayIso();
   const fallbackView = (): YearMonth => viewOf(selectedIso) ?? viewOf(initialViewIso) ?? viewOf(today) ?? { year: CALENDAR_MIN_YEAR, month: 1 };
@@ -58,7 +60,7 @@ export function DatePickerModal({ visible, title, selectedIso, minIso = null, in
   }
 
   const weeks = buildMonthGrid(view.year, view.month);
-  const isBlocked = (iso: string) => minIso !== null && iso < minIso;
+  const isBlocked = (iso: string) => (minIso !== null && iso < minIso) || (maxIso !== null && iso > maxIso);
   const sameView = (a: YearMonth, b: YearMonth) => a.year === b.year && a.month === b.month;
 
   const nav = (label: string, glyph: string, target: YearMonth, testID: string) => {

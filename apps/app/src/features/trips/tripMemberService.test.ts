@@ -110,6 +110,7 @@ describe('what the database can answer, in plain words', () => {
     ['name_taken', 'name_taken', MEMBER_MESSAGES.name_taken],
     ['trip_full', 'full', MEMBER_MESSAGES.full],
     ['use_leave_instead', 'use_leave', MEMBER_MESSAGES.use_leave],
+    ['balance_not_settled', 'balance', MEMBER_MESSAGES.balance], // ADR-047: a friend who shares an expense has a balance until it is settled
     ['cannot_rename', 'cannot_rename', MEMBER_MESSAGES.cannot_rename],
     ['invalid_request', 'invalid', MEMBER_MESSAGES.invalid],
   ];
@@ -119,6 +120,17 @@ describe('what the database can answer, in plain words', () => {
     expect(e).toBeInstanceOf(TripMemberError);
     expect(e.kind).toBe(kind);
     expect(e.message).toBe(message);
+  });
+
+  it('an outstanding balance is explained, never shown as the generic failure, for a friend added by name and for leaving', async () => {
+    const removal = await fails(err('balance_not_settled', 'P0001'), (c) => removeMember(c, { tripId: TRIP, memberId: MEMBER }));
+    expect(removal.kind).toBe('balance');
+    expect(removal.message).toBe(MEMBER_MESSAGES.balance);
+    expect(removal.message).not.toBe(MEMBER_MESSAGES.unknown);
+    expect(removal.message).not.toMatch(/net_minor|P0001|balance_not_settled/); // raw database text is never shown
+    const leaving = await fails(err('balance_not_settled'), (c) => leaveTrip(c, { tripId: TRIP }));
+    expect(leaving.kind).toBe('balance');
+    expect(leaving.message).toBe(MEMBER_MESSAGES.balance_leave);
   });
 
   it('the same refusal reads differently when you are the one leaving', async () => {

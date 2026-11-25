@@ -193,6 +193,60 @@ This seventh database update lets an admin **copy the trip's invitation link as 
 5. Try it with a real admin account: **People -> Invite people -> Create invitation link**, **Done**, then press **Copy link** several times and paste each time: it is the same link. Open it in a private window to confirm it still works. **Revoke link**: Copy link disappears and the old link says it is not valid. The Vault secret is deleted too (you can confirm in the dashboard under Integrations -> Vault: no `trip-invite-...` secret remains for a revoked link).
 6. Rate limiting is still required before real users (ADR-054).
 
+## Step 15 - Expenses (M5): migrations 20261123200000, 20261124000000 and 20261124100000
+
+Run the three files in this order in the SQL Editor (each is safe to run again; **leave the files exactly as they are**). The first two are already applied on your project; **20261124100000_expense_row_guard_updates.sql is the new one**: it makes the payer and share guards also refuse an amount-only UPDATE of a row whose member has left.
+
+1. `npm run verify:supabase` must say `PASSED` with **0 failures and 0 warnings**. It checks the expense tables and functions from the outside. It cannot check triggers (the API never exposes trigger functions), so use the read-only SQL below for those.
+2. Read-only trigger check (changes nothing; paste, Run). Expect **8 rows**; after migration #10 the definitions of `expense_payers_member_guard` and `expense_splits_member_guard` must say `BEFORE INSERT OR UPDATE ON` with no `OF` after `UPDATE`:
+
+   ```sql
+   select tgname, pg_get_triggerdef(oid) as definition
+     from pg_trigger
+    where not tgisinternal
+      and tgname in ('trip_members_balance_guard', 'trips_dates_guard', 'trips_currency_guard', 'expenses_zz_equal_check',
+                     'expense_splits_zz_equal_check', 'expense_payers_member_guard', 'expense_splits_member_guard', 'expenses_category_owner')
+    order by tgname;
+   ```
+
+3. Read-only privilege check (expect `false, false, false` for the first three and `true` for the last):
+
+   ```sql
+   select has_function_privilege('anon', 'public.trips_currency_guard()', 'EXECUTE')              as anon_runs_guard,
+          has_function_privilege('authenticated', 'public.expense_rows_member_guard()', 'EXECUTE') as signed_in_runs_guard,
+          has_table_privilege('authenticated', 'public.expenses', 'INSERT')                         as signed_in_inserts_directly,
+          has_function_privilege('authenticated', 'public.create_expense(uuid, uuid, text, bigint, date, text, text, text, uuid[], jsonb)', 'EXECUTE') as signed_in_runs_create;
+   ```
+
+## Step 16 - Exact, percentage and shares splits (M5 Checkpoint 5): migration 20261125000000
+
+Run `supabase/migrations/20261125000000_expense_split_methods.sql` in the SQL Editor (safe to run again; leave the file as it is). It replaces the two expense write functions with versions that accept a method and typed values; **the old way of calling them keeps working**.
+
+1. Run `npm run verify:supabase`: expect `PASSED` with **0 failures and 0 warnings** (it now also checks the new internal functions are closed to the public).
+2. Read-only checks (change nothing). There must be exactly ONE `create_expense` and ONE `update_expense`, and the table must accept the four methods:
+
+   ```sql
+   select proname, pg_get_function_arguments(oid) as arguments
+     from pg_proc where proname in ('create_expense', 'update_expense') and pronamespace = 'public'::regnamespace order by 1;
+
+   select conname, pg_get_constraintdef(oid) from pg_constraint
+    where conrelid = 'public.expenses'::regclass and conname like 'expenses_split_method%';
+
+   select tgname from pg_trigger where not tgisinternal and tgname in ('expenses_zz_split_inputs_check', 'expense_splits_zz_split_inputs_check') order by 1;
+   ```
+
+   Expect each function once (ending in `p_split_inputs jsonb DEFAULT NULL::jsonb`), the constraint `expenses_split_method_values` (and no `expenses_split_method_equal_only`), and both triggers.
+3. Privilege check (expect `false, false, false, true`):
+
+   ```sql
+   select has_function_privilege('anon', 'public.allocate_weighted(bigint, uuid[], bigint[])', 'EXECUTE')                     as anon_runs_allocator,
+          has_function_privilege('authenticated', 'public.expense_derive_shares(text, bigint, uuid[], bigint[])', 'EXECUTE')  as signed_in_runs_derive,
+          has_function_privilege('anon', 'public.create_expense(uuid, uuid, text, bigint, date, text, text, text, uuid[], jsonb, jsonb)', 'EXECUTE') as anon_runs_create,
+          has_function_privilege('authenticated', 'public.create_expense(uuid, uuid, text, bigint, date, text, text, text, uuid[], jsonb, jsonb)', 'EXECUTE') as signed_in_runs_create;
+   ```
+
+4. Try it in the app: add an expense with Percentages (for example 50, 30, 20), open it (it shows the percentages and the stored amounts), edit it to Shares, and open History to see both changes.
+
 ## Troubleshooting
 
 | You see | Meaning and fix |

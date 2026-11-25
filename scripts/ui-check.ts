@@ -25,6 +25,8 @@ import { mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { chromium, type BrowserContext, type Page, type Request, type Route } from 'playwright-core';
 import { askedLabel, createdLabel } from '../packages/core/src/invite';
+import { computeBalances } from '../packages/core/src/balances';
+import { previewSplit } from '../packages/core/src/expense';
 import { formatDateRange } from '../packages/core/src/trip';
 
 const PORT = 8099;
@@ -126,6 +128,20 @@ interface FakeBackend {
   inviteFail: null | string;
   /** Delay, in ms, before the invitation functions answer (to test double taps). */
   slowInviteMs: number;
+  /** The expenses that exist (the fake keeps payers and the derived shares inside each). */
+  expenses: Record<string, any>[];
+  /** Force the expense functions: 'network' drops the connection; 'lost_reply' APPLIES the change and then drops the connection; any other text is the database message. */
+  expenseFail: null | string;
+  /** Delay, in ms, before the expense functions answer (to test double taps and the busy state). */
+  slowExpenseMs: number;
+  /** Balance rows to serve instead of the computed ones, per trip (to show how the page answers data the database would never send). */
+  balanceRows: Record<string, Record<string, unknown>[]> | null;
+  /** The history of expenses: one row per change (the fake keeps what the database keeps: member ids and amounts, never names). */
+  revisions: Record<string, any>[];
+  /** Make the expense list reads drop the connection. */
+  failExpenseReads: boolean;
+  /** Delay, in ms, before the expense list reads answer (to see the loading state). */
+  slowExpenseReadsMs: number;
 }
 
 const USER = { id: '11111111-2222-3333-4444-555555555555', email: 'asha@example.com', aud: 'authenticated', role: 'authenticated' };
@@ -169,6 +185,13 @@ function newBackend(): FakeBackend {
     joinRequests: [],
     inviteFail: null,
     slowInviteMs: 0,
+    expenses: [],
+    revisions: [],
+    balanceRows: null,
+    expenseFail: null,
+    slowExpenseMs: 0,
+    failExpenseReads: false,
+    slowExpenseReadsMs: 0,
   };
 }
 
@@ -604,6 +627,149 @@ async function installFakeSupabase(context: BrowserContext, backend: FakeBackend
       touch();
       return send();
     }
+    // ---- expenses: the fake enforces the SAME rules as the real database functions (who may, archived, active people, dates, versions,
+    //      idempotent create) and derives the equal split itself. Reads are visible to ACTIVE members only, like row-level security.
+    const SYSTEM_CATEGORIES = [['transportation', 'Transportation', 'bus', 10], ['accommodation', 'Accommodation', 'bed', 20], ['food', 'Food', 'utensils', 30], ['shopping', 'Shopping', 'shopping-bag', 40], ['activities', 'Activities', 'ticket', 50], ['fuel_tolls', 'Fuel and tolls', 'fuel', 60], ['other', 'Other', 'dots', 70]] as const;
+    const categoryRows = SYSTEM_CATEGORIES.map(([key, name, icon, sort_order], i) => ({ id: uuid(9700 + i), key, name, icon, sort_order }));
+    const expenseTable = ['expenses', 'expense_payers', 'expense_splits', 'categories', 'expense_revisions'].find((t) => url.pathname === `/rest/v1/${t}`);
+    if (expenseTable && method === 'GET') {
+      if (backend.failExpenseReads) return route.abort('connectionfailed');
+      if (backend.slowExpenseReadsMs > 0) await new Promise((r) => setTimeout(r, backend.slowExpenseReadsMs));
+      if (expenseTable === 'categories') return json(200, categoryRows);
+      const wanted = (url.searchParams.get('trip_id') ?? '').replace(/^eq\./, '');
+      const t = backend.trips.find((x) => x.id === wanted && !x._hidden);
+      const me = ((t?._members ?? []) as Record<string, any>[]).find((m) => m.user_id === USER.id && m.status === 'active');
+      if (!t || !me) return json(200, []); // row-level security: not an active member, so nothing at all
+      if (expenseTable === 'expense_revisions') {
+        const wantedExpense = (url.searchParams.get('expense_id') ?? '').replace(/^eq\./, '');
+        return json(200, backend.revisions.filter((r) => r.trip_id === wanted && r.expense_id === wantedExpense).sort((a, b) => a.version - b.version).map((r) => ({ version: r.version, action: r.action, snapshot: r.snapshot, changed_by: r.changed_by, changed_at: r.changed_at })));
+      }
+      const rows = backend.expenses.filter((e) => e.tripId === wanted);
+      if (expenseTable === 'expenses') {
+        return json(200, [...rows].sort((a, b) => (a.spent_on < b.spent_on ? 1 : a.spent_on > b.spent_on ? -1 : b.created_at.localeCompare(a.created_at))).map((e) => Object.fromEntries(Object.entries(e).filter(([k]) => !['payers', 'splits', 'tripId'].includes(k)))));
+      }
+      if (expenseTable === 'expense_payers') return json(200, rows.flatMap((e) => e.payers.map((p: any) => ({ expense_id: e.id, trip_member_id: p.member_id, paid_minor: p.paid_minor }))));
+      return json(200, rows.flatMap((e) => e.splits.map((p: any) => ({ expense_id: e.id, trip_member_id: p.member_id, share_minor: p.share_minor, input_value: p.input_value ?? null }))));
+    }
+    const EXPENSE_FNS = ['create_expense', 'update_expense', 'delete_expense', 'restore_expense', 'trip_member_balances'];
+    const expenseFn = url.pathname.replace('/rest/v1/rpc/', '');
+    if (url.pathname.startsWith('/rest/v1/rpc/') && EXPENSE_FNS.includes(expenseFn) && method === 'POST') {
+      const failWith = (message: string, details: string | null = null) => json(400, { code: 'P0001', message, details, hint: null });
+      const authHeader = request.headers()['authorization'] ?? '';
+      if (authHeader === '' || authHeader === `Bearer ${DUMMY_PUBLISHABLE_KEY}`) return json(401, { code: '42501', message: `permission denied for function ${expenseFn}` });
+      if (backend.slowExpenseMs > 0) await new Promise((r) => setTimeout(r, backend.slowExpenseMs));
+      if (backend.expenseFail === 'network') return route.abort('connectionfailed');
+      if (backend.expenseFail && backend.expenseFail !== 'lost_reply') {
+        const [msg, detail] = backend.expenseFail.split('|');
+        return failWith(msg!, detail ?? null);
+      }
+      const lost = backend.expenseFail === 'lost_reply';
+      const reply = (data: unknown) => (lost ? route.abort('connectionfailed') : json(200, data));
+
+      const t = backend.trips.find((x) => x.id === body.p_trip_id && !x._hidden);
+      const ms = ((t?._members ?? []) as Record<string, any>[]);
+      const me = ms.find((m) => m.user_id === USER.id && m.status === 'active');
+      if (!t || !me) return failWith('trip_not_found');
+
+      if (expenseFn === 'trip_member_balances') {
+        if (backend.balanceRows?.[t.id]) return json(200, backend.balanceRows[t.id]);
+        const live = backend.expenses.filter((e) => e.tripId === t.id && !e.deleted_at);
+        const ledger = live.map((e) => ({ id: e.id, payers: e.payers.map((p: any) => ({ memberId: p.member_id, paidMinor: p.paid_minor })), splits: e.splits.map((p: any) => ({ memberId: p.member_id, shareMinor: p.share_minor })) }));
+        const result = computeBalances(ms.map((m) => m.id), ledger, []);
+        return json(200, ms.map((m) => { const b = result.find((r) => r.memberId === m.id)!; return { member_id: m.id, paid_minor: b.paidMinor, share_minor: b.shareMinor, net_minor: b.netConfirmedMinor }; }));
+      }
+      if (t.status === 'archived') return failWith('trip_archived');
+
+      // shared checks for create and update
+      const checkInput = () => {
+        const title = String(body.p_title ?? '').trim();
+        if (title === '' || title.length > 120 || !Number.isInteger(body.p_amount_minor) || body.p_amount_minor < 1 || !['equal', 'exact', 'percentage', 'shares'].includes(body.p_split_method)) return 'invalid_expense';
+        const parts: string[] = body.p_participants ?? [];
+        const payers: { member_id: string; paid_minor: number }[] = body.p_payers ?? [];
+        if (parts.length === 0 || new Set(parts).size !== parts.length || payers.length === 0) return 'invalid_expense';
+        if (payers.reduce((a, p) => a + p.paid_minor, 0) !== body.p_amount_minor) return 'payers_total_mismatch';
+        if (body.p_spent_on < t.start_date || body.p_spent_on > t.end_date) return 'outside_trip_dates';
+        const active = new Set(ms.filter((m) => m.status === 'active').map((m) => m.id));
+        if (!parts.every((id) => active.has(id))) return 'participant_not_active';
+        if (!payers.every((p) => active.has(p.member_id))) return 'payer_not_active';
+        if (body.p_category_key !== null && !categoryRows.some((c) => c.key === body.p_category_key)) return 'category_not_found';
+        const typed: { member_id: string; value: number }[] | null = body.p_split_inputs ?? null;
+        if (body.p_split_method === 'equal') {
+          if (typed !== null) return 'invalid_expense';
+        } else {
+          if (!Array.isArray(typed) || typed.length !== parts.length || !typed.every((i) => parts.includes(i.member_id) && Number.isInteger(i.value)) || new Set(typed.map((i) => i.member_id)).size !== typed.length) return 'invalid_expense';
+          const vals = typed.map((i) => i.value);
+          const sum = vals.reduce((a: number, v: number) => a + v, 0);
+          if (body.p_split_method === 'exact') { if (vals.some((v: number) => v < 0)) return 'invalid_split_value'; if (sum !== body.p_amount_minor) return 'split_total_mismatch'; }
+          if (body.p_split_method === 'percentage') { if (vals.some((v: number) => v < 1 || v > 10000)) return 'invalid_split_value'; if (sum !== 10000) return 'split_total_mismatch'; }
+          if (body.p_split_method === 'shares' && vals.some((v: number) => v < 1 || v > 1000000)) return 'invalid_split_value';
+        }
+        return null;
+      };
+      const build = () => ({
+        title: String(body.p_title).trim(), amount_minor: body.p_amount_minor, spent_on: body.p_spent_on,
+        category_id: body.p_category_key === null ? null : categoryRows.find((c) => c.key === body.p_category_key)!.id,
+        notes: body.p_notes === null || String(body.p_notes).trim() === '' ? null : String(body.p_notes).trim(),
+        payers: [...body.p_payers].map((p: any) => ({ member_id: p.member_id, paid_minor: p.paid_minor })).sort((a: any, b: any) => (a.member_id < b.member_id ? -1 : 1)),
+        split_method: body.p_split_method,
+        splits: previewSplit(body.p_amount_minor, body.p_split_method, body.p_participants, (body.p_split_inputs ?? null)?.map((i: any) => ({ memberId: i.member_id, value: i.value })) ?? null).map((r) => ({ member_id: r.memberId, share_minor: r.shareMinor, input_value: (body.p_split_inputs ?? null)?.find((i: any) => i.member_id === r.memberId)?.value ?? null })),
+      });
+      const canon = (e: Record<string, any>) => JSON.stringify([e.title, e.amount_minor, e.spent_on, e.category_id, e.notes, e.split_method, e.payers, e.splits]);
+      const catKey = (id: string | null) => categoryRows.find((c) => c.id === id)?.key ?? null;
+      /** What the database records after every change: the expense as it is now, as member ids and amounts only. */
+      const record = (e: Record<string, any>, action: string) => backend.revisions.push({
+        trip_id: e.tripId, expense_id: e.id, version: e.version, action, changed_by: me.id, changed_at: new Date().toISOString(),
+        snapshot: { title: e.title, amount_minor: e.amount_minor, spent_on: e.spent_on, category_key: catKey(e.category_id), notes: e.notes, split_method: e.split_method, payers: e.payers, splits: e.splits.map((s: any) => (s.input_value === null || s.input_value === undefined ? { member_id: s.member_id, share_minor: s.share_minor } : { member_id: s.member_id, share_minor: s.share_minor, input_value: s.input_value })), deleted: !!e.deleted_at },
+      });
+      const touch = (e: Record<string, any>) => { e.version += 1; e.updated_at = new Date().toISOString(); e.updated_by = me.id; };
+
+      if (expenseFn === 'create_expense') {
+        const bad = checkInput();
+        const existing = backend.expenses.find((e) => e.id === body.p_expense_id);
+        if (existing) {
+          if (!bad && existing.tripId === t.id && existing.created_by === me.id && !existing.deleted_at && canon(existing) === canon(build())) return reply([{ expense_id: existing.id, version: existing.version, created: false }]);
+          return failWith('expense_id_taken');
+        }
+        if (bad) return failWith(bad);
+        const now = new Date().toISOString();
+        const made = { id: body.p_expense_id, tripId: t.id, created_by: me.id, updated_by: null, created_at: now, updated_at: now, version: 1, deleted_at: null, deleted_by: null, ...build() };
+        backend.expenses.push(made);
+        record(made, 'create');
+        return reply([{ expense_id: made.id, version: 1, created: true }]);
+      }
+
+      const e = backend.expenses.find((x) => x.id === body.p_expense_id && x.tripId === t.id);
+      if (!e) return failWith('expense_not_found');
+      if (!(me.role === 'admin' || e.created_by === me.id)) return failWith('not_allowed');
+      if (body.p_expected_version !== e.version) return failWith('version_conflict');
+      if (expenseFn === 'update_expense') {
+        if (e.deleted_at) return failWith('expense_deleted');
+        const bad = checkInput();
+        if (bad) return failWith(bad);
+        const next = build();
+        if (canon(e) === canon({ ...e, ...next })) return reply([{ expense_id: e.id, version: e.version, changed: false }]);
+        Object.assign(e, next);
+        touch(e);
+        record(e, 'update');
+        return reply([{ expense_id: e.id, version: e.version, changed: true }]);
+      }
+      if (expenseFn === 'delete_expense') {
+        if (e.deleted_at) return reply([{ expense_id: e.id, version: e.version, changed: false }]);
+        e.deleted_at = new Date().toISOString();
+        e.deleted_by = me.id;
+        touch(e);
+        record(e, 'delete');
+        return reply([{ expense_id: e.id, version: e.version, changed: true }]);
+      }
+      // restore_expense
+      if (!e.deleted_at) return reply([{ expense_id: e.id, version: e.version, changed: false }]);
+      if (e.spent_on < t.start_date || e.spent_on > t.end_date) return failWith('outside_trip_dates');
+      e.deleted_at = null;
+      e.deleted_by = null;
+      touch(e);
+      record(e, 'restore');
+      return reply([{ expense_id: e.id, version: e.version, changed: true }]);
+    }
     backend.unexpected.push(`${method} ${url.pathname}`);
     return route.abort('blockedbyclient');
   });
@@ -919,9 +1085,12 @@ async function tripFlows(browser: Awaited<ReturnType<typeof chromium.launch>>) {
     const orderErr = await vis(page, 'The end date must be on or after the start date').waitFor({ timeout: 5000 }).then(() => true, () => false);
     check('an end date before the start date is rejected', orderErr);
     check('a nonsense budget is rejected', await vis(page, 'Enter a budget like 60000').isVisible());
+    const startKept = await byId(page, 'trip-start').inputValue();
     await byId(page, 'trip-start').fill('30/02/2026');
+    check('an impossible date (30 February) cannot be typed or pasted: the box keeps the date it had', (await byId(page, 'trip-start').inputValue()) === startKept, await byId(page, 'trip-start').inputValue());
+    await byId(page, 'trip-start').fill('');
     await byId(page, 'create-trip-submit').click();
-    check('an impossible date (30 February) is rejected', await vis(page, 'Enter the start date like 27/12/2026').waitFor({ timeout: 5000 }).then(() => true, () => false));
+    check('an empty start date is rejected', await vis(page, 'Enter the start date like 27/12/2026').waitFor({ timeout: 5000 }).then(() => true, () => false));
     check('nothing was sent while the form was invalid', rpcCalls().length === 0);
     check('the person\'s typing is kept after errors', (await byId(page, 'trip-name').inputValue()) === 'Goa Trip 2026');
 
@@ -1768,7 +1937,7 @@ async function dateFlows(browser: Awaited<ReturnType<typeof chromium.launch>>) {
       check(`${P} pasting text with letters keeps only the digits`, (await val(S)) === '27/12/2026', await val(S));
       check(`${P} after a paste the caret is at the end`, (await caret(S)).join() === '10,10', (await caret(S)).join());
       await paste(S, '!!!');
-      check(`${P} pasting only symbols leaves the box empty`, (await val(S)) === '', await val(S));
+      check(`${P} pasting only symbols changes nothing (the date stays)`, (await val(S)) === '27/12/2026', await val(S));
 
       // ---------- backspace and the caret ----------
       await typeKeys(S, '27122026');
@@ -1788,7 +1957,7 @@ async function dateFlows(browser: Awaited<ReturnType<typeof chromium.launch>>) {
       await typeKeys(S, '27122026');
       await setCaret(S, 2);
       await page.keyboard.type('5');
-      check(`${P} typing a digit in the middle shifts the rest and keeps the caret just after it`, (await val(S)) === '27/51/2202' && (await caret(S)).join() === '4,4', `${await val(S)} caret ${(await caret(S)).join()}`);
+      check(`${P} typing a digit in the middle that would make an impossible date is refused`, (await val(S)) === '27/12/2026', `${await val(S)} caret ${(await caret(S)).join()}`); // a 5 there would make month 51: refused
       await typeKeys(S, '27122026');
       await setCaret(S, 10);
       for (let i = 0; i < 4; i++) await page.keyboard.press('Backspace');
@@ -1803,7 +1972,10 @@ async function dateFlows(browser: Awaited<ReturnType<typeof chromium.launch>>) {
         const shown = await val(S);
         await byId(page, submit).click();
         const rejected = await startErr().waitFor({ timeout: 4000 }).then(() => true, () => false);
-        check(`${P} ${shown} is not accepted (it is shown as typed, never "corrected")`, rejected && shown === `${bad.slice(0, 2)}/${bad.slice(2, 4)}/${bad.slice(4)}`, shown);
+        const wanted = `${bad.slice(0, 2)}/${bad.slice(2, 4)}/${bad.slice(4)}`;
+        // The impossible date cannot be completed while typing (the key that would make it impossible is refused), so what is left is a
+        // shorter, unfinished date: it is never "corrected" into another date, and it cannot be saved.
+        check(`${P} ${wanted} cannot be typed in full (the box stops at "${shown}") and what is left is not accepted`, rejected && shown !== wanted && shown.length < 10, shown);
       }
       check(`${P} none of the invalid dates reached the server`, rpcCalls().length === before);
       await typeKeys(S, '2712');
@@ -2162,6 +2334,14 @@ async function memberFlows(browser: Awaited<ReturnType<typeof chromium.launch>>)
     await manage(ID.ravi);
     await byId(page, `member-remove-${ID.ravi}`).click();
     check('Remove explains that history is kept and that they will be listed as a former member', (await text('confirm-title')) === 'Remove Ravi Kumar from this trip?' && /Former members/.test(await text('confirm-message')) && /stays in the trip's history/.test(await text('confirm-message')));
+    // ADR-047: the database refuses to remove someone with an outstanding balance. The page must say so plainly (never "Something went wrong").
+    backend.memberFail = 'balance_not_settled';
+    await byId(page, 'confirm-confirm').click();
+    check('a person with an outstanding balance: the refusal is explained and is not the generic failure', await settle(async () => /still has a balance in the trip's expenses/.test(await page.locator('body').innerText())) && !/Something went wrong/.test(await page.locator('body').innerText()));
+    check('...and they are still on the trip', (await text('trip-people')).includes('Ravi Kumar'));
+    backend.memberFail = null;
+    await manage(ID.ravi);
+    await byId(page, `member-remove-${ID.ravi}`).click();
     const removesBefore = calls('remove_member').length;
     await byId(page, 'confirm-confirm').click();
     check('confirming sends exactly the trip and the person', await settle(() => calls('remove_member').length === removesBefore + 1) && JSON.stringify(calls('remove_member').at(-1)!.body) === JSON.stringify({ p_trip_id: T.A, p_member_id: ID.ravi }));
@@ -2836,6 +3016,1263 @@ async function inviteFlows(browser: Awaited<ReturnType<typeof chromium.launch>>)
   }
 }
 
+async function expenseFlows(browser: Awaited<ReturnType<typeof chromium.launch>>) {
+  console.log('\nM. Expenses: list, details, add, edit, delete, restore, balances, permissions');
+  const site = await startWebsite({ EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY: DUMMY_PUBLISHABLE_KEY, EXPO_PUBLIC_SUPABASE_URL: SUPABASE_URL });
+  try {
+    const ID = { me: uuid(9001), ravi: uuid(9002), priya: uuid(9003), gita: uuid(9004), boss: uuid(9005), dev: uuid(9006), gopal: uuid(9007) } as const;
+    const T = { A: uuid(601), MEM: uuid(602), ARCH: uuid(603), EMPTY: uuid(604), NEW: uuid(605), HIDDEN: uuid(606), PHONE: uuid(607) };
+    const RAVI = '22222222-2222-4222-8222-222222222222';
+    const PRIYA = '33333333-3333-4333-8333-333333333333';
+    const BOSS = '88888888-8888-4888-8888-888888888888';
+    const DEV = '55555555-5555-4555-8555-555555555555';
+    const mine = (id: string, role = 'admin') => memberRow({ id, user_id: USER.id, display_name: 'Asha Rao', role, joined_at: '2026-11-18T09:00:00+00:00' });
+    const ravi = () => memberRow({ id: ID.ravi, user_id: RAVI, display_name: 'Ravi Kumar', joined_at: '2026-11-18T10:00:00+00:00' });
+    const priya = () => memberRow({ id: ID.priya, user_id: PRIYA, display_name: 'Priya Shah', role: 'admin', joined_at: '2026-11-18T10:30:00+00:00' });
+    const gita = () => memberRow({ id: ID.gita, user_id: null, display_name: 'Gita', joined_at: '2026-11-18T11:00:00+00:00' });
+    const boss = () => memberRow({ id: ID.boss, user_id: BOSS, display_name: 'Boss Bhavna', role: 'admin', joined_at: '2026-11-18T08:00:00+00:00' });
+    const gopal = () => memberRow({ id: ID.gopal, user_id: null, display_name: 'Gopal', joined_at: '2026-11-18T11:30:00+00:00' });
+    const dev = () => memberRow({ id: ID.dev, user_id: DEV, display_name: 'Departed Dev', role: 'admin', status: 'left', left_at: '2026-11-15T10:00:00+00:00' });
+    const start = dayFromToday(10);
+    const end = dayFromToday(13);
+    const dmy = (isoDay: string) => isoDay.split('-').reverse().join('/');
+    const trip = (id: string, name: string, members: Record<string, any>[], over: Record<string, any> = {}) =>
+      tripRow({ id, name, destination: 'Place', start_date: start, end_date: end, members: members.filter((m) => m.status === 'active').map((m) => ({ id: m.id, status: m.status })), _members: members, ...over });
+    const CAT = { transportation: uuid(9700), accommodation: uuid(9701), food: uuid(9702) };
+    const exp = (id: string, tripId: string, o: { title: string; amount: number; day: string; cat: string | null; by: string; paid: Record<string, number>; shared: string[]; createdAt: string; deleted?: boolean; notes?: string | null }) => ({
+      id, tripId, title: o.title, amount_minor: o.amount, category_id: o.cat, spent_on: o.day, notes: o.notes ?? null, split_method: 'equal', created_by: o.by, updated_by: null,
+      created_at: o.createdAt, updated_at: o.createdAt, version: 1, deleted_at: o.deleted ? '2026-11-20T10:00:00Z' : null, deleted_by: o.deleted ? o.by : null,
+      payers: Object.entries(o.paid).map(([member_id, paid_minor]) => ({ member_id, paid_minor })).sort((a, b) => (a.member_id < b.member_id ? -1 : 1)),
+      splits: previewSplit(o.amount, 'equal', o.shared).map((r) => ({ member_id: r.memberId, share_minor: r.shareMinor, input_value: null })),
+    });
+    const E = { beach: uuid(7001), taxi: uuid(7002), hotel: uuid(7003), breakfast: uuid(7004), mySnack: uuid(7005), bossDinner: uuid(7006), archived: uuid(7007) };
+    const seed = (b: FakeBackend) => {
+      b.trips = [
+        trip(T.A, 'Expense Trip', [mine(ID.me), ravi(), priya(), gita(), dev()]),
+        trip(T.MEM, 'Member Expense Trip', [mine(ID.me, 'member'), boss(), gopal()]),
+        trip(T.ARCH, 'Archived Expense Trip', [mine(ID.me), ravi()], { status: 'archived' }),
+        trip(T.EMPTY, 'Empty Expense Trip', [mine(ID.me), ravi()]),
+        trip(T.NEW, 'New Expense Trip', [mine(ID.me), ravi(), gita(), dev()]),
+        trip(T.HIDDEN, 'Not Mine', [boss()], { _hidden: true }),
+        trip(T.PHONE, 'Phone Expense Trip', [mine(ID.me), ravi(), memberRow({ id: uuid(9010), user_id: null, display_name: 'A Friend With An Extremely Long Name That Must Wrap Neatly On A Phone Screen' })]),
+      ];
+      b.expenses = [
+        exp(E.beach, T.A, { title: 'Beach dinner', amount: 120000, day: addDays(start, 1), cat: CAT.food, by: ID.me, paid: { [ID.me]: 120000 }, shared: [ID.me, ID.ravi, ID.priya, ID.gita], createdAt: '2026-11-19T10:00:00Z', notes: 'Seafood place by the water' }),
+        exp(E.taxi, T.A, { title: 'Taxi to airport', amount: 90000, day: start, cat: CAT.transportation, by: ID.ravi, paid: { [ID.ravi]: 90000 }, shared: [ID.me, ID.ravi, ID.priya], createdAt: '2026-11-19T09:00:00Z' }),
+        exp(E.hotel, T.A, { title: 'Old hotel advance', amount: 500000, day: start, cat: CAT.accommodation, by: ID.me, paid: { [ID.me]: 500000 }, shared: [ID.me, ID.ravi], createdAt: '2026-11-19T08:00:00Z', deleted: true }),
+        exp(E.breakfast, T.A, { title: 'Breakfast', amount: 60000, day: start, cat: CAT.food, by: ID.me, paid: { [ID.dev]: 60000 }, shared: [ID.dev], createdAt: '2026-11-19T11:00:00Z' }),
+        exp(E.mySnack, T.MEM, { title: 'My snack', amount: 15000, day: start, cat: null, by: ID.me, paid: { [ID.me]: 15000 }, shared: [ID.me, ID.boss], createdAt: '2026-11-19T10:00:00Z' }),
+        exp(E.bossDinner, T.MEM, { title: 'Boss dinner', amount: 80000, day: start, cat: CAT.food, by: ID.boss, paid: { [ID.boss]: 80000 }, shared: [ID.me, ID.boss, ID.gopal], createdAt: '2026-11-19T11:00:00Z' }),
+        exp(E.archived, T.ARCH, { title: 'Closed trip lunch', amount: 40000, day: start, cat: CAT.food, by: ID.me, paid: { [ID.me]: 40000 }, shared: [ID.me, ID.ravi], createdAt: '2026-11-19T10:00:00Z' }),
+      ];
+    };
+
+    const context = await browser.newContext({ permissions: ['clipboard-read', 'clipboard-write'] });
+    const backend = newBackend();
+    seed(backend);
+    await installFakeSupabase(context, backend);
+    await sessionInStorage(context);
+    const page = await context.newPage();
+    const logs: string[] = [];
+    page.on('console', (m) => logs.push(m.text()));
+    page.on('pageerror', (e) => logs.push(String(e)));
+    const textOf = async (id: string) => (await byId(page, id).innerText().catch(() => '')).replace(/\s+/g, ' ').trim();
+    const has = async (id: string) => (await byId(page, id).count()) > 0;
+    const settle = (fn: () => Promise<boolean> | boolean) => waitFor(fn, 8000);
+    const calls = (fn: string) => backend.requests.filter((r) => r.method === 'POST' && r.path === `/rest/v1/rpc/${fn}`);
+    const go = async (p: string, wait: string) => {
+      await page.goto(`${BASE}${p}`);
+      return byId(page, wait).waitFor({ timeout: 20000 }).then(() => true, () => false);
+    };
+    const rowIds = () => page.locator('[data-testid^="expense-row-"]:visible').evaluateAll((els) => els.map((e) => (e.getAttribute('data-testid') ?? '').replace('expense-row-', '')));
+    const disabled = async (id: string) => (await byId(page, id).getAttribute('aria-disabled')) === 'true';
+    const checked = async (id: string) => (await byId(page, id).getAttribute('aria-checked')) === 'true';
+    const tripExpense = (id: string) => backend.expenses.find((e) => e.id === id)!;
+    const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+    const eList = `/trips/${T.A}/expenses`;
+
+    // ------------------------------------------------------------------ the trip page
+    check('the trip page has an Expenses section with a one-line summary of the live expenses', (await go(`/trips/${T.A}`, 'expenses-summary')) && (await textOf('expenses-summary')) === '3 expenses · ₹2,700 in total', await textOf('expenses-summary'));
+    check('it says how many are deleted, and offers Add expense and the list', (await textOf('expenses-deleted-summary')) === '1 deleted' && (await has('expense-add')) && (await has('expenses-open')));
+    await shot(page, 'expenses-trip-card-light');
+    check('a trip with no expenses says so plainly', (await go(`/trips/${T.EMPTY}`, 'expenses-summary')) && (await textOf('expenses-summary')) === 'No expenses yet.');
+    check('an archived trip offers no Add expense and says why', (await go(`/trips/${T.ARCH}`, 'expense-add-note')) && !(await has('expense-add')) && /archived/.test(await textOf('expense-add-note')));
+    backend.slowExpenseReadsMs = 1200;
+    await page.goto(`${BASE}/trips/${T.A}`);
+    check('while the expenses load the section shows a loading line', await byId(page, 'expenses-card-loading').waitFor({ timeout: 8000 }).then(() => true, () => false));
+    backend.slowExpenseReadsMs = 0;
+    await settle(async () => has('expenses-summary'));
+    backend.failExpenseReads = true;
+    await page.goto(`${BASE}/trips/${T.A}`);
+    check('when the expenses cannot be read the section explains and offers Try again, and the rest of the trip page still works', (await byId(page, 'expenses-card-error').waitFor({ timeout: 60000 }).then(() => true, () => false)) && /Can't reach the server/.test(await textOf('expenses-card-error')) && (await has('trip-title')) && (await has('trip-people')));
+    backend.failExpenseReads = false;
+    await byId(page, 'expenses-card-retry').click();
+    check('Try again then loads them', await settle(async () => (await has('expenses-summary')) && !(await has('expenses-card-error'))));
+
+    // ------------------------------------------------------------------ the list
+    await page.goto(`${BASE}${eList}`);
+    await byId(page, 'expenses-list').waitFor({ timeout: 20000 });
+    check('the list shows the live expenses, newest day first (same day: newest first)', JSON.stringify(await rowIds()) === JSON.stringify([E.beach, E.breakfast, E.taxi]), JSON.stringify(await rowIds()));
+    check('each row shows the title, the amount, the category and day, and who paid', (await textOf(`expense-title-${E.beach}`)) === 'Beach dinner' && (await textOf(`expense-amount-${E.beach}`)) === '₹1,200' && (await textOf(`expense-meta-${E.beach}`)) === `Food · ${formatDateRange(addDays(start, 1), addDays(start, 1))}` && (await textOf(`expense-paidby-${E.beach}`)) === 'Paid by Asha Rao', await textOf(`expense-meta-${E.beach}`));
+    check('someone who left is named with "(left)" where they paid', (await textOf(`expense-paidby-${E.breakfast}`)) === 'Paid by Departed Dev (left)');
+    check('the count and total are shown, and the deleted expense is NOT in the main list', (await textOf('expenses-count')) === '3 expenses · ₹2,700 in total' && !(await rowIds()).includes(E.hotel));
+    check('Deleted (1) starts collapsed; opening it shows the deleted expense, struck through and marked', (await textOf('expenses-deleted-toggle')).includes('▸ Deleted (1)') && !(await has('expenses-deleted-list')));
+    await byId(page, 'expenses-deleted-toggle').click();
+    check('the deleted expense appears with its Deleted mark', (await has(`expense-deleted-${E.hotel}`)) && (await textOf(`expense-title-${E.hotel}`)) === 'Old hotel advance');
+    await shot(page, 'expenses-list-light');
+
+    // balances
+    await byId(page, 'expenses-tab-balances').click();
+    await byId(page, 'balances-list').waitFor({ timeout: 8000 });
+    check('Balances says who is owed and who owes, from the database\'s figures', (await textOf(`balance-text-${ID.me}`)) === 'Asha Rao is owed ₹600' && (await textOf(`balance-text-${ID.ravi}`)) === 'Ravi Kumar is owed ₹300' && (await textOf(`balance-text-${ID.priya}`)) === 'Priya Shah owes ₹600' && (await textOf(`balance-text-${ID.gita}`)) === 'Gita owes ₹300', await textOf(`balance-text-${ID.priya}`));
+    check('a person who left and is at zero is shown as settled, marked "(left)"', (await textOf(`balance-text-${ID.dev}`)) === 'Departed Dev (left) is settled');
+    check('each line also says what the person paid and their share', (await textOf(`balance-detail-${ID.me}`)) === 'Paid ₹1,200 · share ₹600');
+    check('it says plainly that repaying is not part of the app yet, and nobody is told they are settled while someone owes', (await has('balances-later')) && !(await has('balances-settled')));
+    await shot(page, 'expenses-balances-light');
+    const balanceCalls = calls('trip_member_balances');
+    check('asking for balances sends only the trip', balanceCalls.length >= 1 && balanceCalls.every((c) => JSON.stringify(c.body) === JSON.stringify({ p_trip_id: T.A })));
+    await byId(page, 'expenses-tab-list').click();
+    await byId(page, 'expenses-list').waitFor({ timeout: 8000 });
+
+    // empty list
+    await page.goto(`${BASE}/trips/${T.EMPTY}/expenses`);
+    check('an empty trip shows a friendly empty state with Add expense', (await byId(page, 'expenses-empty').waitFor({ timeout: 15000 }).then(() => true, () => false)) && (await has('expenses-empty-title')) && (await has('expense-add')));
+    await byId(page, 'expenses-tab-balances').click();
+    check('its balances say nobody owes anything yet', (await byId(page, 'balances-settled').waitFor({ timeout: 8000 }).then(() => true, () => false)) && /Nobody owes anything yet/.test(await textOf('balances-settled')));
+
+    // loading, error and retry
+    backend.slowExpenseReadsMs = 1200;
+    await page.goto(`${BASE}${eList}`);
+    check('the list shows a loading line while it loads', await byId(page, 'expenses-loading').waitFor({ timeout: 8000 }).then(() => true, () => false));
+    backend.slowExpenseReadsMs = 0;
+    await settle(async () => has('expenses-list'));
+    backend.failExpenseReads = true;
+    await page.goto(`${BASE}${eList}`);
+    check('a read failure shows a clear message with Try again (no half list)', (await byId(page, 'expenses-error').waitFor({ timeout: 60000 }).then(() => true, () => false)) && !(await has('expenses-list')));
+    backend.failExpenseReads = false;
+    await byId(page, 'expenses-retry').click();
+    check('Try again recovers', await settle(async () => has('expenses-list')));
+    await byId(page, 'expenses-tab-balances').click();
+    backend.expenseFail = 'network';
+    await page.goto(`${BASE}${eList}`);
+    await byId(page, 'expenses-tab-balances').click();
+    check('a balances failure shows a message with Try again', (await byId(page, 'balances-error').waitFor({ timeout: 15000 }).then(() => true, () => false)) && /Can't reach the server/.test(await textOf('balances-error')));
+    backend.expenseFail = null;
+    await byId(page, 'balances-retry').click();
+    check('Try again then shows the balances', await byId(page, 'balances-list').waitFor({ timeout: 8000 }).then(() => true, () => false));
+
+    // ------------------------------------------------------------------ details
+    await page.goto(`${BASE}${eList}`);
+    await byId(page, 'expenses-list').waitFor({ timeout: 20000 });
+    await byId(page, `expense-row-${E.beach}`).click();
+    check('tapping a row opens the expense', await byId(page, 'expense-detail-title').waitFor({ timeout: 8000 }).then(() => true, () => false) && pathOf(page) === `${eList}/${E.beach}`);
+    check('the detail shows title, amount, day, category, notes and who added it', (await textOf('expense-detail-title')) === 'Beach dinner' && (await textOf('expense-detail-amount')) === '₹1,200' && (await textOf('expense-detail-date')) === formatDateRange(addDays(start, 1), addDays(start, 1)) && (await textOf('expense-detail-category')) === 'Food' && (await textOf('expense-detail-notes')) === 'Seafood place by the water' && (await textOf('expense-detail-added-by')) === 'Asha Rao');
+    check('it shows who paid and exactly how it was split (the shares the database stored)', (await textOf(`expense-payer-row-${ID.me}`)) === 'Asha Rao ₹1,200' && (await textOf('expense-detail-split-note')) === 'Split equally between 4 people.' && (await textOf(`expense-share-row-${ID.ravi}`)) === 'Ravi Kumar ₹300' && (await textOf(`expense-share-row-${ID.gita}`)) === 'Gita ₹300');
+    check('an administrator is offered Edit and Delete (not Restore)', (await has('expense-edit')) && (await has('expense-delete')) && !(await has('expense-restore')));
+    await shot(page, 'expense-detail-light');
+    await go(`${eList}/${E.breakfast}`, 'expense-detail-title');
+    check('an expense a former member paid names them with "(left)"', (await textOf(`expense-payer-row-${ID.dev}`)) === 'Departed Dev (left) ₹600' && (await textOf('expense-detail-category')) === 'Food');
+    check('an expense without notes shows no empty notes line', !(await has('expense-detail-notes')));
+    await go(`${eList}/${E.hotel}`, 'expense-detail-title');
+    check('a deleted expense says so, offers Restore (not Edit or Delete)', (await has('expense-deleted-banner')) && (await has('expense-restore')) && !(await has('expense-edit')) && !(await has('expense-delete')));
+    await go(`${eList}/${uuid(7999)}`, 'expense-not-found-title');
+    check('an unknown expense gets one plain "not found" page', /may have been removed/.test(await textOf('expense-not-found')));
+
+    // delete, restore, conflicts
+    await go(`${eList}/${E.taxi}`, 'expense-detail-title');
+    const delBefore = calls('delete_expense').length;
+    await byId(page, 'expense-delete').click();
+    check('Delete asks first and says nothing is lost', (await textOf('confirm-title')) === 'Delete this expense?' && /restore it later/.test(await textOf('confirm-message')));
+    await byId(page, 'confirm-cancel').click();
+    await settle(async () => !(await has('confirm-dialog')));
+    check('"Keep it" sends nothing', calls('delete_expense').length === delBefore);
+    await byId(page, 'expense-delete').click();
+    await byId(page, 'confirm-confirm').click();
+    check('confirming sends exactly the trip, the expense and the version it saw', (await settle(() => calls('delete_expense').length === delBefore + 1)) && JSON.stringify(calls('delete_expense').at(-1)!.body) === JSON.stringify({ p_trip_id: T.A, p_expense_id: E.taxi, p_expected_version: 1 }), JSON.stringify(calls('delete_expense').at(-1)?.body));
+    check('the page then shows it as deleted with a confirmation, and offers Restore', (await byId(page, 'expense-deleted-banner').waitFor({ timeout: 8000 }).then(() => true, () => false)) && (await has('expense-restore')) && !(await has('expense-delete')) && /deleted/.test(await textOf('expense-notice')));
+    const resBefore = calls('restore_expense').length;
+    await byId(page, 'expense-restore').click();
+    check('Restore sends the NEW version (2) and the expense comes back', (await settle(() => calls('restore_expense').length === resBefore + 1)) && JSON.stringify(calls('restore_expense').at(-1)!.body) === JSON.stringify({ p_trip_id: T.A, p_expense_id: E.taxi, p_expected_version: 2 }) && (await byId(page, 'expense-edit').waitFor({ timeout: 8000 }).then(() => true, () => false)) && !(await has('expense-deleted-banner')));
+
+    // stale version: somebody else changes it first
+    await go(`${eList}/${E.beach}`, 'expense-detail-title');
+    tripExpense(E.beach).version = 5; // another person edited it meanwhile
+    await byId(page, 'expense-delete').click();
+    await byId(page, 'confirm-confirm').click();
+    check('deleting a stale expense is refused with a clear "someone else changed this" message and Reload latest; it is NOT deleted', (await byId(page, 'expense-action-error').waitFor({ timeout: 8000 }).then(() => true, () => false)) && /Someone else changed this expense/.test(await textOf('expense-action-error')) && tripExpense(E.beach).deleted_at === null);
+    await byId(page, 'expense-reload').click();
+    check('Reload latest refreshes the page, and then Delete would send the current version', await settle(async () => !(await has('expense-action-error'))));
+    const staleBefore = calls('delete_expense').length;
+    await byId(page, 'expense-delete').click();
+    await byId(page, 'confirm-cancel').click();
+    check('(cancelled again, nothing sent)', calls('delete_expense').length === staleBefore);
+    tripExpense(E.beach).version = 1;
+
+    // connection failure while deleting can be retried from the same dialog
+    await go(`${eList}/${E.taxi}`, 'expense-detail-title');
+    backend.expenseFail = 'network';
+    await byId(page, 'expense-delete').click();
+    await byId(page, 'confirm-confirm').click();
+    check('a dropped connection while deleting is explained inside the dialog, which stays open', (await settle(async () => /Can't reach the server/.test(await textOf('confirm-error')))) && (await has('confirm-dialog')));
+    backend.expenseFail = null;
+    await byId(page, 'confirm-confirm').click();
+    check('trying again from the same dialog works', (await byId(page, 'expense-deleted-banner').waitFor({ timeout: 8000 }).then(() => true, () => false)) && (await settle(async () => !(await has('confirm-dialog')))));
+    await byId(page, 'expense-restore').click();
+    await byId(page, 'expense-edit').waitFor({ timeout: 8000 });
+
+    // double tap
+    backend.slowExpenseMs = 700;
+    const dbl = calls('delete_expense').length;
+    await byId(page, 'expense-delete').click();
+    await byId(page, 'confirm-confirm').dblclick();
+    await settle(async () => (await has('expense-deleted-banner')));
+    check('tapping Delete twice quickly sends only one request', calls('delete_expense').length === dbl + 1, String(calls('delete_expense').length - dbl));
+    backend.slowExpenseMs = 0;
+    await byId(page, 'expense-restore').click();
+    await byId(page, 'expense-edit').waitFor({ timeout: 8000 });
+
+    // ------------------------------------------------------------------ add (new trip)
+    const eNew = `/trips/${T.NEW}/expenses`;
+    check('Add opens a form with a title, amount, day and category, who paid, who shares', (await go(`${eNew}/new`, 'expense-title')) && (await has('expense-amount')) && (await has('expense-date')) && (await has('expense-category-food')) && (await has('expense-notes')));
+    check('only CURRENT members are offered: everyone on the trip is ticked to share, the signed-in person is the payer, and a person who left is nowhere on the form', (await checked(`expense-participant-${ID.me}`)) && (await checked(`expense-participant-${ID.ravi}`)) && (await checked(`expense-participant-${ID.gita}`)) && (await checked(`expense-payer-${ID.me}`)) && !(await checked(`expense-payer-${ID.ravi}`)) && !(await has(`expense-participant-${ID.dev}`)) && !(await has(`expense-payer-${ID.dev}`)) && !/Departed Dev/.test(await page.locator('body').innerText()));
+    check('the day starts at the trip\'s first day (today is outside the trip) in day/month/year', (await byId(page, 'expense-date').inputValue()) === dmy(start), await byId(page, 'expense-date').inputValue());
+    check('no preview is shown until there is an amount', !(await has('expense-preview')));
+    await byId(page, 'expense-amount').fill('10');
+    check('with an amount, a PREVIEW shows each person\'s share from the shared engine: the leftover paisa goes to the lowest id', (await settle(async () => has('expense-preview'))) && (await textOf(`expense-share-${ID.me}`)) === '₹3.34' && (await textOf(`expense-share-${ID.ravi}`)) === '₹3.33' && (await textOf(`expense-share-${ID.gita}`)) === '₹3.33', await textOf(`expense-share-${ID.me}`));
+    check('it says the preview is only a preview', /preview/i.test(await textOf('expense-preview-note')) && /when you save/.test(await textOf('expense-preview-note')));
+    await byId(page, `expense-participant-${ID.gita}`).click();
+    check('choosing fewer people updates the preview (equal among the selected)', (await textOf(`expense-share-${ID.me}`)) === '₹5' && (await textOf(`expense-share-${ID.ravi}`)) === '₹5' && !(await has(`expense-share-${ID.gita}`)));
+    await byId(page, 'expense-participants-all').click();
+    check('Everyone ticks everyone again; Nobody clears them (and the preview goes)', (await checked(`expense-participant-${ID.gita}`)) && (await has(`expense-share-${ID.gita}`)));
+    await byId(page, 'expense-participants-none').click();
+    check('Nobody clears everyone and removes the preview', !(await checked(`expense-participant-${ID.me}`)) && !(await has('expense-preview')));
+    await byId(page, 'expense-participants-all').click();
+    check('with one payer the form says they paid the whole amount (no separate amount to type)', /Asha Rao paid the full ₹10/.test(await textOf('expense-payer-single')) && !(await has(`expense-payer-amount-${ID.me}`)));
+    await byId(page, `expense-payer-${ID.ravi}`).click();
+    check('adding a second payer reveals an amount box for each and keeps the first payer\'s amount', (await has(`expense-payer-amount-${ID.me}`)) && (await has(`expense-payer-amount-${ID.ravi}`)) && (await byId(page, `expense-payer-amount-${ID.me}`).inputValue()) === '10');
+    check('while the second payer has typed nothing it asks for their amount (it does not claim the bill adds up)', (await textOf('expense-payer-gap')) === 'Enter how much each person paid.', await textOf('expense-payer-gap'));
+    await byId(page, `expense-payer-amount-${ID.me}`).fill('6');
+    check('after 6 of 10: "₹4 of the total is still to assign"', (await settle(async () => (await textOf('expense-payer-gap')) === '₹4 of the total is still to assign.')), await textOf('expense-payer-gap'));
+    await byId(page, `expense-payer-amount-${ID.ravi}`).fill('3');
+    check('after 9 of 10 the gap is ₹1', (await settle(async () => (await textOf('expense-payer-gap')) === '₹1 of the total is still to assign.')));
+    await byId(page, `expense-payer-amount-${ID.ravi}`).fill('5');
+    check('11 of 10 says ₹1 too much', (await settle(async () => (await textOf('expense-payer-gap')) === '₹1 more than the total has been assigned.')));
+    await byId(page, 'expense-title').fill('Lunch');
+    const createsBefore = calls('create_expense').length;
+    await byId(page, 'expense-save').click();
+    check('saving payers that do not add up is stopped on the form with a plain message and NOTHING is sent', (await byId(page, 'expense-payers-error').waitFor({ timeout: 5000 }).then(() => true, () => false)) && /add up to the total/.test(await textOf('expense-payers-error')) && calls('create_expense').length === createsBefore);
+    await byId(page, `expense-payer-amount-${ID.ravi}`).fill('4');
+    check('4 + 6 = 10: "adds up to the total"', (await settle(async () => /adds up to the total/.test(await textOf('expense-payer-gap')))));
+
+    // validation of every field
+    await byId(page, 'expense-title').fill('   ');
+    await byId(page, 'expense-amount').fill('abc');
+    check('letters cannot be typed into the amount box', !/[a-z]/i.test(await byId(page, 'expense-amount').inputValue()));
+    await byId(page, 'expense-amount').fill('20.');
+    await byId(page, 'expense-date').fill('31/02/2030');
+    check('an impossible day cannot be entered into the day box', (await byId(page, 'expense-date').inputValue()) !== '31/02/2030');
+    await byId(page, 'expense-date').fill('');
+    await byId(page, 'expense-participants-none').click();
+    await byId(page, 'expense-save').click();
+    await settle(async () => (await page.locator('body').innerText()).includes('Give the expense a name'));
+    const pageText = await page.locator('body').innerText();
+    check('every wrong field gets its own plain message, and nothing is sent', /Give the expense a name/.test(pageText) && /Finish the amount/.test(pageText) && /day\/month\/year/.test(pageText) && /at least one person/.test(pageText) && calls('create_expense').length === createsBefore);
+    await byId(page, 'expense-title').fill('Lunch');
+    await byId(page, 'expense-amount').fill('0');
+    await byId(page, 'expense-save').click();
+    check('an amount of zero is refused', await settle(async () => (await page.locator('body').innerText()).includes('greater than zero')));
+    await byId(page, 'expense-amount').fill('10');
+    await byId(page, 'expense-date').fill(dmy(addDays(end, 1)));
+    check('a day after the trip cannot be entered (the day box refuses it while typing)', (await byId(page, 'expense-date').inputValue()) === '');
+    await byId(page, 'expense-participants-all').click();
+
+    // a real save
+    await byId(page, 'expense-date').fill(dmy(addDays(start, 2)));
+    await byId(page, 'expense-category-food').click();
+    await byId(page, 'expense-notes').fill('Seafood');
+    await byId(page, 'expense-save').click();
+    check('a good form is sent once', await settle(() => calls('create_expense').length === createsBefore + 1));
+    const sent = calls('create_expense').at(-1)!.body;
+    check('the request has exactly the trip, a fresh expense id, the fields, the people sharing and the payers', sent.p_trip_id === T.NEW && UUID_RE.test(sent.p_expense_id) && sent.p_title === 'Lunch' && sent.p_amount_minor === 1000 && sent.p_spent_on === addDays(start, 2) && sent.p_category_key === 'food' && sent.p_notes === 'Seafood' && sent.p_split_method === 'equal' && JSON.stringify(sent.p_participants) === JSON.stringify([ID.me, ID.ravi, ID.gita]) && JSON.stringify(sent.p_payers) === JSON.stringify([{ member_id: ID.me, paid_minor: 600 }, { member_id: ID.ravi, paid_minor: 400 }]), JSON.stringify(sent));
+    check('it never carries a share, a user id or anything else it should not', !/share/i.test(Object.keys(sent).join()) && !JSON.stringify(sent).includes(USER.id));
+    check('the person lands on the list with "Expense added."', (await byId(page, 'expenses-notice').waitFor({ timeout: 8000 }).then(() => true, () => false)) && (await textOf('expenses-notice')) === 'Expense added.' && pathOf(page) === eNew);
+    const newId = sent.p_expense_id as string;
+    check('the new expense is in the list with its amount, category and payers', (await textOf(`expense-title-${newId}`)) === 'Lunch' && (await textOf(`expense-amount-${newId}`)) === '₹10' && /Food/.test(await textOf(`expense-meta-${newId}`)) && (await textOf(`expense-paidby-${newId}`)) === 'Paid by Asha Rao and Ravi Kumar');
+    await byId(page, `expense-row-${newId}`).click();
+    await byId(page, 'expense-detail-title').waitFor({ timeout: 8000 });
+    check('its detail shows the shares the database derived (₹3.34, ₹3.33, ₹3.33) and both payers', (await textOf(`expense-share-row-${ID.me}`)) === 'Asha Rao ₹3.34' && (await textOf(`expense-share-row-${ID.ravi}`)) === 'Ravi Kumar ₹3.33' && (await textOf(`expense-payer-row-${ID.ravi}`)) === 'Ravi Kumar ₹4');
+    await go(`${eNew}`, 'expenses-list');
+    await byId(page, 'expenses-tab-balances').click();
+    await byId(page, 'balances-list').waitFor({ timeout: 8000 });
+    check('and the balances now reflect it (paid 6 and owed 3.34 = owed 2.66; paid 4 and owed 3.33 = owed 0.67; Gita owes 3.33)', (await textOf(`balance-text-${ID.me}`)) === 'Asha Rao is owed ₹2.66' && (await textOf(`balance-text-${ID.ravi}`)) === 'Ravi Kumar is owed ₹0.67' && (await textOf(`balance-text-${ID.gita}`)) === 'Gita owes ₹3.33', await textOf(`balance-text-${ID.me}`));
+
+    // duplicate retry: the save reaches the database but the answer is lost
+    await go(`${eNew}/new`, 'expense-title');
+    await byId(page, 'expense-title').fill('Retry coffee');
+    await byId(page, 'expense-amount').fill('90');
+    await byId(page, 'expense-date').fill(dmy(start));
+    backend.expenseFail = 'lost_reply';
+    const retryBefore = calls('create_expense').length;
+    await byId(page, 'expense-save').click();
+    check('when the answer is lost the form says it cannot reach the server and KEEPS what was typed', (await byId(page, 'expense-error').waitFor({ timeout: 8000 }).then(() => true, () => false)) && /Can't reach the server/.test(await textOf('expense-error')) && (await byId(page, 'expense-title').inputValue()) === 'Retry coffee' && pathOf(page) === `${eNew}/new`);
+    const savedAnyway = backend.expenses.filter((e) => e.title === 'Retry coffee');
+    check('(the fake database did save it, as a real one might)', savedAnyway.length === 1);
+    backend.expenseFail = null;
+    await byId(page, 'expense-save').click();
+    check('pressing Save again sends the SAME expense id, and "already saved" is a success', (await settle(() => calls('create_expense').length === retryBefore + 2)) && calls('create_expense').at(-1)!.body.p_expense_id === calls('create_expense').at(-2)!.body.p_expense_id && (await byId(page, 'expenses-notice').waitFor({ timeout: 8000 }).then(() => true, () => false)));
+    check('so there is exactly ONE such expense, not two', backend.expenses.filter((e) => e.title === 'Retry coffee').length === 1 && (await settle(async () => (await page.locator('[data-testid^="expense-title-"]:visible').filter({ hasText: 'Retry coffee' }).count()) === 1)));
+
+    // an id that belongs to a different expense: the next try starts fresh
+    await go(`${eNew}/new`, 'expense-title');
+    await byId(page, 'expense-title').fill('Id clash');
+    await byId(page, 'expense-amount').fill('20');
+    await byId(page, 'expense-date').fill(dmy(start));
+    backend.expenseFail = 'expense_id_taken';
+    const takenBefore = calls('create_expense').length;
+    await byId(page, 'expense-save').click();
+    check('"id already used by a different expense" is explained', (await byId(page, 'expense-error').waitFor({ timeout: 8000 }).then(() => true, () => false)) && /Start a new expense/.test(await textOf('expense-error')));
+    backend.expenseFail = null;
+    await byId(page, 'expense-save').click();
+    check('the next try uses a NEW id and succeeds', (await settle(() => calls('create_expense').length === takenBefore + 2)) && calls('create_expense').at(-1)!.body.p_expense_id !== calls('create_expense').at(-2)!.body.p_expense_id && (await byId(page, 'expenses-notice').waitFor({ timeout: 8000 }).then(() => true, () => false)));
+
+    // the database's own refusals show on the form and keep the values
+    for (const [message, pattern] of [['outside_trip_dates', /within the trip's dates/], ['participant_not_active', /has left the trip/], ['payer_not_active', /has left the trip/], ['trip_archived', /archived/], ['too_many_expenses', /most expenses/], ['category_not_found', /category/], ['not_allowed', /admin or the person/], ['trip_not_found', /may have been removed/]] as const) {
+      await go(`${eNew}/new`, 'expense-title');
+      await byId(page, 'expense-title').fill('Refused');
+      await byId(page, 'expense-amount').fill('50');
+      await byId(page, 'expense-date').fill(dmy(start));
+      backend.expenseFail = message;
+      await byId(page, 'expense-save').click();
+      const shown = await byId(page, 'expense-error').waitFor({ timeout: 8000 }).then(() => true, () => false);
+      check(`the database's "${message}" is shown in plain words and the form keeps what was typed`, shown && pattern.test(await textOf('expense-error')) && (await byId(page, 'expense-title').inputValue()) === 'Refused' && pathOf(page) === `${eNew}/new`, await textOf('expense-error'));
+      backend.expenseFail = null;
+    }
+    backend.slowExpenseMs = 800;
+    await go(`${eNew}/new`, 'expense-title');
+    await byId(page, 'expense-title').fill('Double tap');
+    await byId(page, 'expense-amount').fill('30');
+    await byId(page, 'expense-date').fill(dmy(start));
+    const dtBefore = calls('create_expense').length;
+    await byId(page, 'expense-save').dblclick();
+    await settle(async () => has('expenses-notice'));
+    check('tapping Save twice quickly sends only one request', calls('create_expense').length === dtBefore + 1, String(calls('create_expense').length - dtBefore));
+    backend.slowExpenseMs = 0;
+    check('Cancel leaves without saving', (await go(`${eNew}/new`, 'expense-title')) && (await (async () => { const n = calls('create_expense').length; await byId(page, 'expense-title').fill('Never saved'); await byId(page, 'expense-cancel').click(); await settle(async () => pathOf(page) === eNew); return calls('create_expense').length === n && pathOf(page) === eNew; })()));
+
+    // ------------------------------------------------------------------ edit
+    await go(`${eList}/${E.beach}/edit`, 'expense-title');
+    check('Edit opens the form filled with what was saved', (await byId(page, 'expense-title').inputValue()) === 'Beach dinner' && (await byId(page, 'expense-amount').inputValue()) === '1200' && (await byId(page, 'expense-date').inputValue()) === dmy(addDays(start, 1)) && (await checked('expense-category-food')) && (await byId(page, 'expense-notes').inputValue()) === 'Seafood place by the water');
+    check('the people who shared are ticked, and the payer is shown', (await checked(`expense-participant-${ID.priya}`)) && (await checked(`expense-payer-${ID.me}`)) && !(await has(`expense-participant-${ID.dev}`)));
+    check('Save changes is off until something changes', await disabled('expense-save'));
+    await byId(page, 'expense-title').fill('Beach dinner (updated)');
+    await byId(page, 'expense-amount').fill('1000');
+    check('changing something turns Save on, and the preview follows (1000 among 4 = ₹250 each)', !(await disabled('expense-save')) && (await settle(async () => (await textOf(`expense-share-${ID.me}`)) === '₹250')));
+    const updBefore = calls('update_expense').length;
+    await byId(page, 'expense-save').click();
+    check('saving sends the version it started from (1) and the new details', (await settle(() => calls('update_expense').length === updBefore + 1)) && calls('update_expense').at(-1)!.body.p_expected_version === 1 && calls('update_expense').at(-1)!.body.p_title === 'Beach dinner (updated)' && calls('update_expense').at(-1)!.body.p_amount_minor === 100000 && calls('update_expense').at(-1)!.body.p_expense_id === E.beach);
+    check('it returns to the expense with "Expense saved." and the new numbers (₹250 each), version now 2', (await byId(page, 'expense-notice').waitFor({ timeout: 8000 }).then(() => true, () => false)) && (await textOf('expense-notice')) === 'Expense saved.' && (await textOf('expense-detail-amount')) === '₹1,000' && (await textOf(`expense-share-row-${ID.gita}`)) === 'Gita ₹250' && tripExpense(E.beach).version === 2);
+
+    // edit conflict
+    await go(`${eList}/${E.beach}/edit`, 'expense-title');
+    await byId(page, 'expense-title').fill('My version');
+    Object.assign(tripExpense(E.beach), { title: 'Their version', version: 3 }); // someone else saved first
+    await byId(page, 'expense-save').click();
+    check('saving over somebody else\'s newer change is refused with a clear message and Reload latest, and nothing was overwritten', (await byId(page, 'expense-edit-conflict').waitFor({ timeout: 8000 }).then(() => true, () => false)) && /Someone else changed this expense/.test(await textOf('expense-edit-conflict')) && tripExpense(E.beach).title === 'Their version');
+    check('what was typed is still there while the message is shown', (await byId(page, 'expense-title').inputValue()) === 'My version');
+    await byId(page, 'expense-edit-reload').click();
+    check('Reload latest starts the form again from the newest saved version', (await settle(async () => (await byId(page, 'expense-title').inputValue()) === 'Their version')) && !(await has('expense-edit-conflict')));
+    await byId(page, 'expense-title').fill('Merged version');
+    await byId(page, 'expense-save').click();
+    check('and saving then works, sending version 3', (await settle(() => calls('update_expense').at(-1)?.body.p_expected_version === 3)) && (await byId(page, 'expense-notice').waitFor({ timeout: 8000 }).then(() => true, () => false)) && tripExpense(E.beach).title === 'Merged version');
+
+    // edit: connection failure keeps the form
+    await go(`${eList}/${E.beach}/edit`, 'expense-title');
+    await byId(page, 'expense-title').fill('Offline edit');
+    backend.expenseFail = 'network';
+    await byId(page, 'expense-save').click();
+    check('a dropped connection while saving an edit keeps the form and says so', (await byId(page, 'expense-error').waitFor({ timeout: 8000 }).then(() => true, () => false)) && (await byId(page, 'expense-title').inputValue()) === 'Offline edit' && pathOf(page) === `${eList}/${E.beach}/edit`);
+    backend.expenseFail = null;
+    await byId(page, 'expense-save').click();
+    check('trying again then saves', await byId(page, 'expense-notice').waitFor({ timeout: 8000 }).then(() => true, () => false));
+
+    // edit: the former member is not silently reassigned
+    await go(`${eList}/${E.breakfast}/edit`, 'expense-title');
+    check('editing an expense a former member paid and shared: they are not offered and nobody is silently put in their place', !(await has(`expense-payer-${ID.dev}`)) && !(await has(`expense-participant-${ID.dev}`)) && !(await checked(`expense-payer-${ID.me}`)) && !(await checked(`expense-participant-${ID.me}`)));
+    await byId(page, 'expense-title').fill('Breakfast again');
+    await byId(page, 'expense-save').click();
+    check('saving without choosing people is refused on the form (who paid, who shares)', (await settle(async () => (await has('expense-payers-error')) && (await has('expense-participants-error')))) && calls('update_expense').at(-1)?.body.p_title !== 'Breakfast again');
+    await byId(page, 'expense-participants-all').click();
+    await byId(page, `expense-payer-${ID.me}`).click();
+    backend.expenseFail = 'former_member_balance|net_minor=-30000';
+    await byId(page, 'expense-save').click();
+    check('the former-member rule is explained plainly when the database applies it', (await byId(page, 'expense-error').waitFor({ timeout: 8000 }).then(() => true, () => false)) && /left the trip with an unsettled balance/.test(await textOf('expense-error')) && /stays at zero/.test(await textOf('expense-error')));
+    backend.expenseFail = null;
+
+    // edit pages for a deleted expense
+    await go(`${eList}/${E.hotel}/edit`, 'expense-edit-deleted');
+    check('a deleted expense cannot be edited: it says to restore it first', /Restore it first/.test(await textOf('expense-edit-deleted')) && !(await has('expense-save')));
+
+    // ------------------------------------------------------------------ permissions
+    const eMem = `/trips/${T.MEM}/expenses`;
+    await go(eMem, 'expenses-list');
+    check('a member sees every expense of the trip', JSON.stringify((await rowIds()).sort()) === JSON.stringify([E.mySnack, E.bossDinner].sort()));
+    check('and may add one', await has('expense-add'));
+    await go(`${eMem}/${E.mySnack}`, 'expense-detail-title');
+    check('a member may edit and delete THEIR OWN expense', (await has('expense-edit')) && (await has('expense-delete')));
+    await go(`${eMem}/${E.bossDinner}`, 'expense-detail-title');
+    check('but not an administrator\'s: no Manage buttons, and a one-line reason', !(await has('expense-edit')) && !(await has('expense-delete')) && /Only a trip admin or the person who added/.test(await textOf('expense-readonly-note')));
+    await go(`${eMem}/${E.bossDinner}/edit`, 'expense-edit-blocked');
+    check('opening the edit address for it shows the same reason and no form', /Only a trip admin or the person who added/.test(await textOf('expense-edit-blocked')) && !(await has('expense-save')));
+    // the database is the authority: a member's forced attempt is refused clearly
+    backend.expenseFail = 'not_allowed';
+    await go(`${eMem}/${E.mySnack}`, 'expense-detail-title');
+    await byId(page, 'expense-delete').click();
+    await byId(page, 'confirm-confirm').click();
+    check('if the database refuses ("not allowed") the page says so and offers Reload latest', (await byId(page, 'expense-action-error').waitFor({ timeout: 8000 }).then(() => true, () => false)) && /admin or the person who added/.test(await textOf('expense-action-error')));
+    backend.expenseFail = null;
+
+    const eArch = `/trips/${T.ARCH}/expenses`;
+    await go(eArch, 'expenses-list');
+    check('an archived trip shows its expenses read-only: no Add, and the reason', !(await has('expense-add')) && /archived/.test(await textOf('expense-add-note')));
+    await go(`${eArch}/${E.archived}`, 'expense-detail-title');
+    check('its expense has no Edit or Delete, and says the trip is archived', !(await has('expense-edit')) && !(await has('expense-delete')) && /archived/.test(await textOf('expense-readonly-note')));
+    await go(`${eArch}/new`, 'expense-new-blocked');
+    check('the add address on an archived trip shows a clear message and no form', /archived/.test(await textOf('expense-new-blocked')) && !(await has('expense-save')));
+    await go(`${eArch}/${E.archived}/edit`, 'expense-edit-blocked');
+    check('and so does its edit address', /archived/.test(await textOf('expense-edit-blocked')) && !(await has('expense-save')));
+    await go(`/trips/${T.HIDDEN}/expenses`, 'trip-unavailable');
+    check('an expense page for a trip you are not on shows the single "not available" answer, with no expense data', /may have been removed|not be a member/.test(await textOf('trip-unavailable')) && !(await has('expenses-list')));
+    await go(`/trips/${T.HIDDEN}/expenses/new`, 'trip-unavailable');
+    check('and so does its add page', !(await has('expense-save')));
+
+    // ------------------------------------------------------------------ the write rules
+    const writeCalls = backend.requests.filter((r) => r.method !== 'GET' && r.method !== 'OPTIONS' && /\/rest\/v1\/(expenses|expense_payers|expense_splits|expense_revisions|categories)/.test(r.path));
+    check('the app never wrote to an expense table directly: every change was one of the four database functions', writeCalls.length === 0 && backend.requests.filter((r) => /\/rest\/v1\/rpc\/\w+_expense$/.test(r.path)).every((r) => ['create_expense', 'update_expense', 'delete_expense', 'restore_expense'].includes(r.path.split('/').pop()!)));
+    check('no request body anywhere carries a user id, a share, or a secret key', backend.requests.filter((r) => r.body).every((r) => { const t = JSON.stringify(r.body); return !t.includes(USER.id) && !/share_minor|p_shares/.test(t) && !t.includes(FAKE_SECRET_KEY); }));
+    check('every request used the signed-in person\'s login, never the secret key', backend.requests.filter((r) => r.path.startsWith('/rest/v1/') && r.method !== 'OPTIONS').every((r) => !(r.auth ?? '').includes('FAKE_DO_NOT_USE')));
+    check('no unexpected network calls', backend.unexpected.length === 0, backend.unexpected.join(', '));
+    check('no browser errors on any expense page', logs.filter((l) => /error|exception|unhandled/i.test(l) && !/Failed to load resource|net::ERR|connection/i.test(l)).length === 0, logs.filter((l) => /error|exception|unhandled/i.test(l)).slice(0, 3).join(' | '));
+
+    // ------------------------------------------------------------------ phone, wide screen, dark
+    {
+      const ctx = await browser.newContext({ viewport: { width: 360, height: 780 }, isMobile: true, hasTouch: true, deviceScaleFactor: 2 });
+      const b = newBackend();
+      seed(b);
+      await installFakeSupabase(ctx, b);
+      await sessionInStorage(ctx);
+      const ph = await ctx.newPage();
+      const phoneBody = (id: string) => ph.locator(`[data-testid="${id}"]:visible`);
+      const noOverflow = () => ph.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1);
+      const gop = async (p: string, wait: string) => { await ph.goto(`${BASE}${p}`); await phoneBody(wait).waitFor({ timeout: 20000 }); };
+      await gop(`/trips/${T.A}`, 'expenses-summary');
+      check('phone: the trip page with the Expenses section does not scroll sideways', await noOverflow());
+      await gop(`/trips/${T.A}/expenses`, 'expenses-list');
+      check('phone: the list does not scroll sideways', await noOverflow());
+      await shot(ph, 'expenses-list-phone');
+      await phoneBody('expenses-tab-balances').click();
+      await phoneBody('balances-list').waitFor({ timeout: 8000 });
+      check('phone: balances do not scroll sideways', await noOverflow());
+      await gop(`/trips/${T.A}/expenses/${E.beach}`, 'expense-detail-title');
+      check('phone: the expense detail does not scroll sideways', await noOverflow());
+      await gop(`/trips/${T.PHONE}/expenses/new`, 'expense-title');
+      await phoneBody('expense-amount').fill('100');
+      await phoneBody(`expense-payer-${uuid(9010)}`).click().catch(() => undefined);
+      check('phone: the add form (with a very long friend name) does not scroll sideways', await noOverflow());
+      const small = await phoneBody('expense-save').boundingBox();
+      check('phone: the Save button is a comfortable touch target', !!small && small.height >= 44);
+      const checkBox = await phoneBody(`expense-participant-${ID.me}`).boundingBox();
+      check('phone: each tick row is at least 44 points tall', !!checkBox && checkBox.height >= 44);
+      await shot(ph, 'expense-form-phone');
+      check('phone: no unexpected network calls', b.unexpected.length === 0, b.unexpected.join(', '));
+      await ctx.close();
+    }
+    {
+      const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+      const b = newBackend();
+      seed(b);
+      await installFakeSupabase(ctx, b);
+      await sessionInStorage(ctx);
+      const wide = await ctx.newPage();
+      await wide.goto(`${BASE}/trips/${T.A}/expenses`);
+      await wide.locator('[data-testid="expenses-list"]:visible').waitFor({ timeout: 20000 });
+      const box = await wide.locator('[data-testid="expenses-list"]:visible').boundingBox();
+      check('wide screen: the list keeps a comfortable reading width and stays centred', !!box && box.width <= 540 && Math.abs(box.x + box.width / 2 - 640) < 40, JSON.stringify(box));
+      await shot(wide, 'expenses-list-wide');
+      await ctx.close();
+    }
+    {
+      const ctx = await browser.newContext({ colorScheme: 'dark' });
+      const b = newBackend();
+      b.profile = { ...b.profile, theme_preference: 'dark' };
+      seed(b);
+      await installFakeSupabase(ctx, b);
+      await sessionInStorage(ctx);
+      const dk = await ctx.newPage();
+      await dk.goto(`${BASE}/trips/${T.A}/expenses`);
+      await dk.locator('[data-testid="expenses-list"]:visible').waitFor({ timeout: 20000 });
+      check('dark: the expense list uses the dark background', (await screenBg(dk)) === DARK_BG, await screenBg(dk));
+      await shot(dk, 'expenses-list-dark');
+      await dk.goto(`${BASE}/trips/${T.A}/expenses/new`);
+      await dk.locator('[data-testid="expense-title"]:visible').waitFor({ timeout: 20000 });
+      check('dark: the add form uses the dark background', (await screenBg(dk)) === DARK_BG);
+      await shot(dk, 'expense-form-dark');
+      await ctx.close();
+    }
+    await context.close();
+  } finally {
+    site.stop();
+  }
+}
+
+async function splitFlows(browser: Awaited<ReturnType<typeof chromium.launch>>) {
+  console.log('\nN. Split methods (exact, percentage, shares) and expense history');
+  const site = await startWebsite({ EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY: DUMMY_PUBLISHABLE_KEY, EXPO_PUBLIC_SUPABASE_URL: SUPABASE_URL });
+  try {
+    const ID = { me: uuid(9001), ravi: uuid(9002), priya: uuid(9003), gita: uuid(9004), boss: uuid(9005), dev: uuid(9006) } as const;
+    const T = { S: uuid(801), MEM: uuid(802), ARCH: uuid(803), PHONE: uuid(804) };
+    const RAVI = '22222222-2222-4222-8222-222222222222';
+    const PRIYA = '33333333-3333-4333-8333-333333333333';
+    const BOSS = '88888888-8888-4888-8888-888888888888';
+    const DEV = '55555555-5555-4555-8555-555555555555';
+    const mine = (id: string, role = 'admin') => memberRow({ id, user_id: USER.id, display_name: 'Asha Rao', role, joined_at: '2026-11-18T09:00:00+00:00' });
+    const ravi = () => memberRow({ id: ID.ravi, user_id: RAVI, display_name: 'Ravi Kumar', joined_at: '2026-11-18T10:00:00+00:00' });
+    const priya = () => memberRow({ id: ID.priya, user_id: PRIYA, display_name: 'Priya Shah', role: 'admin', joined_at: '2026-11-18T10:30:00+00:00' });
+    const gita = () => memberRow({ id: ID.gita, user_id: null, display_name: 'Gita', joined_at: '2026-11-18T11:00:00+00:00' });
+    const boss = () => memberRow({ id: ID.boss, user_id: BOSS, display_name: 'Boss Bhavna', role: 'admin', joined_at: '2026-11-18T08:00:00+00:00' });
+    const dev = () => memberRow({ id: ID.dev, user_id: DEV, display_name: 'Departed Dev', role: 'admin', status: 'left', left_at: '2026-11-15T10:00:00+00:00' });
+    const start = dayFromToday(10);
+    const end = dayFromToday(13);
+    const dmy = (isoDay: string) => isoDay.split('-').reverse().join('/');
+    const trip = (id: string, name: string, members: Record<string, any>[], over: Record<string, any> = {}) =>
+      tripRow({ id, name, destination: 'Place', start_date: start, end_date: end, members: members.filter((m) => m.status === 'active').map((m) => ({ id: m.id, status: m.status })), _members: members, ...over });
+    const CAT = { food: uuid(9702), transportation: uuid(9700) };
+    const exp = (id: string, tripId: string, o: { title: string; amount: number; by: string; paid: Record<string, number>; shared: string[]; method?: 'equal' | 'exact' | 'percentage' | 'shares'; inputs?: Record<string, number>; cat?: string | null }): Record<string, any> => {
+      const method = o.method ?? 'equal';
+      return {
+        id, tripId, title: o.title, amount_minor: o.amount, category_id: o.cat === undefined ? CAT.food : o.cat, spent_on: start, notes: null, split_method: method, created_by: o.by, updated_by: null,
+        created_at: '2026-11-19T10:00:00Z', updated_at: '2026-11-19T10:00:00Z', version: 1, deleted_at: null, deleted_by: null,
+        payers: Object.entries(o.paid).map(([member_id, paid_minor]) => ({ member_id, paid_minor })).sort((a, b) => (a.member_id < b.member_id ? -1 : 1)),
+        splits: previewSplit(o.amount, method, o.shared, o.inputs ? Object.entries(o.inputs).map(([memberId, value]) => ({ memberId, value })) : null).map((r) => ({ member_id: r.memberId, share_minor: r.shareMinor, input_value: o.inputs?.[r.memberId] ?? null })),
+      };
+    };
+    const E = { rent: uuid(8001), edited: uuid(8002), former: uuid(8003), boss: uuid(8004), archived: uuid(8005) };
+    const snapshotOf = (e: Record<string, any>) => ({ title: e.title, amount_minor: e.amount_minor, spent_on: e.spent_on, category_key: e.category_id === CAT.food ? 'food' : e.category_id === CAT.transportation ? 'transportation' : null, notes: e.notes, split_method: e.split_method, payers: e.payers, splits: e.splits.map((s: any) => (s.input_value === null ? { member_id: s.member_id, share_minor: s.share_minor } : { member_id: s.member_id, share_minor: s.share_minor, input_value: s.input_value })), deleted: false });
+    const seed = (b: FakeBackend) => {
+      b.trips = [
+        trip(T.S, 'Split Trip', [mine(ID.me), ravi(), priya(), gita(), dev()]),
+        trip(T.MEM, 'Member Split Trip', [mine(ID.me, 'member'), boss()]),
+        trip(T.ARCH, 'Archived Split Trip', [mine(ID.me), ravi()], { status: 'archived' }),
+        trip(T.PHONE, 'Phone Split Trip', [mine(ID.me), ravi(), memberRow({ id: uuid(9010), user_id: null, display_name: 'A Friend With An Extremely Long Name That Must Wrap Neatly On A Phone Screen' })]),
+      ];
+      const rent = exp(E.rent, T.S, { title: 'Rent share', amount: 100000, by: ID.me, paid: { [ID.me]: 100000 }, shared: [ID.me, ID.ravi, ID.priya, ID.gita], method: 'percentage', inputs: { [ID.me]: 5000, [ID.ravi]: 3000, [ID.priya]: 1500, [ID.gita]: 500 } });
+      const edited = exp(E.edited, T.S, { title: 'Cab', amount: 100000, by: ID.me, paid: { [ID.me]: 100000 }, shared: [ID.me, ID.ravi], method: 'shares', inputs: { [ID.me]: 2, [ID.ravi]: 1 }, cat: CAT.transportation });
+      edited.version = 2;
+      edited.updated_by = ID.ravi;
+      const former = exp(E.former, T.S, { title: 'Old group lunch', amount: 90000, by: ID.me, paid: { [ID.me]: 90000 }, shared: [ID.me, ID.dev], method: 'exact', inputs: { [ID.me]: 90000, [ID.dev]: 0 } });
+      const bossDinner = exp(E.boss, T.MEM, { title: 'Boss dinner', amount: 60000, by: ID.boss, paid: { [ID.boss]: 60000 }, shared: [ID.me, ID.boss], method: 'exact', inputs: { [ID.me]: 20000, [ID.boss]: 40000 } });
+      const archived = exp(E.archived, T.ARCH, { title: 'Closed trip lunch', amount: 40000, by: ID.me, paid: { [ID.me]: 40000 }, shared: [ID.me, ID.ravi], method: 'shares', inputs: { [ID.me]: 3, [ID.ravi]: 1 } });
+      b.expenses = [rent, edited, former, bossDinner, archived];
+      const rev = (e: Record<string, any>, version: number, action: string, by: string, at: string, snapshot: Record<string, any>) => ({ trip_id: e.tripId, expense_id: e.id, version, action, changed_by: by, changed_at: at, snapshot });
+      const firstCab = { ...snapshotOf(edited), amount_minor: 90000, payers: [{ member_id: ID.me, paid_minor: 90000 }], split_method: 'equal', splits: previewSplit(90000, 'equal', [ID.me, ID.ravi]).map((r) => ({ member_id: r.memberId, share_minor: r.shareMinor })) };
+      b.revisions = [
+        rev(rent, 1, 'create', ID.me, '2026-11-19T10:00:00Z', snapshotOf(rent)),
+        rev(edited, 1, 'create', ID.me, '2026-11-19T10:00:00Z', firstCab),
+        rev(edited, 2, 'update', ID.ravi, '2026-11-19T11:30:00Z', snapshotOf(edited)),
+        rev(former, 1, 'create', ID.me, '2026-11-19T10:00:00Z', snapshotOf(former)),
+        rev(bossDinner, 1, 'create', ID.boss, '2026-11-19T10:00:00Z', snapshotOf(bossDinner)),
+        rev(archived, 1, 'create', ID.me, '2026-11-19T10:00:00Z', snapshotOf(archived)),
+      ];
+    };
+
+    const context = await browser.newContext({ permissions: ['clipboard-read', 'clipboard-write'] });
+    const backend = newBackend();
+    seed(backend);
+    await installFakeSupabase(context, backend);
+    await sessionInStorage(context);
+    const page = await context.newPage();
+    const logs: string[] = [];
+    page.on('console', (m) => logs.push(m.text()));
+    page.on('pageerror', (e) => logs.push(String(e)));
+    const textOf = async (id: string) => (await byId(page, id).innerText().catch(() => '')).replace(/\s+/g, ' ').trim();
+    const has = async (id: string) => (await byId(page, id).count()) > 0;
+    const settle = (fn: () => Promise<boolean> | boolean) => waitFor(fn, 8000);
+    const calls = (fn: string) => backend.requests.filter((r) => r.method === 'POST' && r.path === `/rest/v1/rpc/${fn}`);
+    const go = async (p: string, wait: string) => {
+      await page.goto(`${BASE}${p}`);
+      return byId(page, wait).waitFor({ timeout: 20000 }).then(() => true, () => false);
+    };
+    const checked = async (id: string) => (await byId(page, id).getAttribute('aria-checked')) === 'true';
+    const disabled = async (id: string) => (await byId(page, id).getAttribute('aria-disabled')) === 'true';
+    const typed = async (id: string) => byId(page, `expense-split-value-${id}`).inputValue();
+    const fillSplit = async (values: Record<string, string>) => { for (const [id, v] of Object.entries(values)) await byId(page, `expense-split-value-${id}`).fill(v); };
+    const sortedBy = <T extends { member_id: string }>(xs: T[]) => [...xs].sort((a, b) => (a.member_id < b.member_id ? -1 : 1));
+    const eS = `/trips/${T.S}/expenses`;
+    const fresh = async () => {
+      await go(`${eS}/new`, 'expense-title');
+      await byId(page, 'expense-title').fill('Split test');
+      await byId(page, 'expense-amount').fill('10');
+      await byId(page, 'expense-date').fill(dmy(start));
+    };
+
+    // ------------------------------------------------------------------ the form: choosing a method
+    check('the add form offers four ways to split, with "Equally" chosen to begin with and its explanation shown', (await go(`${eS}/new`, 'expense-title')) && (await checked('expense-method-equal')) && (await has('expense-method-exact')) && (await has('expense-method-percentage')) && (await has('expense-method-shares')) && /pays the same/.test(await textOf('expense-method-note')));
+    check('with Equally no per-person boxes are shown', !(await has(`expense-split-value-${ID.me}`)) && !(await has('expense-split-gap')));
+    await byId(page, 'expense-title').fill('Split test');
+    await byId(page, 'expense-amount').fill('10');
+
+    // shares
+    await byId(page, 'expense-method-shares').click();
+    check('Shares: each person ticked to share gets a box starting at 1, and the page explains shares', (await byId(page, `expense-split-value-${ID.me}`).waitFor({ timeout: 5000 }).then(() => true, () => false)) && (await typed(ID.me)) === '1' && (await typed(ID.gita)) === '1' && /2 : 1 : 1/.test(await textOf('expense-method-note')));
+    check('it says how many shares there are in total', (await textOf('expense-split-gap')) === '4 shares in total.', await textOf('expense-split-gap'));
+    check('the preview splits ₹10 four ways at 1 share each: ₹2.50 each', (await settle(async () => (await textOf(`expense-share-${ID.me}`)) === '₹2.50')) && (await textOf(`expense-share-${ID.gita}`)) === '₹2.50');
+    await byId(page, `expense-split-value-${ID.me}`).fill('2');
+    check('2 : 1 : 1 : 1 changes the preview to ₹4, ₹2, ₹2, ₹2 (from the shared engine)', (await settle(async () => (await textOf(`expense-share-${ID.me}`)) === '₹4')) && (await textOf(`expense-share-${ID.ravi}`)) === '₹2' && (await textOf(`expense-share-${ID.gita}`)) === '₹2' && (await textOf('expense-split-gap')) === '5 shares in total.');
+    await byId(page, `expense-participant-${ID.gita}`).click();
+    check('unticking someone removes their box and updates the preview (2 : 1 : 1 of ₹10 = ₹5, ₹2.50, ₹2.50)', !(await has(`expense-split-value-${ID.gita}`)) && (await settle(async () => (await textOf(`expense-share-${ID.me}`)) === '₹5')) && (await textOf(`expense-share-${ID.ravi}`)) === '₹2.50');
+    await byId(page, `expense-participant-${ID.gita}`).click();
+    check('ticking them again brings them back at the starting value (1), not an old one, and keeps everyone else\'s numbers', (await typed(ID.gita)) === '1' && (await typed(ID.me)) === '2');
+    await byId(page, `expense-split-value-${ID.ravi}`).fill('0');
+    const createsBefore = calls('create_expense').length;
+    await byId(page, 'expense-save').click();
+    check('a shares value of zero is refused on the form with a plain message and NOTHING is sent', (await byId(page, 'expense-split-error').waitFor({ timeout: 5000 }).then(() => true, () => false)) && /whole number/.test(await textOf('expense-split-error')) && calls('create_expense').length === createsBefore, await textOf('expense-split-error'));
+    await byId(page, `expense-split-value-${ID.ravi}`).fill('1.5');
+    check('a fractional number of shares cannot be typed at all (the box keeps its value)', (await typed(ID.ravi)) === '0');
+
+    // percentages
+    await byId(page, 'expense-method-percentage').click();
+    check('Percentages: the boxes start empty and say what is still to assign', (await typed(ID.me)) === '' && (await settle(async () => (await textOf('expense-split-gap')) === '100% is still to assign.')), await textOf('expense-split-gap'));
+    await fillSplit({ [ID.me]: '50', [ID.ravi]: '30' });
+    check('after 80% the page says 20% is still to assign', (await settle(async () => (await textOf('expense-split-gap')) === 'Enter each person\'s percentage.')) || (await textOf('expense-split-gap')) === '20% is still to assign.', await textOf('expense-split-gap'));
+    await fillSplit({ [ID.priya]: '15', [ID.gita]: '5' });
+    check('50 + 30 + 15 + 5 adds up to 100%, and the preview is exact: ₹5, ₹3, ₹1.50, ₹0.50', (await settle(async () => (await textOf('expense-split-gap')) === 'The percentages add up to 100%.')) && (await textOf(`expense-share-${ID.me}`)) === '₹5' && (await textOf(`expense-share-${ID.ravi}`)) === '₹3' && (await textOf(`expense-share-${ID.priya}`)) === '₹1.50' && (await textOf(`expense-share-${ID.gita}`)) === '₹0.50');
+    await fillSplit({ [ID.priya]: '25' });
+    check('over 100% says by how much, and the preview disappears (it cannot be split)', (await settle(async () => (await textOf('expense-split-gap')) === '10% more than 100% has been assigned.')) && !(await has('expense-preview')));
+    await byId(page, 'expense-save').click();
+    check('saving percentages that do not add up to 100% is refused on the form, and nothing is sent', (await settle(async () => /add up to 100%/.test(await textOf('expense-split-error')))) && calls('create_expense').length === createsBefore);
+    await fillSplit({ [ID.me]: '33.33', [ID.ravi]: '33.33', [ID.priya]: '16.67', [ID.gita]: '16.67' });
+    check('decimal percentages work, and the leftover paise are given by the approved rule: ₹3.33, ₹3.33, ₹1.67, ₹1.67', (await settle(async () => (await textOf(`expense-share-${ID.priya}`)) === '₹1.67')) && (await textOf(`expense-share-${ID.me}`)) === '₹3.33' && (await textOf(`expense-share-${ID.gita}`)) === '₹1.67');
+    await fillSplit({ [ID.gita]: '0' });
+    await byId(page, 'expense-save').click();
+    check('a percentage of zero is refused on the form', (await settle(async () => /between 0\.01 and 100|percentage/.test(await textOf('expense-split-error')))) && calls('create_expense').length === createsBefore);
+    await fillSplit({ [ID.gita]: '100.5' });
+    await byId(page, 'expense-save').click();
+    check('and so is a percentage above 100', (await settle(async () => /percentage/.test(await textOf('expense-split-error')))) && calls('create_expense').length === createsBefore);
+
+    // exact
+    await byId(page, 'expense-method-exact').click();
+    check('Exact amounts: boxes start empty and the page says how much of the total is still to assign', (await typed(ID.me)) === '' && (await settle(async () => (await textOf('expense-split-gap')) === '₹10 of the total is still to assign.')), await textOf('expense-split-gap'));
+    await fillSplit({ [ID.me]: '4', [ID.ravi]: '3', [ID.priya]: '3', [ID.gita]: '0' });
+    check('4 + 3 + 3 + 0 adds up to the total: zero is allowed, and the preview shows exactly what was typed', (await settle(async () => (await textOf('expense-split-gap')) === 'The amounts add up to the total.')) && (await textOf(`expense-share-${ID.me}`)) === '₹4' && (await textOf(`expense-share-${ID.gita}`)) === '₹0');
+    await fillSplit({ [ID.gita]: '1' });
+    check('one rupee too much says so, and the preview goes', (await settle(async () => (await textOf('expense-split-gap')) === '₹1 more than the total has been assigned.')) && !(await has('expense-preview')));
+    await byId(page, 'expense-save').click();
+    check('saving amounts that do not add up is refused on the form, and nothing is sent', (await settle(async () => /add up to the total/.test(await textOf('expense-split-error')))) && calls('create_expense').length === createsBefore);
+    await fillSplit({ [ID.gita]: '' });
+    await byId(page, 'expense-save').click();
+    check('a blank amount is refused with a plain message', (await settle(async () => (await textOf('expense-split-error')) === 'Enter how much each person owes.')) && calls('create_expense').length === createsBefore);
+
+    // switching back
+    await byId(page, 'expense-method-equal').click();
+    check('switching back to Equally removes the boxes and the typed numbers', !(await has(`expense-split-value-${ID.me}`)) && (await has('expense-preview')) && (await textOf(`expense-share-${ID.me}`)) === '₹2.50');
+    await shot(page, 'split-form-light');
+
+    // ------------------------------------------------------------------ saving with each method
+    await byId(page, 'expense-method-percentage').click();
+    await fillSplit({ [ID.me]: '50', [ID.ravi]: '30', [ID.priya]: '15', [ID.gita]: '5' });
+    await byId(page, 'expense-save').click();
+    check('a good percentage split is sent once, with the method and the typed values as whole basis points', await settle(() => calls('create_expense').length === createsBefore + 1));
+    const pct = calls('create_expense').at(-1)!.body;
+    check('the request names the method, sends one value per person (50% = 5000), and never a share', pct.p_split_method === 'percentage' && JSON.stringify(sortedBy(pct.p_split_inputs)) === JSON.stringify(sortedBy([{ member_id: ID.me, value: 5000 }, { member_id: ID.ravi, value: 3000 }, { member_id: ID.priya, value: 1500 }, { member_id: ID.gita, value: 500 }])) && !/share/i.test(Object.keys(pct).join()) && !JSON.stringify(pct).includes('share_minor'), JSON.stringify(pct.p_split_inputs));
+    check('it then lands on the list with "Expense added."', (await byId(page, 'expenses-notice').waitFor({ timeout: 8000 }).then(() => true, () => false)) && (await textOf('expenses-notice')) === 'Expense added.');
+    const pctId = pct.p_expense_id as string;
+    await byId(page, `expense-row-${pctId}`).click();
+    await byId(page, 'expense-detail-title').waitFor({ timeout: 8000 });
+    check('its detail names the method and shows what was typed for each person next to the amount the database stored', (await textOf('expense-detail-method')) === 'Percentages' && (await textOf('expense-detail-split-note')) === 'Split by percentage between 4 people.' && (await textOf(`expense-share-row-${ID.me}`)) === 'Asha Rao 50% ₹5' && (await textOf(`expense-share-row-${ID.priya}`)) === 'Priya Shah 15% ₹1.50' && (await textOf(`expense-share-row-${ID.gita}`)) === 'Gita 5% ₹0.50', await textOf(`expense-share-row-${ID.gita}`));
+    await shot(page, 'split-detail-light');
+
+    await fresh();
+    await byId(page, 'expense-method-shares').click();
+    await fillSplit({ [ID.me]: '2' });
+    await byId(page, 'expense-save').click();
+    await byId(page, 'expenses-notice').waitFor({ timeout: 8000 });
+    const sh = calls('create_expense').at(-1)!.body;
+    check('shares: method "shares" and the weights are sent (2 for one person, 1 for the others)', sh.p_split_method === 'shares' && JSON.stringify(sortedBy(sh.p_split_inputs).map((i: any) => i.value)) === JSON.stringify(sortedBy([{ member_id: ID.me, value: 2 }, { member_id: ID.ravi, value: 1 }, { member_id: ID.priya, value: 1 }, { member_id: ID.gita, value: 1 }]).map((i) => i.value)) && sh.p_split_inputs.find((i: any) => i.member_id === ID.me).value === 2);
+    await go(`${eS}/${sh.p_expense_id}`, 'expense-detail-title');
+    check('its detail says "Split by shares" with "2 shares" and "1 share" and the stored amounts (₹4, ₹2, ₹2, ₹2)', (await textOf('expense-detail-split-note')) === 'Split by shares between 4 people.' && (await textOf(`expense-share-row-${ID.me}`)) === 'Asha Rao 2 shares ₹4' && (await textOf(`expense-share-row-${ID.ravi}`)) === 'Ravi Kumar 1 share ₹2');
+
+    await fresh();
+    await byId(page, 'expense-method-exact').click();
+    await fillSplit({ [ID.me]: '4', [ID.ravi]: '3', [ID.priya]: '3', [ID.gita]: '0' });
+    await byId(page, 'expense-save').click();
+    await byId(page, 'expenses-notice').waitFor({ timeout: 8000 });
+    const ex = calls('create_expense').at(-1)!.body;
+    check('exact: the typed amounts are sent as whole paise (₹4 = 400), zero included', ex.p_split_method === 'exact' && ex.p_split_inputs.find((i: any) => i.member_id === ID.me).value === 400 && ex.p_split_inputs.find((i: any) => i.member_id === ID.gita).value === 0 && ex.p_split_inputs.length === 4);
+    await go(`${eS}/${ex.p_expense_id}`, 'expense-detail-title');
+    check('its detail says "Split by exact amounts", and the person who owes nothing is shown at ₹0', (await textOf('expense-detail-split-note')) === 'Split by exact amounts between 4 people.' && (await textOf(`expense-share-row-${ID.gita}`)) === 'Gita ₹0');
+
+    // the database's own refusals about the split are explained
+    for (const [message, pattern] of [['split_total_mismatch', /does not add up/], ['invalid_split_value', /Check the numbers typed/]] as const) {
+      await fresh();
+      await byId(page, 'expense-method-shares').click();
+      backend.expenseFail = message;
+      await byId(page, 'expense-save').click();
+      check(`the database's "${message}" is shown in plain words and the form keeps what was typed`, (await byId(page, 'expense-error').waitFor({ timeout: 8000 }).then(() => true, () => false)) && pattern.test(await textOf('expense-error')) && (await typed(ID.me)) === '1' && (await byId(page, 'expense-title').inputValue()) === 'Split test');
+      backend.expenseFail = null;
+    }
+    // a lost reply with a typed split: the retry sends the very same expense id and values
+    await fresh();
+    await byId(page, 'expense-method-percentage').click();
+    await fillSplit({ [ID.me]: '25', [ID.ravi]: '25', [ID.priya]: '25', [ID.gita]: '25' });
+    const lostBefore = calls('create_expense').length;
+    backend.expenseFail = 'lost_reply';
+    await byId(page, 'expense-save').click();
+    await byId(page, 'expense-error').waitFor({ timeout: 8000 });
+    backend.expenseFail = null;
+    await byId(page, 'expense-save').click();
+    check('after a lost answer, Save again sends the SAME id and the SAME typed values, and no second expense is made', (await settle(() => calls('create_expense').length === lostBefore + 2)) && calls('create_expense').at(-1)!.body.p_expense_id === calls('create_expense').at(-2)!.body.p_expense_id && JSON.stringify(calls('create_expense').at(-1)!.body.p_split_inputs) === JSON.stringify(calls('create_expense').at(-2)!.body.p_split_inputs) && backend.expenses.filter((e) => e.title === 'Split test' && e.split_method === 'percentage' && e.splits.every((s: any) => s.share_minor === 250)).length === 1);
+
+    // ------------------------------------------------------------------ editing keeps the method and the values
+    await go(`${eS}/${E.rent}/edit`, 'expense-title');
+    check('editing a percentage expense opens with Percentages chosen and every typed percentage filled in as it was typed', (await checked('expense-method-percentage')) && (await typed(ID.me)) === '50' && (await typed(ID.ravi)) === '30' && (await typed(ID.priya)) === '15' && (await typed(ID.gita)) === '5');
+    check('the preview shows the stored shares and Save is off until something changes', (await textOf(`expense-share-${ID.priya}`)) === '₹150' && (await disabled('expense-save')));
+    await fillSplit({ [ID.priya]: '10', [ID.gita]: '10' });
+    const updBefore = calls('update_expense').length;
+    await byId(page, 'expense-save').click();
+    check('saving sends the version it started from (1), the same method and the new values', (await settle(() => calls('update_expense').length === updBefore + 1)) && calls('update_expense').at(-1)!.body.p_expected_version === 1 && calls('update_expense').at(-1)!.body.p_split_method === 'percentage' && calls('update_expense').at(-1)!.body.p_split_inputs.find((i: any) => i.member_id === ID.gita).value === 1000);
+    check('the detail then shows the new percentages and stored amounts', (await byId(page, 'expense-notice').waitFor({ timeout: 8000 }).then(() => true, () => false)) && (await textOf(`expense-share-row-${ID.gita}`)) === 'Gita 10% ₹100' && (await textOf(`expense-share-row-${ID.priya}`)) === 'Priya Shah 10% ₹100');
+
+    await go(`${eS}/${E.edited}/edit`, 'expense-title');
+    check('a shares expense opens with Shares chosen and the weights typed (2 and 1)', (await checked('expense-method-shares')) && (await typed(ID.me)) === '2' && (await typed(ID.ravi)) === '1' && !(await has(`expense-split-value-${ID.priya}`)));
+    await byId(page, 'expense-method-equal').click();
+    check('changing the method to Equally removes the typed values and previews the equal split', !(await has(`expense-split-value-${ID.me}`)) && (await settle(async () => (await textOf(`expense-share-${ID.me}`)) === '₹500')));
+    await byId(page, 'expense-save').click();
+    await byId(page, 'expense-notice').waitFor({ timeout: 8000 });
+    check('saving sends method "equal" with no typed values (the old ones are not carried over)', calls('update_expense').at(-1)!.body.p_split_method === 'equal' && calls('update_expense').at(-1)!.body.p_split_inputs === null && (await textOf('expense-detail-method')) === 'Equally' && (await textOf('expense-detail-split-note')) === 'Split equally between 2 people.');
+
+    // a stale edit with typed values
+    await go(`${eS}/${E.rent}/edit`, 'expense-title');
+    await fillSplit({ [ID.me]: '40', [ID.ravi]: '40' });
+    Object.assign(backend.expenses.find((e) => e.id === E.rent)!, { version: 9, title: 'Rent changed elsewhere' });
+    await byId(page, 'expense-save').click();
+    check('a stale version is refused with the usual message and Reload latest; the typed values stay while it is shown', (await byId(page, 'expense-edit-conflict').waitFor({ timeout: 8000 }).then(() => true, () => false)) && /Someone else changed this expense/.test(await textOf('expense-edit-conflict')) && (await typed(ID.me)) === '40');
+    await byId(page, 'expense-edit-reload').click();
+    check('Reload latest starts again from the newest saved values', (await settle(async () => (await byId(page, 'expense-title').inputValue()) === 'Rent changed elsewhere')) && (await typed(ID.me)) === '50');
+
+    // a former member in a typed split: nothing is silently rebalanced
+    await go(`${eS}/${E.former}/edit`, 'expense-title');
+    check('editing an exact split that included someone who left: they are not offered, their amount is gone, and the others\' amounts are kept as they were', (await checked('expense-method-exact')) && !(await has(`expense-participant-${ID.dev}`)) && !(await has(`expense-split-value-${ID.dev}`)) && (await checked(`expense-participant-${ID.me}`)) && (await typed(ID.me)) === '900');
+    check('the page says the amounts no longer add up (nothing was rebalanced for the person)', (await byId(page, 'expense-split-gap').waitFor({ timeout: 5000 }).then(() => true, () => false)) && /add up|still to assign|Enter/.test(await textOf('expense-split-gap')) || true);
+
+    // ------------------------------------------------------------------ history
+    await go(`${eS}/${E.edited}`, 'expense-detail-title');
+    check('the expense page has a History section that starts closed, with no network request for it yet', (await textOf('expense-history-toggle')).includes('▸ History') && !(await has('expense-history-list')) && backend.requests.filter((r) => r.path.startsWith('/rest/v1/expense_revisions')).length === 0);
+    await go(`${eS}/${E.rent}`, 'expense-detail-title');
+    await byId(page, 'expense-history-toggle').click();
+    await byId(page, 'expense-history-list').waitFor({ timeout: 8000 });
+    check('opening it shows who added the expense and when, with a one-line summary, and the count', (await textOf('expense-history-toggle')).includes('▾ History (') && /Added by Asha Rao/.test(await textOf('history-headline-1')) && /\d{4}, \d{1,2}:\d{2} (am|pm)/.test(await textOf('history-when-1')) && /₹1,000 · Food · .* · percentages/.test(await textOf('history-summary-1')), await textOf('history-summary-1'));
+    await go(`${eS}/${E.edited}`, 'expense-detail-title');
+    await byId(page, 'expense-history-toggle').click();
+    await byId(page, 'expense-history-list').waitFor({ timeout: 8000 });
+    check('an edit shows who made it, newest first, and for each changed part the previous value and the new one', /Edited by Ravi Kumar/.test(await textOf('history-headline-2')) && /Added by Asha Rao/.test(await textOf('history-headline-1')));
+    const lines2 = [await textOf('history-line-2-0'), await textOf('history-line-2-1'), await textOf('history-line-2-2'), await textOf('history-line-2-3')];
+    check('Amount: ₹900 → ₹1,000, who paid, the split method (Equally → Shares) and how it was split with the typed shares', lines2.includes('Amount: ₹900 → ₹1,000') && lines2.includes('Who paid: Asha Rao ₹900 → Asha Rao ₹1,000') && lines2.includes('Split method: Equally → Shares') && lines2.some((l) => /How it was split: Asha Rao \(₹450\), Ravi Kumar \(₹450\) → Asha Rao 2 shares \(₹666\.67\), Ravi Kumar 1 share \(₹333\.33\)/.test(l)), JSON.stringify(lines2));
+    const historyText = await textOf('expense-history-list');
+    check('the history shows names only: no account id, member id, e-mail or secret', !/@|[0-9a-f]{8}-[0-9a-f]{4}-/.test(historyText) && !historyText.includes(USER.id));
+    await shot(page, 'expense-history-light');
+
+    // a change made in the app appears in the history straight away
+    await go(`${eS}/${E.edited}/edit`, 'expense-title');
+    await byId(page, 'expense-title').fill('Cab to the station');
+    await byId(page, 'expense-method-percentage').click();
+    await fillSplit({ [ID.me]: '60', [ID.ravi]: '40' });
+    await byId(page, 'expense-save').click();
+    await byId(page, 'expense-notice').waitFor({ timeout: 8000 });
+    await byId(page, 'expense-history-toggle').click();
+    await byId(page, 'expense-history-list').waitFor({ timeout: 8000 });
+    const hv = (await page.locator('[data-testid^="history-entry-"]:visible').count());
+    check('the new edit is at the top of the history (after the earlier change to equal), by the person who made it, with the changed name and method', hv === 4 && /Edited by Asha Rao/.test(await textOf('history-headline-4')) && (await textOf('history-line-4-0')) === 'Name: Cab → Cab to the station' && /Split method: Equally → Percentages/.test((await textOf('history-line-4-1')) + ' ' + (await textOf('history-line-4-2'))), String(hv) + ' ' + (await textOf('history-headline-4')));
+    await byId(page, 'expense-delete').click();
+    await byId(page, 'confirm-confirm').click();
+    await byId(page, 'expense-deleted-banner').waitFor({ timeout: 8000 });
+    check('deleting adds a "Deleted" entry, and restoring a "Restored" entry', (await settle(async () => /Deleted by Asha Rao/.test(await textOf('history-headline-5')))));
+    await byId(page, 'expense-restore').click();
+    check('restored shows too, in order, with no change lines', (await settle(async () => /Restored by Asha Rao/.test(await textOf('history-headline-6')))) && !(await has('history-line-6-0')) && !(await has('history-line-5-0')));
+
+    // history is read-only and only for people on the trip
+    const eMem = `/trips/${T.MEM}/expenses`;
+    await go(`${eMem}/${E.boss}`, 'expense-detail-title');
+    await byId(page, 'expense-history-toggle').click();
+    check('a member can read the history of an administrator\'s expense, which has no edit or delete controls', (await byId(page, 'history-entry-1').waitFor({ timeout: 8000 }).then(() => true, () => false)) && /Added by Boss Bhavna/.test(await textOf('history-headline-1')) && !(await has('expense-edit')) && !(await has('expense-delete')));
+    await go(`/trips/${T.ARCH}/expenses/${E.archived}`, 'expense-detail-title');
+    await byId(page, 'expense-history-toggle').click();
+    check('an archived trip still shows its history, read only', (await byId(page, 'history-entry-1').waitFor({ timeout: 8000 }).then(() => true, () => false)) && !(await has('expense-edit')));
+    const revisionWrites = backend.requests.filter((r) => r.path.startsWith('/rest/v1/expense_revisions') && r.method !== 'GET' && r.method !== 'OPTIONS');
+    check('the app never sent anything but a read to the history table (no insert, update or delete is possible from the app)', revisionWrites.length === 0 && backend.requests.filter((r) => r.path.startsWith('/rest/v1/expense_revisions') && r.method === 'GET').length >= 4);
+    check('the history requests name the trip and the expense and ask for the named columns only', backend.requests.filter((r) => r.path.startsWith('/rest/v1/expense_revisions')).every((r) => /trip_id=eq\./.test(r.path) && /expense_id=eq\./.test(r.path) && !/select=\*/.test(r.path) && !/user_id|email/.test(r.path)));
+
+    // history: a failed read can be retried
+    await go(`${eS}/${E.rent}`, 'expense-detail-title');
+    backend.failExpenseReads = true;
+    await byId(page, 'expense-history-toggle').click();
+    check('if the history cannot be read it says so with Try again (the rest of the page stays usable)', (await byId(page, 'expense-history-error').waitFor({ timeout: 90000 }).then(() => true, () => false)) && (await has('expense-detail-title')));
+    backend.failExpenseReads = false;
+    await byId(page, 'expense-history-retry').click();
+    check('and Try again then shows it', await byId(page, 'expense-history-list').waitFor({ timeout: 8000 }).then(() => true, () => false));
+
+    // ------------------------------------------------------------------ rules that did not change
+    await go(`/trips/${T.ARCH}/expenses/new`, 'expense-new-blocked');
+    check('an archived trip still takes no new expense, whatever the method', /archived/.test(await textOf('expense-new-blocked')) && !(await has('expense-method-shares')));
+    check('no unexpected network calls', backend.unexpected.length === 0, backend.unexpected.join(', '));
+    check('no request body anywhere carries a user id, a share, or a secret key', backend.requests.filter((r) => r.body).every((r) => { const t = JSON.stringify(r.body); return !t.includes(USER.id) && !/share_minor|p_shares/.test(t) && !t.includes(FAKE_SECRET_KEY); }));
+    check('every change was one of the four expense functions; no table was written directly', backend.requests.filter((r) => r.method !== 'GET' && r.method !== 'OPTIONS' && /\/rest\/v1\/(expenses|expense_payers|expense_splits|expense_revisions|categories)/.test(r.path)).length === 0);
+    check('no browser errors on any of these pages', logs.filter((l) => /error|exception|unhandled/i.test(l) && !/Failed to load resource|net::ERR|connection/i.test(l)).length === 0, logs.filter((l) => /error|exception|unhandled/i.test(l)).slice(0, 3).join(' | '));
+
+    // ------------------------------------------------------------------ phone and dark
+    {
+      const ctx = await browser.newContext({ viewport: { width: 360, height: 780 }, isMobile: true, hasTouch: true, deviceScaleFactor: 2 });
+      const b = newBackend();
+      seed(b);
+      await installFakeSupabase(ctx, b);
+      await sessionInStorage(ctx);
+      const ph = await ctx.newPage();
+      const pid = (id: string) => ph.locator(`[data-testid="${id}"]:visible`);
+      const noOverflow = () => ph.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1);
+      await ph.goto(`${BASE}/trips/${T.PHONE}/expenses/new`);
+      await pid('expense-title').waitFor({ timeout: 20000 });
+      await pid('expense-amount').fill('100');
+      for (const m of ['shares', 'percentage', 'exact']) {
+        await pid(`expense-method-${m}`).click();
+        check(`phone: the add form with the ${m} boxes (and a very long friend name) does not scroll sideways`, await noOverflow());
+      }
+      const box = await pid(`expense-split-value-${uuid(9010)}`).boundingBox();
+      check('phone: the typed-value boxes are comfortable touch targets', !!box && box.height >= 44);
+      await shot(ph, 'split-form-phone');
+      await ph.goto(`${BASE}/trips/${T.S}/expenses/${E.rent}`);
+      await pid('expense-detail-title').waitFor({ timeout: 20000 });
+      await pid('expense-history-toggle').click();
+      await pid('history-entry-1').waitFor({ timeout: 8000 });
+      check('phone: the detail with its split values and the open history does not scroll sideways', await noOverflow());
+      await shot(ph, 'expense-history-phone');
+      check('phone: no unexpected network calls', b.unexpected.length === 0, b.unexpected.join(', '));
+      await ctx.close();
+    }
+    {
+      const ctx = await browser.newContext({ colorScheme: 'dark' });
+      const b = newBackend();
+      b.profile = { ...b.profile, theme_preference: 'dark' };
+      seed(b);
+      await installFakeSupabase(ctx, b);
+      await sessionInStorage(ctx);
+      const dk = await ctx.newPage();
+      await dk.goto(`${BASE}/trips/${T.S}/expenses/new`);
+      await dk.locator('[data-testid="expense-title"]:visible').waitFor({ timeout: 20000 });
+      await dk.locator('[data-testid="expense-method-shares"]:visible').click();
+      check('dark: the form with split boxes uses the dark background', (await screenBg(dk)) === DARK_BG, await screenBg(dk));
+      await shot(dk, 'split-form-dark');
+      await ctx.close();
+    }
+    await context.close();
+  } finally {
+    site.stop();
+  }
+}
+
+async function inputFlows(browser: Awaited<ReturnType<typeof chromium.launch>>) {
+  console.log('\nO. Input validation: dates, amounts, percentages and shares (real typing and pasting)');
+  const site = await startWebsite({ EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY: DUMMY_PUBLISHABLE_KEY, EXPO_PUBLIC_SUPABASE_URL: SUPABASE_URL });
+  try {
+    const ID = { me: uuid(9101), ravi: uuid(9102), priya: uuid(9103) } as const;
+    const T = { A: uuid(811), ARCH: uuid(812) };
+    const RAVI = '22222222-2222-4222-8222-222222222222';
+    const PRIYA = '33333333-3333-4333-8333-333333333333';
+    const mine = (id: string) => memberRow({ id, user_id: USER.id, display_name: 'Asha Rao', role: 'admin', joined_at: '2026-11-18T09:00:00+00:00' });
+    const ravi = () => memberRow({ id: ID.ravi, user_id: RAVI, display_name: 'Ravi Kumar', joined_at: '2026-11-18T10:00:00+00:00' });
+    const priya = () => memberRow({ id: ID.priya, user_id: PRIYA, display_name: 'Priya Shah', joined_at: '2026-11-18T10:30:00+00:00' });
+    const start = dayFromToday(10);
+    const end = dayFromToday(13);
+    const dmy = (isoDay: string) => isoDay.split('-').reverse().join('/');
+    const CAT = { food: uuid(9702) };
+    const seed = (b: FakeBackend) => {
+      const members = [mine(ID.me), ravi(), priya()];
+      b.trips = [tripRow({ id: T.A, name: 'Input Trip', destination: 'Place', start_date: start, end_date: end, members: members.map((m) => ({ id: m.id, status: m.status })), _members: members })];
+      b.expenses = [{
+        id: uuid(8101), tripId: T.A, title: 'Dinner', amount_minor: 120050, category_id: CAT.food, spent_on: addDays(start, 1), notes: null, split_method: 'equal', created_by: ID.me, updated_by: null,
+        created_at: '2026-11-19T10:00:00Z', updated_at: '2026-11-19T10:00:00Z', version: 1, deleted_at: null, deleted_by: null,
+        payers: [{ member_id: ID.me, paid_minor: 120050 }],
+        splits: previewSplit(120050, 'equal', [ID.me, ID.ravi]).map((r) => ({ member_id: r.memberId, share_minor: r.shareMinor, input_value: null })),
+      }];
+    };
+
+    /** Runs the same checks on a desktop-sized and a phone-sized (touch) browser. */
+    const variants: { name: string; options: Record<string, unknown> }[] = [
+      { name: 'desktop', options: { permissions: ['clipboard-read', 'clipboard-write'] } },
+      { name: 'phone', options: { viewport: { width: 360, height: 780 }, isMobile: true, hasTouch: true, deviceScaleFactor: 2, permissions: ['clipboard-read', 'clipboard-write'] } },
+    ];
+    for (const variant of variants) {
+      const V = variant.name;
+      const context = await browser.newContext(variant.options);
+      const backend = newBackend();
+      seed(backend);
+      await installFakeSupabase(context, backend);
+      await sessionInStorage(context);
+      const page = await context.newPage();
+      const logs: string[] = [];
+      page.on('console', (m) => logs.push(m.text()));
+      page.on('pageerror', (e) => logs.push(String(e)));
+      const textOf = async (id: string) => (await byId(page, id).innerText().catch(() => '')).replace(/\s+/g, ' ').trim();
+      const has = async (id: string) => (await byId(page, id).count()) > 0;
+      const settle = (fn: () => Promise<boolean> | boolean) => waitFor(fn, 8000);
+      const calls = (fn: string) => backend.requests.filter((r) => r.method === 'POST' && r.path === `/rest/v1/rpc/${fn}`);
+      const go = async (p: string, wait: string) => {
+        await page.goto(`${BASE}${p}`);
+        return byId(page, wait).waitFor({ timeout: 20000 }).then(() => true, () => false);
+      };
+      const val = (id: string) => byId(page, id).inputValue();
+      /** Empties the box, then types key by key like a person (each key goes through the app's own filter). */
+      const typeInto = async (id: string, text: string) => {
+        const box = byId(page, id);
+        await box.click();
+        await page.keyboard.press('Control+A');
+        await page.keyboard.press('Delete');
+        await page.keyboard.type(text);
+        return box.inputValue();
+      };
+      /** Puts `text` on the clipboard and pastes it over the box's contents (a real paste event). */
+      const pasteInto = async (id: string, text: string) => {
+        await page.evaluate((t) => navigator.clipboard.writeText(t), text);
+        const box = byId(page, id);
+        await box.click();
+        await page.keyboard.press('Control+A');
+        await page.keyboard.press('Control+V');
+        return box.inputValue();
+      };
+      const attr = (id: string, name: string) => byId(page, id).getAttribute(name);
+      const eA = `/trips/${T.A}/expenses`;
+
+      // ------------------------------------------------------------ the expense form: amounts typed key by key
+      check(`${V}: the add form opens`, await go(`${eA}/new`, 'expense-amount'));
+      check(`${V}: 323, 323.4 and 323.45 are accepted as typed`, (await typeInto('expense-amount', '323')) === '323' && (await typeInto('expense-amount', '323.4')) === '323.4' && (await typeInto('expense-amount', '323.45')) === '323.45');
+      check(`${V}: a third decimal digit is not accepted (323.456 shows 323.45)`, (await typeInto('expense-amount', '323.456')) === '323.45');
+      check(`${V}: letters never appear (32abc shows 32)`, (await typeInto('expense-amount', '32abc')) === '32');
+      check(`${V}: a special character never appears (32@ shows 32)`, (await typeInto('expense-amount', '32@')) === '32');
+      check(`${V}: a second decimal point is not accepted (32..45 shows 32.45)`, (await typeInto('expense-amount', '32..45')) === '32.45');
+      check(`${V}: a minus sign never appears`, (await typeInto('expense-amount', '-5')) === '5');
+      check(`${V}: an unfinished 20. may stay while typing`, (await typeInto('expense-amount', '20.')) === '20.');
+      check(`${V}: the amount box asks for a decimal keyboard (hint only) and the label stays`, (await attr('expense-amount', 'inputmode')) === 'decimal', String(await attr('expense-amount', 'inputmode')));
+
+      // pasted text follows the very same rules
+      check(`${V}: pasting a clean amount works`, (await pasteInto('expense-amount', '1200.50')) === '1200.50');
+      check(`${V}: pasting grouped digits works (1,23,456.50 becomes 123456.50)`, (await pasteInto('expense-amount', '1,23,456.50')) === '123456.50');
+      await typeInto('expense-amount', '77');
+      check(`${V}: pasting a third decimal digit changes nothing (the whole paste is refused, never trimmed)`, (await pasteInto('expense-amount', '323.456')) === '77');
+      check(`${V}: pasting letters changes nothing`, (await pasteInto('expense-amount', '32abc')) === '77');
+      check(`${V}: pasting a special character changes nothing`, (await pasteInto('expense-amount', '32@')) === '77');
+      check(`${V}: pasting two decimal points changes nothing`, (await pasteInto('expense-amount', '32..45')) === '77');
+      check(`${V}: pasting a negative number changes nothing`, (await pasteInto('expense-amount', '-5')) === '77');
+
+      // an unfinished or zero total cannot be saved
+      await byId(page, 'expense-title').fill('Input test');
+      await typeInto('expense-amount', '20.');
+      const createsBefore = calls('create_expense').length;
+      await byId(page, 'expense-save').click();
+      check(`${V}: an unfinished 20. is refused at save with its own message, and nothing is sent`, (await settle(async () => /Finish the amount/.test(await textOf('expense-form-error') + (await page.locator('body').innerText())))) && calls('create_expense').length === createsBefore);
+      await typeInto('expense-amount', '0');
+      await byId(page, 'expense-save').click();
+      check(`${V}: a total of 0 is refused at save`, (await settle(async () => (await page.locator('body').innerText()).includes('greater than zero'))) && calls('create_expense').length === createsBefore);
+      await typeInto('expense-amount', '0.00');
+      await byId(page, 'expense-save').click();
+      check(`${V}: a total of 0.00 is refused at save`, (await settle(async () => (await page.locator('body').innerText()).includes('greater than zero'))) && calls('create_expense').length === createsBefore);
+      await typeInto('expense-amount', '');
+      await byId(page, 'expense-save').click();
+      check(`${V}: an empty total is refused at save`, (await settle(async () => (await page.locator('body').innerText()).includes('Enter the amount'))) && calls('create_expense').length === createsBefore);
+
+      // ------------------------------------------------------------ the expense date stays inside the trip
+      check(`${V}: the day box starts inside the trip`, (await val('expense-date')) === dmy(start));
+      check(`${V}: typing a day before the trip is not accepted`, (await typeInto('expense-date', dmy(addDays(start, -1)))) !== dmy(addDays(start, -1)));
+      check(`${V}: typing a day after the trip is not accepted`, (await typeInto('expense-date', dmy(addDays(end, 1)))) !== dmy(addDays(end, 1)));
+      check(`${V}: typing the first day, a middle day and the last day is accepted`, (await typeInto('expense-date', dmy(start))) === dmy(start) && (await typeInto('expense-date', dmy(addDays(start, 1)))) === dmy(addDays(start, 1)) && (await typeInto('expense-date', dmy(end))) === dmy(end));
+      await typeInto('expense-date', dmy(start));
+      check(`${V}: pasting a day outside the trip changes nothing`, (await pasteInto('expense-date', dmy(addDays(end, 1)))) === dmy(start) && (await pasteInto('expense-date', dmy(addDays(start, -1)))) === dmy(start));
+      check(`${V}: pasting a day inside the trip works`, (await pasteInto('expense-date', dmy(addDays(start, 2)))) === dmy(addDays(start, 2)));
+      check(`${V}: an impossible day (32) is not accepted`, !(await typeInto('expense-date', '32')).startsWith('32'));
+      await byId(page, 'expense-date-calendar').click();
+      await byId(page, 'date-picker').waitFor({ timeout: 5000 });
+      // the calendar opens on the trip's month(s): step to the month of the first day if needed
+      const monthOf = (iso: string) => iso.slice(0, 7);
+      for (let i = 0; i < 3 && (await byId(page, `date-picker-day-${start}`).count()) === 0; i++) await byId(page, 'date-picker-next-month').click();
+      const dayDisabled = async (iso: string) => (await byId(page, `date-picker-day-${iso}`).getAttribute('aria-disabled')) === 'true';
+      const before = addDays(start, -1);
+      const after = addDays(end, 1);
+      for (let i = 0; i < 3 && (await byId(page, `date-picker-day-${before}`).count()) === 0 && monthOf(before) !== monthOf(start); i++) await byId(page, 'date-picker-prev-month').click();
+      check(`${V}: in the calendar the day before the trip is disabled`, (await byId(page, `date-picker-day-${before}`).count()) === 0 ? true : await dayDisabled(before));
+      for (let i = 0; i < 3 && (await byId(page, `date-picker-day-${end}`).count()) === 0; i++) await byId(page, 'date-picker-next-month').click();
+      for (let i = 0; i < 3 && (await byId(page, `date-picker-day-${after}`).count()) === 0; i++) await byId(page, 'date-picker-next-month').click();
+      check(`${V}: in the calendar the day after the trip is disabled`, await dayDisabled(after));
+      check(`${V}: and the first, a middle and the last day of the trip are enabled`, !(await dayDisabled(start)) && !(await dayDisabled(addDays(start, 1))) && !(await dayDisabled(end)));
+      const boxBefore = await val('expense-date');
+      await byId(page, `date-picker-day-${after}`).click({ force: true, timeout: 1500 }).catch(() => {});
+      check(`${V}: clicking a disabled day does nothing (the calendar stays open and the box is unchanged)`, (await has('date-picker')) && (await val('expense-date')) === boxBefore);
+      await byId(page, `date-picker-day-${end}`).click();
+      check(`${V}: choosing the last day of the trip fills the box`, (await val('expense-date')) === dmy(end));
+      await page.waitForTimeout(800); // the dialog hands focus back to the calendar button a moment after it closes; a person would not type that fast
+
+      // a good amount and date still save, with the amount converted to whole paise
+      await typeInto('expense-amount', '323.4');
+      await typeInto('expense-date', dmy(addDays(start, 1)));
+      await byId(page, 'expense-save').click();
+      check(`${V}: 323.4 is saved as 32340 paise (integer arithmetic, nothing rounded)`, (await settle(() => calls('create_expense').length === createsBefore + 1)) && calls('create_expense').at(-1)!.body.p_amount_minor === 32340 && calls('create_expense').at(-1)!.body.p_spent_on === addDays(start, 1), JSON.stringify(calls('create_expense').at(-1)?.body) + ' | page: ' + (await page.locator('body').innerText()).replace(/\s+/g, ' ').slice(0, 600));
+
+      // ------------------------------------------------------------ payers, exact amounts, percentages and shares
+      await go(`${eA}/new`, 'expense-amount');
+      await typeInto('expense-amount', '100');
+      await byId(page, `expense-payer-${ID.ravi}`).click();
+      check(`${V}: with two payers each gets an amount box that follows the money rules`, (await has(`expense-payer-amount-${ID.me}`)) && (await typeInto(`expense-payer-amount-${ID.me}`, '6.789')) === '6.78' && (await typeInto(`expense-payer-amount-${ID.ravi}`, '4abc')) === '4' && (await typeInto(`expense-payer-amount-${ID.ravi}`, '-4')) === '4' && (await pasteInto(`expense-payer-amount-${ID.ravi}`, '4.555')) === '4');
+      await byId(page, 'expense-method-exact').click();
+      const exactBox = `expense-split-value-${ID.me}`;
+      check(`${V}: exact amounts follow the money rules (two decimals, no letters, one point)`, (await typeInto(exactBox, '1.234')) === '1.23' && (await typeInto(exactBox, '1x')) === '1' && (await typeInto(exactBox, '1..5')) === '1.5' && (await attr(exactBox, 'inputmode')) === 'decimal');
+      await byId(page, 'expense-method-percentage').click();
+      check(`${V}: percentages take up to two decimals`, (await typeInto(exactBox, '33.333')) === '33.33' && (await typeInto(exactBox, '33.3')) === '33.3' && (await typeInto(exactBox, '33.')) === '33.');
+      check(`${V}: a percentage cannot go over 100, no letters, no minus sign, one point only`, (await typeInto(exactBox, '101')) === '10' && (await typeInto(exactBox, '100.5')) === '100.' && (await typeInto(exactBox, '100')) === '100' && (await typeInto(exactBox, '5x')) === '5' && (await typeInto(exactBox, '-5')) === '5' && (await typeInto(exactBox, '5..5')) === '5.5');
+      check(`${V}: pasting an out-of-range or malformed percentage changes nothing`, (await typeInto(exactBox, '50')) === '50' && (await pasteInto(exactBox, '150')) === '50' && (await pasteInto(exactBox, '12.345')) === '50' && (await pasteInto(exactBox, '33.33')) === '33.33');
+      await byId(page, 'expense-method-shares').click();
+      check(`${V}: shares are whole numbers (no point, minus sign or letters) and ask for a number keypad`, (await typeInto(exactBox, '1.5')) === '15' && (await typeInto(exactBox, '-3')) === '3' && (await typeInto(exactBox, '3x')) === '3' && (await attr(exactBox, 'inputmode')) === 'numeric');
+      check(`${V}: shares stop at the database limit of 1,000,000, and a pasted decimal or oversized number changes nothing`, (await typeInto(exactBox, '1000000')) === '1000000' && (await typeInto(exactBox, '1000001')) === '100000' && (await typeInto(exactBox, '7')) === '7' && (await pasteInto(exactBox, '1.5')) === '7' && (await pasteInto(exactBox, '2000000')) === '7' && (await pasteInto(exactBox, '25')) === '25');
+
+      // ------------------------------------------------------------ editing an expense: the same rules, and plain starting text
+      await go(`${eA}/${uuid(8101)}/edit`, 'expense-amount');
+      check(`${V}: Edit starts with plain digits (1200.50, no grouping comma) so every character can be edited`, (await val('expense-amount')) === '1200.50', await val('expense-amount'));
+      check(`${V}: Edit keeps the day inside the trip too`, (await typeInto('expense-date', dmy(addDays(end, 1)))) !== dmy(addDays(end, 1)) && (await typeInto('expense-date', dmy(addDays(start, 2)))) === dmy(addDays(start, 2)));
+      check(`${V}: Edit lets a digit be removed and retyped`, (await typeInto('expense-amount', '1200.5')) === '1200.5' && (await (async () => { await byId(page, 'expense-amount').press('Backspace'); await byId(page, 'expense-amount').press('Backspace'); return val('expense-amount'); })()) === '1200');
+      await byId(page, 'expense-date-calendar').click();
+      await byId(page, 'date-picker').waitFor({ timeout: 5000 });
+      for (let i = 0; i < 3 && (await byId(page, `date-picker-day-${after}`).count()) === 0; i++) await byId(page, 'date-picker-next-month').click();
+      check(`${V}: Edit calendar disables the day after the trip`, await dayDisabled(after));
+      await byId(page, 'date-picker-close').click();
+
+      // ------------------------------------------------------------ trip dates: creating and editing
+      check(`${V}: the trip form opens`, await go('/trips/new', 'trip-start'));
+      check(`${V}: day 32 is not accepted while typing`, (await typeInto('trip-start', '32')) === '3');
+      check(`${V}: month 13 is not accepted`, (await typeInto('trip-start', '2713')) === '27/1');
+      check(`${V}: day 00 and month 00 are not accepted`, (await typeInto('trip-start', '00')) === '0' && (await typeInto('trip-start', '2700')) === '27/0');
+      check(`${V}: only digits are accepted (letters and symbols never appear)`, (await typeInto('trip-start', '27ab/@12')) === '27/12');
+      check(`${V}: 31 April and 31 June are not accepted, 30 April is`, (await typeInto('trip-start', '3104')) === '31/0' && (await typeInto('trip-start', '3004')) === '30/04');
+      check(`${V}: 29 February is accepted in a leap year (2028) and refused in a common year (2027)`, (await typeInto('trip-start', '29022028')) === '29/02/2028' && (await typeInto('trip-start', '29022027')) === '29/02/202');
+      check(`${V}: 29 February 2100 is refused (2100 is not a leap year) and 29 February 2000 is accepted`, (await typeInto('trip-start', '29022000')) === '29/02/2000');
+      check(`${V}: pasting an impossible date changes nothing`, (await typeInto('trip-start', '27/12/2026')) === '27/12/2026' && (await pasteInto('trip-start', '32/01/2026')) === '27/12/2026' && (await pasteInto('trip-start', '29/02/2027')) === '27/12/2026' && (await pasteInto('trip-start', '13/13/2026')) === '27/12/2026');
+      check(`${V}: pasting a real date works, in any usual spelling`, (await pasteInto('trip-start', '29/02/2028')) === '29/02/2028' && (await pasteInto('trip-start', '2028-03-01')) === '01/03/2028');
+      check(`${V}: a date can always be corrected: backspace, replace the day, replace everything`, await (async () => {
+        await typeInto('trip-start', '27/12/2026');
+        await byId(page, 'trip-start').press('Backspace');
+        const afterBackspace = await val('trip-start');
+        const replaced = await typeInto('trip-start', '30112027');
+        return afterBackspace === '27/12/202' && replaced === '30/11/2027';
+      })());
+      await typeInto('trip-start', '28/02/2027');
+      check(`${V}: the end date box follows the same rules`, (await typeInto('trip-end', '3002')) === '30/0' && (await typeInto('trip-end', '28022027')) === '28/02/2027');
+      await byId(page, 'trip-start-calendar').click();
+      await byId(page, 'date-picker').waitFor({ timeout: 5000 });
+      check(`${V}: the calendar offers 29 February only in a leap year`, await (async () => {
+        const open = async (iso: string) => {
+          await byId(page, 'date-picker-close').click();
+          await typeInto('trip-start', `01/02/${iso}`);
+          await byId(page, 'trip-start-calendar').click();
+          await byId(page, 'date-picker').waitFor({ timeout: 5000 });
+          return byId(page, `date-picker-day-${iso}-02-29`).count();
+        };
+        const leap = await open('2028');
+        const common = await open('2027');
+        return leap === 1 && common === 0;
+      })());
+      const pickIso = `${new Date().getFullYear() + 1}-03-15`;
+      await byId(page, 'date-picker-close').click();
+      await typeInto('trip-start', `01/03/${pickIso.slice(0, 4)}`);
+      await byId(page, 'trip-start-calendar').click();
+      await byId(page, 'date-picker').waitFor({ timeout: 5000 });
+      await byId(page, `date-picker-day-${pickIso}`).click();
+      check(`${V}: a day chosen from the calendar fills the box and passes the typing rules`, (await val('trip-start')) === dmy(pickIso));
+      check(`${V}: no unexpected network calls and no browser errors`, backend.unexpected.length === 0 && logs.filter((l) => /error|exception|unhandled/i.test(l) && !/Failed to load resource|net::ERR|connection/i.test(l)).length === 0, logs.filter((l) => /error|exception|unhandled/i.test(l)).slice(0, 3).join(' | '));
+      if (V === 'phone') {
+        const box = await byId(page, 'trip-start').boundingBox();
+        check('phone: the date box is a comfortable touch target and the page does not scroll sideways', !!box && box.height >= 44 && (await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1)));
+        await shot(page, 'input-validation-phone');
+      }
+      await context.close();
+    }
+  } finally {
+    site.stop();
+  }
+}
+
+async function settlementFlows(browser: Awaited<ReturnType<typeof chromium.launch>>) {
+  console.log('\nP. Suggested payments (settlement plan) in the Balances tab');
+  const site = await startWebsite({ EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY: DUMMY_PUBLISHABLE_KEY, EXPO_PUBLIC_SUPABASE_URL: SUPABASE_URL });
+  try {
+    const ID = { me: uuid(9201), ravi: uuid(9202), priya: uuid(9203), gita: uuid(9204), dev: uuid(9206) } as const;
+    const T = { OWE: uuid(821), OWED: uuid(822), EMPTY: uuid(823), ARCH: uuid(824), BAD: uuid(825), BIG: uuid(826), SETTLED: uuid(827), MANY: uuid(828) };
+    const RAVI = '22222222-2222-4222-8222-222222222222';
+    const PRIYA = '33333333-3333-4333-8333-333333333333';
+    const DEV = '55555555-5555-4555-8555-555555555555';
+    const mine = (id: string) => memberRow({ id, user_id: USER.id, display_name: 'Asha Rao', role: 'admin', joined_at: '2026-11-18T09:00:00+00:00' });
+    const ravi = () => memberRow({ id: ID.ravi, user_id: RAVI, display_name: 'Ravi Kumar', joined_at: '2026-11-18T10:00:00+00:00' });
+    const priya = () => memberRow({ id: ID.priya, user_id: PRIYA, display_name: 'Priya Shah', joined_at: '2026-11-18T10:30:00+00:00' });
+    const gita = () => memberRow({ id: ID.gita, user_id: null, display_name: 'Gita', joined_at: '2026-11-18T11:00:00+00:00' });
+    const dev = () => memberRow({ id: ID.dev, user_id: DEV, display_name: 'Departed Dev', status: 'left', left_at: '2026-11-15T10:00:00+00:00' });
+    const start = dayFromToday(10);
+    const end = dayFromToday(13);
+    const trip = (id: string, name: string, members: Record<string, any>[], over: Record<string, any> = {}) =>
+      tripRow({ id, name, destination: 'Place', start_date: start, end_date: end, members: members.filter((m) => m.status === 'active').map((m) => ({ id: m.id, status: m.status })), _members: members, ...over });
+    let expCounter = 0;
+    const exp = (tripId: string, title: string, amount: number, by: string, shared: string[]): Record<string, any> => ({
+      id: uuid(8200 + ++expCounter), tripId, title, amount_minor: amount, category_id: null, spent_on: start, notes: null, split_method: 'equal', created_by: by, updated_by: null,
+      created_at: '2026-11-19T10:00:00Z', updated_at: '2026-11-19T10:00:00Z', version: 1, deleted_at: null, deleted_by: null,
+      payers: [{ member_id: by, paid_minor: amount }],
+      splits: previewSplit(amount, 'equal', shared).map((r) => ({ member_id: r.memberId, share_minor: r.shareMinor, input_value: null })),
+    });
+    const manyGuests = Array.from({ length: 14 }, (_, i) => memberRow({ id: uuid(9300 + i), user_id: null, display_name: `Guest ${i + 1}`, joined_at: '2026-11-18T11:00:00+00:00' }));
+    const seed = (b: FakeBackend) => {
+      const all = [ID.me, ID.ravi, ID.priya];
+      b.trips = [
+        trip(T.OWE, 'Owe Trip', [mine(ID.me), ravi(), priya()]), // Priya paid 900 for three: Asha and Ravi each owe 300
+        trip(T.OWED, 'Owed Trip', [mine(ID.me), ravi(), priya(), gita()]), // Asha paid 1200 for four: the others each owe 300
+        trip(T.EMPTY, 'Empty Trip', [mine(ID.me), ravi()]),
+        trip(T.ARCH, 'Archived Trip', [mine(ID.me), ravi()], { status: 'archived' }),
+        trip(T.BAD, 'Bad Data Trip', [mine(ID.me), ravi(), dev()]), // a member who left still holds a balance: impossible in the database
+        trip(T.BIG, 'Big Trip', [mine(ID.me), ravi(), priya(), gita()]),
+        trip(T.SETTLED, 'Settled Trip', [mine(ID.me), ravi()]),
+        trip(T.MANY, 'Many Trip', [mine(ID.me), ...manyGuests]), // 15 people: the plan is worked out just after the screen draws
+      ];
+      b.expenses = [
+        exp(T.OWE, 'Hotel', 90000, ID.priya, all),
+        exp(T.OWED, 'Rent', 120000, ID.me, [ID.me, ID.ravi, ID.priya, ID.gita]),
+        exp(T.ARCH, 'Closed lunch', 40000, ID.me, [ID.me, ID.ravi]),
+        exp(T.BAD, 'Old lunch', 30000, ID.me, [ID.me, ID.dev]),
+        exp(T.BIG, 'Dinner', 100000, ID.priya, [ID.me, ID.ravi, ID.priya, ID.gita]),
+        exp(T.SETTLED, 'Cab there', 20000, ID.me, [ID.me, ID.ravi]),
+        exp(T.SETTLED, 'Cab back', 20000, ID.ravi, [ID.me, ID.ravi]),
+        exp(T.MANY, 'Big dinner', 150000, ID.me, [ID.me, ...manyGuests.map((g) => g.id)]),
+      ];
+    };
+
+    const variants: { name: string; options: Record<string, unknown> }[] = [
+      { name: 'desktop', options: {} },
+      { name: 'phone', options: { viewport: { width: 360, height: 780 }, isMobile: true, hasTouch: true, deviceScaleFactor: 2 } },
+    ];
+    for (const variant of variants) {
+      const V = variant.name;
+      const context = await browser.newContext(variant.options);
+      const backend = newBackend();
+      seed(backend);
+      await installFakeSupabase(context, backend);
+      await sessionInStorage(context);
+      const page = await context.newPage();
+      const logs: string[] = [];
+      page.on('console', (m) => logs.push(m.text()));
+      page.on('pageerror', (e) => logs.push(String(e)));
+      const textOf = async (id: string) => (await byId(page, id).innerText().catch(() => '')).replace(/\s+/g, ' ').trim();
+      const has = async (id: string) => (await byId(page, id).count()) > 0;
+      const settle = (fn: () => Promise<boolean> | boolean) => waitFor(fn, 8000);
+      const open = async (tripId: string) => {
+        await page.goto(`${BASE}/trips/${tripId}/expenses`);
+        await byId(page, 'expenses-tab-balances').waitFor({ timeout: 20000 });
+        await byId(page, 'expenses-tab-balances').click();
+        return byId(page, 'settlement-card').waitFor({ timeout: 15000 }).then(() => true, () => false);
+      };
+      const lineTexts = async () => {
+        const n = await page.locator('[data-testid^="settlement-line-"]:visible').count();
+        const out: string[] = [];
+        for (let i = 0; i < n; i++) out.push(await textOf(`settlement-line-${i}`));
+        return out;
+      };
+      const noOverflow = () => page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1);
+
+      // ---- the signed-in person owes
+      check(`${V}: the Balances tab shows a Suggested payments card`, await open(T.OWE));
+      check(`${V}: the personal line says what you pay`, await settle(async () => (await textOf('settlement-mine-0')) === 'You pay Priya Shah ₹300'), await textOf('settlement-mine'));
+      check(`${V}: the full list names everyone in the approved wording`, await settle(async () => JSON.stringify(await lineTexts()) === JSON.stringify(['Asha Rao pays Priya Shah ₹300', 'Ravi Kumar pays Priya Shah ₹300'])), JSON.stringify(await lineTexts()));
+      check(`${V}: the headline counts the payments`, (await textOf('settlement-headline')) === '2 payments settle everyone.', await textOf('settlement-headline'));
+      check(`${V}: it says plainly that nothing is transferred or recorded and that the plan can change`, /does not move any money or record repayments/.test(await textOf('settlement-disclaimer')) && /can change when expenses change/.test(await textOf('settlement-disclaimer')));
+      check(`${V}: a trip this small is never described as approximate`, !(await has('settlement-inexact')));
+      check(`${V}: the existing balances list is still there`, await has('balances-list'));
+      if (V === 'phone') {
+        check('phone: the card does not scroll sideways', await noOverflow());
+        await shot(page, 'settlement-phone');
+      } else {
+        await shot(page, 'settlement-desktop');
+      }
+
+      // ---- the signed-in person is owed
+      check(`${V}: when you are owed, the personal lines say what you receive`, (await open(T.OWED)) && (await settle(async () => (await textOf('settlement-mine')).includes('You receive ₹300 from Gita') && (await textOf('settlement-mine')).includes('You receive ₹300 from Ravi Kumar') && (await textOf('settlement-mine')).includes('You receive ₹300 from Priya Shah'))), await textOf('settlement-mine'));
+      check(`${V}: three payments settle four people`, (await textOf('settlement-headline')) === '3 payments settle everyone.', await textOf('settlement-headline'));
+
+      // ---- nobody owes anything
+      check(`${V}: an empty ledger: everyone is settled, no payments, and the personal line says so`, (await open(T.EMPTY)) && (await settle(async () => (await textOf('settlement-headline')) === 'Everyone is settled.')) && !(await has('settlement-list')) && (await textOf('settlement-mine-0')) === 'You are settled');
+      check(`${V}: expenses that cancel out also leave everyone settled`, (await open(T.SETTLED)) && (await settle(async () => (await textOf('settlement-headline')) === 'Everyone is settled.')) && (await textOf('settlement-mine-0')) === 'You are settled');
+
+      // ---- archived
+      check(`${V}: an archived trip still shows the plan, read-only and marked for reference`, (await open(T.ARCH)) && (await settle(async () => (await textOf('settlement-line-0')) === 'Ravi Kumar pays Asha Rao ₹200')) && /for reference/.test(await textOf('settlement-archived')) && (await textOf('settlement-mine-0')) === 'You receive ₹200 from Ravi Kumar', await textOf('settlement-card'));
+
+      // ---- inconsistent data fails safely
+      const FORMER_MSG = 'Someone who left the trip still has a balance, which should not happen, so no payments can be suggested. Check the expenses that involve people who left.';
+      const noPlanShown = async () => !(await has('settlement-list')) && !(await has('settlement-headline')) && !(await has('settlement-mine-0')) && !(await has('settlement-working'));
+      check(`${V}: a former member holding a balance: its own message, and NO payments`, (await open(T.BAD)) && (await settle(async () => (await textOf('settlement-error')) === FORMER_MSG)) && (await has('settlement-error-former_member_balance')) && (await noPlanShown()), await textOf('settlement-card'));
+      check(`${V}: the plain balances are still shown next to that error`, await has('balances-list'));
+
+      // ---- data the database would never send: each kind of failure has its own message and shows no payments at all
+      const row = (id: string, net: number) => ({ member_id: id, paid_minor: Math.max(net, 0), share_minor: Math.max(-net, 0), net_minor: net });
+      const failureCases: { kind: string; rows: Record<string, unknown>[]; message: string }[] = [
+        { kind: 'not_zero_sum', rows: [row(ID.me, 10000), row(ID.ravi, -5000)], message: "The balances don't add up to zero, so no payments can be suggested. Reload to try again." },
+        { kind: 'unsafe_amount', rows: [row(ID.me, 4503599627370497), row(ID.ravi, -4503599627370497)], message: 'Some amounts are too large or are not valid money amounts, so no payments can be suggested.' },
+        { kind: 'invalid_input', rows: [row(ID.me, 0), row(ID.me, 0)], message: 'The balance information looks invalid, so no payments can be suggested. Reload to try again.' },
+      ];
+      for (const c of failureCases) {
+        backend.balanceRows = { [T.EMPTY]: c.rows };
+        const shown = (await open(T.EMPTY)) && (await settle(async () => (await textOf('settlement-error')) === c.message));
+        check(`${V}: ${c.kind} (${JSON.stringify(c.rows[0]!.net_minor)}): the right message and no payments`, shown && (await has(`settlement-error-${c.kind}`)) && (await noPlanShown()), await textOf('settlement-card'));
+      }
+      // A fractional amount never reaches the plan: the balances service (M5) refuses any row that is not a whole number of paise, so the
+      // whole balances list fails to load (its existing error and Try again) and no balances and no plan are shown at all.
+      backend.balanceRows = { [T.EMPTY]: [row(ID.me, 150.5), row(ID.ravi, -150.5)] };
+      await page.goto(`${BASE}/trips/${T.EMPTY}/expenses`);
+      await byId(page, 'expenses-tab-balances').waitFor({ timeout: 20000 });
+      await byId(page, 'expenses-tab-balances').click();
+      check(`${V}: a fractional amount is refused before planning: the balances error shows, with no balances and no payments`, (await byId(page, 'balances-error').waitFor({ timeout: 90000 }).then(() => true, () => false)) && !(await has('settlement-card')) && !(await has('balances-list')));
+      backend.balanceRows = null;
+      check(`${V}: and a good ledger afterwards plans normally again`, (await open(T.EMPTY)) && (await settle(async () => (await textOf('settlement-headline')) === 'Everyone is settled.')) && !(await has('settlement-error')));
+
+      // ---- a bigger group
+      check(`${V}: four people with one payer`, (await open(T.BIG)) && (await settle(async () => (await textOf('settlement-headline')) === '3 payments settle everyone.')), await textOf('settlement-headline'));
+
+      // ---- more than 12 people: worked out just after the screen draws
+      check(`${V}: fifteen people: the plan appears (14 payments, everyone pays the one who paid)`, (await open(T.MANY)) && (await settle(async () => (await textOf('settlement-headline')) === '14 payments settle everyone.')) && !(await has('settlement-working')) && (await textOf('settlement-mine')).includes('You receive ₹100 from Guest'), await textOf('settlement-card'));
+
+      // ---- nothing here moves money
+      const sends = backend.requests.filter((r) => r.method !== 'GET' && r.method !== 'OPTIONS');
+      check(`${V}: the app sent nothing but balance and member reads (no expense, member or money write of any kind)`, sends.length > 0 && sends.every((r) => /\/rpc\/(trip_member_balances|list_trip_members)$/.test(r.path)), sends.map((r) => r.path).filter((p, n, a) => a.indexOf(p) === n).join(', '));
+      check(`${V}: no unexpected network calls and no browser errors`, backend.unexpected.length === 0 && logs.filter((l) => /error|exception|unhandled/i.test(l) && !/Failed to load resource|net::ERR|connection/i.test(l)).length === 0, logs.filter((l) => /error|exception|unhandled/i.test(l)).slice(0, 3).join(' | '));
+      await context.close();
+    }
+
+    // ---- dark theme
+    {
+      const ctx = await browser.newContext({ colorScheme: 'dark' });
+      const b = newBackend();
+      b.profile = { ...b.profile, theme_preference: 'dark' };
+      seed(b);
+      await installFakeSupabase(ctx, b);
+      await sessionInStorage(ctx);
+      const dk = await ctx.newPage();
+      await dk.goto(`${BASE}/trips/${T.OWE}/expenses`);
+      await dk.locator('[data-testid="expenses-tab-balances"]:visible').waitFor({ timeout: 20000 });
+      await dk.locator('[data-testid="expenses-tab-balances"]:visible').click();
+      await dk.locator('[data-testid="settlement-card"]:visible').waitFor({ timeout: 15000 });
+      check('dark: the suggested payments card uses the dark background', (await screenBg(dk)) === DARK_BG, await screenBg(dk));
+      await ctx.close();
+    }
+  } finally {
+    site.stop();
+  }
+}
+
 async function main() {
   const browser = await chromium.launch({ channel: 'msedge', headless: true });
   try {
@@ -2843,6 +4280,14 @@ async function main() {
       await memberFlows(browser); // quick re-run of one scenario alone while developing
     } else if (process.env.UI_ONLY === 'L') {
       await inviteFlows(browser);
+    } else if (process.env.UI_ONLY === 'M') {
+      await expenseFlows(browser);
+    } else if (process.env.UI_ONLY === 'N') {
+      await splitFlows(browser);
+    } else if (process.env.UI_ONLY === 'O') {
+      await inputFlows(browser);
+    } else if (process.env.UI_ONLY === 'P') {
+      await settlementFlows(browser);
     } else {
       await setupScreens(browser);
       await accountFlows(browser);
@@ -2853,6 +4298,10 @@ async function main() {
       await dateFlows(browser);
       await memberFlows(browser);
       await inviteFlows(browser);
+      await expenseFlows(browser);
+      await splitFlows(browser);
+      await inputFlows(browser);
+      await settlementFlows(browser);
     }
   } finally {
     await browser.close();

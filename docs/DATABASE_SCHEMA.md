@@ -261,6 +261,8 @@ Seeded system categories (MVP): `transportation`, `accommodation`, `food`, `shop
 **Constraints:** `UNIQUE (COALESCE(trip_id, zero-uuid), key)`.
 
 ### 4.6 `expenses`
+
+> **M5 design (ADR-063, approved with amendments; not built yet):** the date column is `spent_on date` (not `spent_at timestamptz`), `scope` is limited to `shared` and `split_method` to `equal` by check constraints for now (widened later by forward migrations), the database derives the equal split, and the full design is in section 9.
 **Purpose:** The central record: one shared (or personal) spend.
 
 | Column | Type | Constraints |
@@ -332,6 +334,8 @@ Multi-currency (Feature 15) later adds nullable columns (`original_amount_minor`
 **Indexes:** `(trip_member_id)`.
 
 ### 4.9 `expense_revisions`
+
+> **M5 design (ADR-063):** the table also carries `trip_id` (composite foreign key with `expense_id`) so only ACTIVE members of the trip can read it; the snapshot holds member ids and amounts only (no user ids, emails or display names). See section 9.6.
 **Purpose:** Immutable audit/history of every create, edit, delete and restore (feeds activity feed, trust features and the future dispute feature).
 
 | Column | Type | Constraints |
@@ -534,3 +538,78 @@ The RLS membership check (`is_trip_member(trip_id)`) runs on almost every query,
 - Every schema change is a numbered, reviewed migration file in version control; no manual changes in the dashboard.
 - Each environment (dev, staging, prod) is built **only** by applying the same migrations.
 - Tests (pgTAP) must cover: sum constraints, RLS isolation between two trips, state-machine transitions, and the append-only guarantees.
+
+
+---
+
+## 9. Migration #8: expenses (M5, ADR-063) - BUILT AND TESTED LOCALLY (file `20261123200000_expenses.sql`), NOT APPLIED TO LIVE SUPABASE
+
+Forward-only; migrations 1 to 7 stay exactly as applied. Existing functions are not rewritten.
+
+**As built (differences from the design):** the keys that point at `trip_members` are `deferrable initially deferred` (still enforced when the change is saved) so removing a whole trip works in any cascade order; `expenses.id` is the primary key and `(id, trip_id)` is also unique; a category must be a system category or belong to the same trip (function preflight plus a trigger on `expenses`); create checks a retry (full canonical content, same creator, not deleted) BEFORE the state checks, so a retry still works after, for example, a participant left; deleting an already deleted expense and restoring one that is not deleted are safe repeats (`changed = false`), so there is no `expense_not_deleted` code; extra codes `shares_total_mismatch` (backstop) and the `net_minor=<paise>` error detail on `balance_not_settled` and `former_member_balance`.
+
+### 9.0 Checkpoint 2 guards (migration #9, `20261124000000_expense_guards.sql`; built and tested locally, NOT applied live)
+Three independent last-line guards, as triggers, for rules that migration #8 enforced only inside the functions: (1) the trip's **currency is fixed** (`trips_currency_guard`, `currency_locked`; update_trip never had a currency input); (2) an `expense_payers` or `expense_splits` row can only be **written for an active member of the same trip** (`expense_rows_member_guard`, `payer_not_active` or `participant_not_active`; stored history for people who later left is untouched); (3) the stored shares of an equal-split expense must equal the database's own derivation (`check_expense_equal_split`, deferred, `shares_not_equal_split`, runs after the sums check). No existing function or migration was rewritten.
+
+**Migration #10 (`20261124100000_expense_row_guard_updates.sql`, local, NOT applied live):** the two row guards of migration #9 (`expense_payers_member_guard`, `expense_splits_member_guard`) now fire on `BEFORE INSERT OR UPDATE` (any column), closing a gap found in review: an UPDATE of only `paid_minor` or `share_minor` on a row whose member had left slipped past the guard (owner-only SQL; the app can never do it). The same function is used; nothing else changes. Note on migration #9's header comment: the equal-split check runs after the sums check only between triggers on the same table; across tables the order is the order the events were queued. Every check still runs at save time and any failure rolls everything back, so this only affects which error code is reported.
+
+### 9.0b Checkpoint 5: exact, percentage and shares splits (migration #11, `20261125000000_expense_split_methods.sql`; built and tested locally, NOT applied live)
+- **Methods:** `equal` (unchanged), `exact` (typed amounts that add up to the total; zero allowed), `percentage` (typed basis points, 100% = 10000, 1 to 10000 each, adding up to exactly 10000) and `shares` (typed whole weights, 1 to 1,000,000). The table check `expenses_split_method_equal_only` is replaced by `expenses_split_method_values`; `expense_splits.input_value` (already in the schema) now holds the typed value (null for equal) and must be a whole number.
+- **The database derives every share** (the app sends only the method and each person's typed value). Percentage and shares use the approved largest-remainder rule with those numbers as weights: `share = floor(total x weight / sum)`, leftover paise one each to the largest remainder (`total x weight mod sum`), ties to the lowest member id as plain text in the "C" collation. Equal is the same rule with every weight 1 (tested). Exact amounts are used as typed. New internal functions (not callable by the app): `allocate_weighted`, `expense_parse_split_inputs`, `expense_derive_shares`, `expense_derive_from_request`, `expense_splits_json_v2`, `check_expense_split_inputs`; `expense_check_shape` gained the `p_split_inputs` argument.
+- **Signatures:** `create_expense` and `update_expense` gain one trailing parameter `p_split_inputs jsonb default null` (`[{"member_id": "...", "value": 1234}]`, exactly the participants, strictly shaped). The old signatures are dropped; a call with the old arguments still works through the default. Grants are unchanged (signed-in users only).
+- **New codes:** `split_total_mismatch` (exact amounts or percentages do not add up), `invalid_split_value` (a typed value out of range), `split_not_derived` (final guard). Retries compare the method and every typed value; history snapshots carry the typed values (`input_value` inside each split entry) and never any name or account id.
+- **Final enforcement:** a deferred trigger checks that the stored shares of every non-equal expense equal what the database derives from the stored typed values, and that an equal expense holds none. Rule I-1, the locks, versions, ADR-043 and ADR-047 are unchanged and tested with the new methods.
+
+### 9.1 Decisions this design implements
+Database functions derive and validate equal splits; TypeScript is the reference and preview; `spent_on date`; the ADR-043 date guard considers non-deleted expenses and restore re-checks the current dates; triggers enforce ADR-043 and ADR-047 with function-level preflight; an additive unique index on `trip_members (id, trip_id)`; rule I-1 for former members; multiple payers whose amounts add up exactly to the total; first-pass splits are equal among all active members and equal among selected active members (the screen sends the explicit participant list); personal expenses and exact, percentage and shares splits are deferred.
+
+### 9.2 Tables
+| Table | Final columns and constraints |
+|---|---|
+| `trip_members` (existing) | **Additive only:** unique index on `(id, trip_id)` so other tables can use composite foreign keys |
+| `categories` | `id`, `trip_id` (null = system), `key`, `name`, `icon`, `sort_order`, `archived_at`; unique `key` where `trip_id` is null; seeded: transportation, accommodation, food, shopping, activities, fuel_tolls, other; custom categories deferred |
+| `expenses` | `id uuid` (client-generated), `trip_id`, `title` 1 to 120 (trimmed), `amount_minor bigint` 1 to 10^12, `category_id` null, `spent_on date`, `notes` up to 1000, `scope` (check = shared), `split_method` (check = equal), `created_by`, `updated_by`, `created_at`, `updated_at`, `version` default 1, `deleted_at`, `deleted_by`; unique `(id, trip_id)`; at most 2000 per trip (so sums stay far below the JavaScript safe-integer limit) |
+| `expense_payers` | `expense_id`, `trip_id`, `trip_member_id`, `paid_minor > 0`; primary key `(expense_id, trip_member_id)`; composite FKs to `expenses (id, trip_id)` and `trip_members (id, trip_id)` |
+| `expense_splits` | same shape with `share_minor >= 0` and `input_value` (null for equal) |
+| `expense_revisions` | `id` identity, `expense_id`, `trip_id`, `version`, `action` (create, update, delete, restore), `snapshot jsonb`, `changed_by` (a trip member id), `changed_at`; unique `(expense_id, version)`; composite FK `(expense_id, trip_id)` |
+
+Deferred constraint triggers (checked at commit): payments add up to the amount; shares add up to the amount; a shared expense has at least one payer and one split row. Indexes as in section 7.
+
+### 9.3 Functions (all SECURITY DEFINER, `search_path = ''`, `auth.uid()`, revoked from public and anon, granted to `authenticated`)
+```
+create_expense(p_trip_id, p_expense_id, p_title, p_amount_minor, p_spent_on, p_category_key, p_notes,
+               p_split_method, p_participants uuid[], p_payers jsonb)  -> (expense_id, version, created)
+update_expense(p_trip_id, p_expense_id, p_expected_version, ...same fields...) -> (expense_id, version, changed)
+delete_expense(p_trip_id, p_expense_id, p_expected_version)                    -> (expense_id, version, changed)
+restore_expense(p_trip_id, p_expense_id, p_expected_version)                   -> (expense_id, version, changed)
+trip_member_balances(p_trip_id) -> (member_id, paid_minor, share_minor, net_minor)   -- every member, including former
+```
+- **Permissions:** create: any active member; update, delete, restore: an administrator on any expense, a member only on their own; archived trips refuse every write; strangers, former members and pending requesters get `trip_not_found`.
+- **`trip_member_balances` (amendment 1):** raises `not_authenticated` without a login; checks `trip_role_of(trip, auth.uid())` itself and answers `trip_not_found` unless the caller is an ACTIVE member of that trip (no reliance on row-level security); reads stay allowed on archived trips; execution is revoked from public and anon and granted to `authenticated` only.
+- **Create is idempotent:** same id and identical content returns `created = false`; the same id with different content (or belonging to another trip) answers `expense_id_taken` and reveals nothing. An update that changes nothing returns `changed = false`, with no revision and no version bump.
+- **Preflight (clear coded errors, before any write):** trip_not_found, not_allowed, trip_archived, expense_not_found, version_conflict, expense_deleted, expense_not_deleted, expense_id_taken, invalid_expense, payers_total_mismatch, participant_not_active, payer_not_active, outside_trip_dates, category_not_found, too_many_expenses, former_member_balance. Participants and payers must be distinct active members of the trip; on an edit the replacement lists contain active members only (which is how a former member is dropped from a historical expense).
+- **Internal (not callable by the app):** `allocate_equal(total, uuid[])`, `member_net_minor(trip, member)`, `assert_member_settled(trip, member)`, `assert_expenses_within_dates(trip, start, end)`, `assert_former_members_settled(trip, member_ids)`, and the trigger functions.
+
+### 9.4 Rules and guards (amendments 2 and 3)
+- **Rounding:** `allocate_equal` gives every participant `floor(total / n)` and one extra paisa to the first `total mod n` participants ordered by `id::text collate "C"`.
+- **Balance:** `net(m) = sum(paid) - sum(share)` over NON-DELETED shared expenses of the trip, former members included. Zero-sum across the trip. (M7 extends the same function with repayments and ADR-047 then tests both the confirmed and the projected figure.)
+- **Rule I-1 (final enforcement inside the write functions, after the rows are written and before commit):** for every former member (removed or left) appearing in the old OR new rows of the changed expense, `net` is recomputed over the COMPLETE resulting ledger of the trip; any non-zero value raises `former_member_balance` and the whole transaction rolls back (rows, version and revision included). Create can only involve active members, so it cannot change a former member's balance, but the check runs for uniformity.
+- **ADR-047 trigger:** `BEFORE UPDATE OF status ON trip_members FOR EACH ROW WHEN (old.status = 'active' AND new.status <> 'active')` calls `assert_member_settled`; a non-zero balance raises `balance_not_settled` with the signed paise amount in the error detail. It covers `remove_member`, `leave_trip` and any other path. Claiming a guest keeps the same member row, so balances carry over and the trigger does not fire.
+- **ADR-043 trigger:** `BEFORE UPDATE OF start_date, end_date ON trips FOR EACH ROW WHEN (dates changed)` calls `assert_expenses_within_dates`; only NON-DELETED expenses count; a stranded expense raises `expenses_outside_dates`. `restore_expense` re-checks the current trip dates (`outside_trip_dates`). Archiving, currency and every other column are not affected.
+- **Lock ordering:** every write function takes `member_change_context` (caller checks, then the trip row `FOR UPDATE`, then the archived check), then the expense row `FOR UPDATE`; never the reverse. The guard triggers and helpers only READ (no `FOR UPDATE`, `FOR SHARE` or `LOCK`), so they add no lock, and the existing membership functions keep their order (trip lock, then member rows). A change made by direct SQL outside the functions is not serialised by the triggers (an operator action, documented as a residual).
+
+### 9.5 Transaction sequence of an expense write
+1. `auth.uid()` must not be null. 2. `member_change_context` (active member, trip locked, archived refused). 3. Lock the expense row; ownership (administrator or creator); expected version. 4. Preflight validation against the locked state. 5. Write rows, bump the version, insert the revision. 6. Rule I-1 on the complete resulting ledger. 7. At commit the deferred constraints verify the sums.
+
+### 9.6 Revision history: access and exposure (amendment 4)
+- **Read:** row-level security policy `is_trip_member(trip_id)`: ACTIVE members only. A person who left or was removed, a stranger and a pending requester see nothing, as for every other trip table.
+- **Content:** the snapshot holds expense fields (title, amount, date, category key, notes, split method), payer and split rows as trip-member ids with amounts, and `changed_by` as a trip-member id. It never holds user ids, emails or display names, so names resolve through `trip_members` (which already anonymises when an account is deleted) and no personal data is frozen in history. A test pins the allowed snapshot keys.
+- **Write:** no INSERT, UPDATE or DELETE grant to any app role; no write policies; an append-only trigger blocks UPDATE and DELETE (and TRUNCATE) except the automatic cascade when a whole trip is removed (the same `pg_trigger_depth() > 1` mechanism as `trip_member_events`). The same SELECT-only, members-only pattern applies to the other new tables.
+
+### 9.7 Tests (what must exist before Checkpoint 1 is accepted)
+- **Existing behaviour:** the whole existing database suite (313 tests) passes unchanged; `remove_member` and `leave_trip` with a zero balance behave and audit exactly as before; claiming a guest who has expenses keeps their balance on the same member id; source checks that the triggers and helpers contain no locks and fire only on the stated columns.
+- **Access:** every caller kind for every function, including signed out; `trip_member_balances` (signed out, stranger, former, pending, active, archived trip); revision reads by active, former, stranger and pending callers; app roles cannot update or delete revisions or any financial table.
+- **I-1 against the complete ledger (amendment 3):** create (a former member cannot be a payer or participant; nothing about former balances changes); edit (a zero-contribution historical expense can drop a former member; a non-zero one is refused and nothing changes, including version and revision; a seeded state where a former member already has a non-zero balance elsewhere makes even a zero-contribution edit refuse, which proves the whole ledger is used); delete and restore likewise, including restoring an expense after the person left; ADR-047 refusal with the amount in the detail; ADR-043 date change (non-deleted only, restore re-check).
+- **Golden vectors (amendment 5):** one hand-verified fixture file used by both the core tests and the database tests. Each vector states the expected individual allocations AND the expected member balances after every step: exact thirds (Rs 10.00 among three = 334, 333, 333 to ids in ascending order), one paisa among three (1, 0, 0), 100 paise among seven (15, 15 then 14 five times), tie-breaking with ids mixing letters and digits, multiple payers (20000 and 10000 paid for a 30000 expense), a payer who is not a participant, a sole payer who is the sole participant, deleted then restored, a former member with a zero contribution leaving, one with a non-zero balance refused, a claimed guest, a returning member, and the 10^12 cap. Randomised parity (thousands of cases and random create, edit, delete, restore, remove and leave sequences) then asserts SQL equals TypeScript, the zero-sum invariant, I-1, ADR-043 and ADR-047 after every step.
+- **Concurrency:** a real simultaneous run is not possible in the local engine, so (as in M3.5) it is covered by "second caller after the first" simulations and source checks that every write takes the trip lock first.
+- **Security audit:** the function allow-list grows by the five functions; table grants are SELECT only; every function pins `search_path`; the signed-out allow-list stays `preview_invite` only; internal helpers and trigger functions are not callable by the app; mutation checks on every rule.

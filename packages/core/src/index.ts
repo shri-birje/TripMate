@@ -19,3 +19,5 @@ export * from './expense';
 export * from './expenseView';
 export * from './expenseHistory';
 export * from './inputFilter';
+export * from './settlementPlan';
+export * from './settlementView';

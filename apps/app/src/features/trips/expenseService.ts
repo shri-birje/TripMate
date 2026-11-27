@@ -349,6 +349,8 @@ export async function getTripBalances(client: ExpenseClient, tripId: string): Pr
   return rows.map((r) => {
     const row = asRecord(r);
     if (!row || typeof row.member_id !== 'string' || ![row.paid_minor, row.share_minor, row.net_minor].every((n) => typeof n === 'number' && Number.isSafeInteger(n))) throw E('unknown');
+    // M7: sent_minor and received_minor are optional (absent before migration #12) but, when present, must be whole safe numbers
+    for (const extra of [row.sent_minor, row.received_minor]) if (extra !== undefined && !(typeof extra === 'number' && Number.isSafeInteger(extra))) throw E('unknown');
     return balanceLineFromRow(row as unknown as BalanceRowRecord);
   });
 }

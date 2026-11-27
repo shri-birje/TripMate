@@ -379,14 +379,27 @@ export interface BalanceRowRecord {
   member_id: string;
   paid_minor: number;
   share_minor: number;
+  /** M7: the confirmed repayments this member made / received (those with no applied reversal). Absent before migration #12. */
+  sent_minor?: number;
+  received_minor?: number;
   net_minor: number;
 }
 export interface TripBalanceLine {
   memberId: string;
   paidMinor: number;
   shareMinor: number;
-  /** paid - owed. Positive: should receive money. Negative: owes money. Zero: settled. */
+  /** M7: confirmed, unreversed repayments made and received. Absent when the database predates migration #12 (then they count as nothing). */
+  sentMinor?: number;
+  receivedMinor?: number;
+  /** paid - owed (+ sent - received since M7). Positive: should receive money. Negative: owes money. Zero: settled. */
   netMinor: number;
 }
-export const balanceLineFromRow = (r: BalanceRowRecord): TripBalanceLine => ({ memberId: r.member_id, paidMinor: r.paid_minor, shareMinor: r.share_minor, netMinor: r.net_minor });
+export const balanceLineFromRow = (r: BalanceRowRecord): TripBalanceLine => ({
+  memberId: r.member_id,
+  paidMinor: r.paid_minor,
+  shareMinor: r.share_minor,
+  ...(r.sent_minor !== undefined ? { sentMinor: r.sent_minor } : {}),
+  ...(r.received_minor !== undefined ? { receivedMinor: r.received_minor } : {}),
+  netMinor: r.net_minor,
+});
 export const isSettled = (line: TripBalanceLine): boolean => line.netMinor === 0;

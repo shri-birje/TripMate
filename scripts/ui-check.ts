@@ -38,8 +38,8 @@ const DUMMY_PUBLISHABLE_KEY = 'sb_publishable_dummy_key_for_ui_tests_only';
 const FAKE_SECRET_KEY = 'sb_secret_FAKE_DO_NOT_USE_0000';
 const SHOTS = process.env.UI_CHECK_SHOTS ?? path.join(process.cwd(), 'ui-check-screenshots');
 
-const LIGHT_BG = 'rgb(246, 242, 233)';
-const DARK_BG = 'rgb(18, 22, 20)';
+const LIGHT_BG = 'rgb(244, 238, 225)';
+const DARK_BG = 'rgb(16, 16, 16)';
 
 let passed = 0;
 const failures: string[] = [];
@@ -52,6 +52,38 @@ function check(name: string, ok: boolean, detail = '') {
     failures.push(name);
     console.log(`  FAIL  ${name}${detail ? `  (${detail})` : ''}`);
   }
+}
+
+/** The status chips are drawn in capitals (innerText follows the CSS), so compare them as written words. */
+const titleCase = (t: string) => t.trim().charAt(0).toUpperCase() + t.trim().slice(1).toLowerCase();
+
+/** Home shows one status at a time: opens that status tab and returns the text of its list. */
+async function phaseText(page: Page, phase: 'completed' | 'ongoing' | 'upcoming'): Promise<string> {
+  await byId(page, `status-${phase}`).click();
+  const list = byId(page, `section-${phase}`);
+  await list.waitFor({ timeout: 8000 });
+  return (await list.innerText()).replace(/\s+/g, ' ');
+}
+
+/** Whether Home lists this trip in ANY status tab (it shows one status at a time). Leaves the tab where the card was found. */
+async function homeHasCard(page: Page, id: string): Promise<boolean> {
+  for (const ph of ['ongoing', 'upcoming', 'completed'] as const) {
+    const tab = byId(page, `status-${ph}`);
+    if ((await tab.count()) === 0) return false;
+    await tab.click();
+    await page.waitForTimeout(150);
+    if ((await byId(page, `trip-card-${id}`).count()) > 0) return true;
+  }
+  return false;
+}
+/** Waits until Home lists this trip in some status tab, and leaves that tab selected. */
+async function showHomeCard(page: Page, id: string, timeout = 20000): Promise<boolean> {
+  const end = Date.now() + timeout;
+  while (Date.now() < end) {
+    if (await homeHasCard(page, id)) return true;
+    await page.waitForTimeout(300);
+  }
+  return false;
 }
 
 // --------------------------------------------------------------------------
@@ -126,6 +158,10 @@ interface FakeBackend {
   joinRequests: Record<string, any>[];
   /** Force the invitation functions to answer with this database message (or drop the connection). */
   inviteFail: null | string;
+  /** Reads of the expense tables, with the first row index each page asked for. */
+  expenseReadRequests: { table: string; from: number }[];
+  /** When set, any expense page that starts at or after this row number fails with a connection error. */
+  failExpensePageFrom: number | null;
   /** Delay, in ms, before the invitation functions answer (to test double taps). */
   slowInviteMs: number;
   /** The expenses that exist (the fake keeps payers and the derived shares inside each). */
@@ -184,6 +220,8 @@ function newBackend(): FakeBackend {
     invites: [],
     joinRequests: [],
     inviteFail: null,
+    expenseReadRequests: [],
+    failExpensePageFrom: null,
     slowInviteMs: 0,
     expenses: [],
     revisions: [],
@@ -283,7 +321,22 @@ function seedRequest(over: Record<string, any>): Record<string, any> {
   };
 }
 
-async function installFakeSupabase(context: BrowserContext, backend: FakeBackend) {
+/**
+ * Day cards on the Expenses screen start collapsed, which is correct for people but means every older check that reads an expense row would
+ * first have to open its day. So, unless a scenario says `keepCollapsed`, this page-side helper opens each day card once, the moment it appears.
+ */
+const AUTO_EXPAND_SCRIPT = `(() => {
+  const done = new WeakSet();
+  const open = () => {
+    document.querySelectorAll('[data-testid^="expense-day-toggle-"][aria-expanded="false"]').forEach((el) => {
+      if (!done.has(el)) { done.add(el); el.click(); }
+    });
+  };
+  new MutationObserver(open).observe(document, { childList: true, subtree: true, attributes: true, attributeFilter: ['aria-expanded'] });
+})();`;
+
+async function installFakeSupabase(context: BrowserContext, backend: FakeBackend, opts: { keepCollapsed?: boolean } = {}) {
+  if (!opts.keepCollapsed) await context.addInitScript(AUTO_EXPAND_SCRIPT);
   await context.route(/supabase\.co/, async (route: Route, request: Request) => {
     const url = new URL(request.url());
     const method = request.method();
@@ -449,8 +502,9 @@ async function installFakeSupabase(context: BrowserContext, backend: FakeBackend
       const authHeader = request.headers()['authorization'] ?? '';
       const signedIn = authHeader !== '' && authHeader !== `Bearer ${DUMMY_PUBLISHABLE_KEY}`;
       if (backend.inviteFail === 'network') return route.abort('connectionfailed');
+      if (backend.inviteFail === 'network-link' && inviteFn === 'get_general_invite_link') return route.abort('connectionfailed');
       if (backend.slowInviteMs > 0) await new Promise((r) => setTimeout(r, backend.slowInviteMs));
-      if (backend.inviteFail) return failWith(backend.inviteFail);
+      if (backend.inviteFail && backend.inviteFail !== 'network-link') return failWith(backend.inviteFail);
 
       const live = (token: unknown) => {
         const i = typeof token === 'string' && /^[0-9a-f]{64}$/.test(token) ? backend.invites.find((x) => x.token === token) : undefined;
@@ -645,11 +699,32 @@ async function installFakeSupabase(context: BrowserContext, backend: FakeBackend
         return json(200, backend.revisions.filter((r) => r.trip_id === wanted && r.expense_id === wantedExpense).sort((a, b) => a.version - b.version).map((r) => ({ version: r.version, action: r.action, snapshot: r.snapshot, changed_by: r.changed_by, changed_at: r.changed_at })));
       }
       const rows = backend.expenses.filter((e) => e.tripId === wanted);
+      // Like PostgREST: honour the Range header, never return more than 1,000 rows in one response, and report the exact total when asked.
+      const pageOf = (all: any[]) => {
+        // supabase-js sends .range(from, to) as the offset and limit query parameters
+        const hasPaging = url.searchParams.has('offset') || url.searchParams.has('limit');
+        const from = Number(url.searchParams.get('offset') ?? 0);
+        const to = Math.min(from + Number(url.searchParams.get('limit') ?? 1000) - 1, from + 999);
+        backend.expenseReadRequests.push({ table: expenseTable as string, from });
+        const slice = all.slice(from, to + 1);
+        const wantsCount = /count=exact/.test(request.headers()['prefer'] ?? '');
+        return route.fulfill({
+          status: hasPaging && all.length > 0 && slice.length < all.length ? 206 : 200,
+          contentType: 'application/json',
+          headers: { 'access-control-allow-origin': '*', 'access-control-expose-headers': 'content-range', ...(wantsCount ? { 'content-range': `${slice.length ? `${from}-${from + slice.length - 1}` : '*'}/${all.length}` } : {}) },
+          body: JSON.stringify(slice),
+        });
+      };
+      if (backend.failExpensePageFrom !== null && Number(url.searchParams.get('offset') ?? 0) >= backend.failExpensePageFrom) return route.abort('connectionfailed');
+      if (backend.failExpensePageFrom !== null && (/^(\d+)-/.exec(request.headers()['range'] ?? '')?.[1] ?? '0') !== '0' && Number(/^(\d+)-/.exec(request.headers()['range'] ?? '')?.[1]) >= backend.failExpensePageFrom) return route.abort('connectionfailed');
+      const byId = (x: string, y: string) => (x < y ? -1 : x > y ? 1 : 0);
       if (expenseTable === 'expenses') {
-        return json(200, [...rows].sort((a, b) => (a.spent_on < b.spent_on ? 1 : a.spent_on > b.spent_on ? -1 : b.created_at.localeCompare(a.created_at))).map((e) => Object.fromEntries(Object.entries(e).filter(([k]) => !['payers', 'splits', 'tripId'].includes(k)))));
+        return pageOf([...rows].sort((a, b) => (a.spent_on !== b.spent_on ? byId(b.spent_on, a.spent_on) : a.created_at !== b.created_at ? byId(b.created_at, a.created_at) : byId(b.id, a.id))).map((e) => Object.fromEntries(Object.entries(e).filter(([k]) => !['payers', 'splits', 'tripId'].includes(k)))));
       }
-      if (expenseTable === 'expense_payers') return json(200, rows.flatMap((e) => e.payers.map((p: any) => ({ expense_id: e.id, trip_member_id: p.member_id, paid_minor: p.paid_minor }))));
-      return json(200, rows.flatMap((e) => e.splits.map((p: any) => ({ expense_id: e.id, trip_member_id: p.member_id, share_minor: p.share_minor, input_value: p.input_value ?? null }))));
+      const pairs = (key: 'payers' | 'splits') => rows.flatMap((e) => e[key].map((p: any) => ({ e, p })));
+      const ordered = (list: { e: any; p: any }[]) => list.sort((x, y) => byId(x.e.id, y.e.id) || byId(x.p.member_id, y.p.member_id));
+      if (expenseTable === 'expense_payers') return pageOf(ordered(pairs('payers')).map(({ e, p }) => ({ expense_id: e.id, trip_member_id: p.member_id, paid_minor: p.paid_minor })));
+      return pageOf(ordered(pairs('splits')).map(({ e, p }) => ({ expense_id: e.id, trip_member_id: p.member_id, share_minor: p.share_minor, input_value: p.input_value ?? null })));
     }
     const EXPENSE_FNS = ['create_expense', 'update_expense', 'delete_expense', 'restore_expense', 'trip_member_balances'];
     const expenseFn = url.pathname.replace('/rest/v1/rpc/', '');
@@ -795,7 +870,7 @@ const vis = (page: Page, text: string) => page.getByText(text).filter({ visible:
 /** The colour behind the top-left corner of the screen: walks up from that point to the first element that paints a background. */
 const screenBg = (page: Page) =>
   page.evaluate(() => {
-    let el: Element | null = document.elementFromPoint(4, 4);
+    let el: Element | null = document.elementFromPoint(window.innerWidth - 4, 4); // top-right: on a wide window the left edge is the side navigation
     while (el) {
       const bg = getComputedStyle(el).backgroundColor;
       if (bg && bg !== 'rgba(0, 0, 0, 0)' && bg !== 'transparent') return bg;
@@ -808,6 +883,7 @@ const pathOf = (page: Page) => new URL(page.url()).pathname;
 
 async function shot(page: Page, name: string) {
   mkdirSync(SHOTS, { recursive: true });
+  await page.waitForTimeout(350); // let the page's short fade-in finish so the picture shows the finished screen
   await page.screenshot({ path: path.join(SHOTS, `${name}.png`) });
 }
 
@@ -872,14 +948,19 @@ async function accountFlows(browser: Awaited<ReturnType<typeof chromium.launch>>
       const page = await context.newPage();
 
       await page.goto(`${BASE}/`);
-      await byId(page, 'email').waitFor({ timeout: 20000 });
-      check('opening the app signed out lands on sign-in', pathOf(page) === '/sign-in', pathOf(page));
+      await byId(page, 'landing').waitFor({ timeout: 20000 });
+      check('opening the website signed out shows the public landing page', pathOf(page) === '/welcome', pathOf(page));
       check('first launch is LIGHT', (await screenBg(page)) === LIGHT_BG, await screenBg(page));
-      await shot(page, 'sign-in-light');
+      await shot(page, 'landing-light');
 
       await page.goto(`${BASE}/profile`);
+      await byId(page, 'landing').waitFor({ timeout: 20000 });
+      check('a protected page (/profile) sends a signed-out web visitor to the landing page', pathOf(page) === '/welcome', pathOf(page));
+
+      await byId(page, 'hero-login').click();
       await byId(page, 'email').waitFor({ timeout: 20000 });
-      check('a protected page (/profile) sends a signed-out visitor to sign-in', pathOf(page) === '/sign-in', pathOf(page));
+      check('Log in on the landing page opens sign-in', pathOf(page) === '/sign-in', pathOf(page));
+      await shot(page, 'sign-in-light');
 
       await byId(page, 'submit').click();
       const emailErr = await vis(page, 'Enter a valid email address').waitFor({ timeout: 5000 }).then(() => true, () => false);
@@ -964,12 +1045,12 @@ async function signedInFlows(browser: Awaited<ReturnType<typeof chromium.launch>
     check('a page reload keeps the user signed in', stillIn);
 
     // Profile
-    await byId(page, 'open-profile').click();
+    await byId(page, 'nav-profile').click();
     await byId(page, 'profile-name').waitFor({ timeout: 8000 });
     check('profile form is filled from the account', (await byId(page, 'profile-name').inputValue()) === 'Asha Rao');
-    check('shows the signed-in email', (await byId(page, 'account-email').innerText()) === 'asha@example.com');
+    check('shows the signed-in email', (await byId(page, 'profile-email').innerText()) === 'asha@example.com');
     check('Save is disabled until something changes (and announced as disabled)', (await byId(page, 'save-profile').getAttribute('aria-disabled')) === 'true');
-    check('accessibility: the selected theme is announced as checked', (await byId(page, 'theme-light').getAttribute('aria-checked')) === 'true' && (await byId(page, 'theme-dark').getAttribute('aria-checked')) === 'false');
+    check('the Profile screen no longer holds the theme or sign-out controls (they are in Settings)', (await byId(page, 'theme-dark').count()) === 0 && (await byId(page, 'sign-out').count()) === 0);
 
     await byId(page, 'profile-name').fill('Asha R');
     await byId(page, 'profile-upi').fill('not valid');
@@ -988,7 +1069,11 @@ async function signedInFlows(browser: Awaited<ReturnType<typeof chromium.launch>
     check('values are correct', patch?.body.display_name === 'Asha R' && patch?.body.upi_id === 'asha@okhdfcbank' && patch?.body.preferred_currency === 'USD');
     check('the update is limited to this user\'s row', decodeURIComponent(patch?.path ?? '').includes(`id=eq.${USER.id}`));
 
-    // Theme
+    // Theme (Settings, opened from the gear on Profile)
+    await byId(page, 'open-settings').click();
+    await byId(page, 'theme-dark').waitFor({ timeout: 8000 });
+    check('Settings opens from the Profile gear and the bottom navigation is hidden there', pathOf(page) === '/settings' && (await byId(page, 'bottom-nav').count()) === 0, pathOf(page));
+    check('accessibility: the selected theme is announced as checked', (await byId(page, 'theme-light').getAttribute('aria-checked')) === 'true' && (await byId(page, 'theme-dark').getAttribute('aria-checked')) === 'false');
     await byId(page, 'theme-dark').click();
     check('choosing Dark switches the whole screen to dark', await waitFor(async () => (await screenBg(page)) === DARK_BG));
     check('accessibility: Dark is now announced as the checked option', (await byId(page, 'theme-dark').getAttribute('aria-checked')) === 'true' && (await byId(page, 'theme-light').getAttribute('aria-checked')) === 'false');
@@ -996,18 +1081,15 @@ async function signedInFlows(browser: Awaited<ReturnType<typeof chromium.launch>
     const themePatch = await waitFor(() => backend.requests.some((r) => r.method === 'PATCH' && r.body?.theme_preference === 'dark'));
     check('the choice is saved to the account', themePatch);
     await page.reload();
-    await byId(page, 'profile-name').waitFor({ timeout: 10000 });
+    await byId(page, 'theme-dark').waitFor({ timeout: 10000 });
     check('Dark persists after a reload', await waitFor(async () => (await screenBg(page)) === DARK_BG));
 
     await byId(page, 'theme-light').click();
     check('choosing Light switches back', await waitFor(async () => (await screenBg(page)) === LIGHT_BG));
     await shot(page, 'profile-light');
 
-    // System follows the device
-    await byId(page, 'theme-system').click();
-    check('System follows a dark device', await waitFor(async () => (await screenBg(page)) === DARK_BG));
-    await page.emulateMedia({ colorScheme: 'light' });
-    check('...and follows it back to light live', await waitFor(async () => (await screenBg(page)) === LIGHT_BG));
+    // There is no System option any more: only Light and Dark are offered
+    check('Settings offers only Light and Dark (no System option anywhere)', (await byId(page, 'theme-system').count()) === 0 && (await byId(page, 'theme-light').count()) === 1 && (await byId(page, 'theme-dark').count()) === 1);
 
     // Account is source of truth on another device
     await byId(page, 'theme-dark').click();
@@ -1018,8 +1100,38 @@ async function signedInFlows(browser: Awaited<ReturnType<typeof chromium.launch>
     const otherPage = await other.newPage();
     await otherPage.goto(BASE);
     await byId(otherPage, 'greeting').waitFor({ timeout: 20000 });
-    check('a second device (no saved local choice) picks up Dark from the account', await waitFor(async () => (await screenBg(otherPage)) === DARK_BG, 10000));
+    check('a second device (no saved local choice) picks up Dark from the account', await waitFor(async () => (await screenBg(otherPage)) === DARK_BG, 10000), `${await screenBg(otherPage)} account=${String(backend.profile.theme_preference)}`);
     await other.close();
+
+    // A choice made on THIS device beats a different account value (Light on the device, Dark on the account)
+    const keep = await browser.newContext({ colorScheme: 'light' });
+    await keep.addInitScript(() => window.localStorage.setItem('tripmate.theme-preference', 'light'));
+    await installFakeSupabase(keep, backend);
+    await sessionInStorage(keep);
+    const keepPage = await keep.newPage();
+    await keepPage.goto(BASE);
+    await byId(keepPage, 'greeting').waitFor({ timeout: 20000 });
+    await keepPage.waitForTimeout(800);
+    check('device Light + account Dark: the device choice wins (stays Light)', (await screenBg(keepPage)) === LIGHT_BG && backend.profile.theme_preference === 'dark', await screenBg(keepPage));
+    await keep.close();
+
+    // An old saved "system" becomes a real Light or Dark (the device is dark here) and is stored as such
+    const legacy = await browser.newContext({ colorScheme: 'dark' });
+    await legacy.addInitScript(() => {
+      if (!window.sessionStorage.getItem('seeded')) {
+        window.sessionStorage.setItem('seeded', '1');
+        window.localStorage.setItem('tripmate.theme-preference', 'system');
+      }
+    });
+    await installFakeSupabase(legacy, backend);
+    await sessionInStorage(legacy);
+    const legacyPage = await legacy.newPage();
+    await legacyPage.goto(BASE);
+    await byId(legacyPage, 'greeting').waitFor({ timeout: 20000 });
+    check('a legacy saved "system" on a dark device resolves to Dark, with no flash of the other theme', await waitFor(async () => (await screenBg(legacyPage)) === DARK_BG, 10000), await screenBg(legacyPage));
+    const rewritten = await legacyPage.evaluate(() => window.localStorage.getItem('tripmate.theme-preference'));
+    check('...and is stored as "dark" from then on', rewritten === 'dark', String(rewritten));
+    await legacy.close();
 
     // Failed theme save
     backend.failProfileWrites = true;
@@ -1031,14 +1143,14 @@ async function signedInFlows(browser: Awaited<ReturnType<typeof chromium.launch>
 
     // Sign out
     await byId(page, 'sign-out').click();
-    const out = await byId(page, 'email').waitFor({ timeout: 10000 }).then(() => true, () => false);
-    check('signing out returns to sign-in', out && pathOf(page) === '/sign-in', pathOf(page));
+    const out = await byId(page, 'landing').waitFor({ timeout: 10000 }).then(() => true, () => false);
+    check('signing out returns to the public website', out && pathOf(page) === '/welcome', pathOf(page));
     check('the saved session is removed from the browser', (await page.evaluate((k) => window.localStorage.getItem(k), STORAGE_KEY)) === null);
     check('the logout request signs out this device only', authRequests(backend, '/auth/v1/logout').some((r) => r.path.includes('scope=local')), JSON.stringify(authRequests(backend, '/auth/v1/logout').map((r) => r.path)));
     await page.goto(`${BASE}/profile`);
-    await byId(page, 'email').waitFor({ timeout: 10000 });
-    check('after sign-out, /profile is protected again', pathOf(page) === '/sign-in', pathOf(page));
-    check('the theme choice still applies on the sign-in screen (device setting)', (await screenBg(page)) === LIGHT_BG);
+    await byId(page, 'landing').waitFor({ timeout: 10000 });
+    check('after sign-out, /profile is protected again', pathOf(page) === '/welcome', pathOf(page));
+    check('the theme choice still applies on the public website (device setting)', (await screenBg(page)) === LIGHT_BG);
 
     check('no unexpected network calls in the whole run', backend.unexpected.length === 0, backend.unexpected.join(', '));
     await context.close();
@@ -1068,7 +1180,7 @@ async function tripFlows(browser: Awaited<ReturnType<typeof chromium.launch>>) {
     await shot(page, 'home-empty');
 
     // ---- form validation
-    await byId(page, 'create-trip').click();
+    await byId(page, 'nav-create').click();
     await byId(page, 'trip-name').waitFor({ timeout: 8000 });
     check('"Create a trip" opens the form', pathOf(page) === '/trips/new', pathOf(page));
     await byId(page, 'create-trip-submit').click();
@@ -1117,14 +1229,16 @@ async function tripFlows(browser: Awaited<ReturnType<typeof chromium.launch>>) {
     check('...and nothing that could set the creator, id or status', !!call && JSON.stringify(Object.keys(call.body).sort()) === JSON.stringify(['p_budget_minor', 'p_currency', 'p_description', 'p_destination', 'p_end_date', 'p_name', 'p_start_date']), JSON.stringify(Object.keys(call?.body ?? {})));
     check('the request carries the user\'s login, not a secret key', !!call?.auth?.startsWith('Bearer ') && !call.auth.includes('sb_secret'));
 
-    await byId(page, 'section-upcoming').waitFor({ timeout: 8000 });
+    await byId(page, 'status-ongoing').waitFor({ timeout: 8000 });
     const text = async (id: string) => (await byId(page, id).innerText().catch(() => ''));
-    check('the new trip appears under Upcoming', (await text('section-upcoming')).includes('Goa Trip 2026'));
-    check('a trip happening today is under Ongoing', (await text('section-ongoing')).includes('Ongoing Manali'));
-    check('a finished trip is under Completed', (await text('section-completed')).includes('Old Jaipur'));
+    check('Home opens on Ongoing, with Ongoing the middle of Completed | Ongoing | Upcoming', (await byId(page, 'status-ongoing').getAttribute('aria-selected')) === 'true' && (await page.locator('[role="tab"]:visible').allInnerTexts()).join('|') === 'Completed|Ongoing|Upcoming', `${await byId(page, 'status-ongoing').getAttribute('aria-selected')} / ${(await page.locator('[role="tab"]:visible').allInnerTexts()).join('|')}`);
+    check('a trip happening today is under Ongoing', (await phaseText(page, 'ongoing')).includes('Ongoing Manali'));
+    check('a finished trip is under Completed', (await phaseText(page, 'completed')).includes('Old Jaipur'));
+    check('the new trip appears under Upcoming', (await phaseText(page, 'upcoming')).includes('Goa Trip 2026'));
     check('an archived trip is not shown', !(await page.locator('body').innerText()).includes('Archived Secret'));
     const goa = await text(`trip-card-${backend.trips[0]!.id}`);
     check('the card shows place, dates and budget', goa.includes('Goa, India') && goa.includes(formatDateRange(startIso, endIso)) && goa.includes('Budget ₹60,000'), goa.replace(/\n/g, ' | '));
+    await byId(page, 'status-ongoing').click();
     check('the card counts only people still on the trip', (await text('trip-card-trip-ongoing')).includes('2 people'));
     check('a single member reads "1 person"', goa.includes('1 person'));
     await shot(page, 'home-trips-light');
@@ -1132,7 +1246,7 @@ async function tripFlows(browser: Awaited<ReturnType<typeof chromium.launch>>) {
     // ---- double tap while saving
     backend.createMode = 'slow';
     const before = rpcCalls().length;
-    await byId(page, 'create-trip').click();
+    await byId(page, 'nav-create').click();
     await byId(page, 'trip-name').waitFor();
     await byId(page, 'trip-name').fill('Double Tap Trip');
     await byId(page, 'trip-destination').fill('Gokarna');
@@ -1146,7 +1260,7 @@ async function tripFlows(browser: Awaited<ReturnType<typeof chromium.launch>>) {
 
     // ---- server rejects (rule the form could not catch)
     backend.createMode = 'dates_error';
-    await byId(page, 'create-trip').click();
+    await byId(page, 'nav-create').click();
     await byId(page, 'trip-name').waitFor();
     await byId(page, 'trip-name').fill('Rejected Trip');
     await byId(page, 'trip-destination').fill('Somewhere');
@@ -1182,7 +1296,7 @@ async function tripFlows(browser: Awaited<ReturnType<typeof chromium.launch>>) {
     check('if trips cannot be loaded the person sees a clear message and a retry button', errShown && (await byId(failPage, 'trips-retry').isVisible()));
     backend.failTripsList = false;
     await byId(failPage, 'trips-retry').click();
-    check('"Try again" recovers and shows the trips', await byId(failPage, 'section-upcoming').waitFor({ timeout: 10000 }).then(() => true, () => false));
+    check('"Try again" recovers and shows the trips', await byId(failPage, 'section-ongoing').waitFor({ timeout: 10000 }).then(() => true, () => false));
     await failCtx.close();
 
     check('no unexpected network calls in the trips run', backend.unexpected.length === 0, backend.unexpected.join(', '));
@@ -1256,7 +1370,7 @@ async function detailFlows(browser: Awaited<ReturnType<typeof chromium.launch>>)
 
     // ---- open from Home
     await page.goto(BASE);
-    await byId(page, `trip-card-${GOA}`).waitFor({ timeout: 20000 });
+    await showHomeCard(page, GOA);
     const label = (await byId(page, `trip-card-${GOA}`).getAttribute('aria-label')) ?? '';
     check('accessibility: the trip card is a button that names the trip', label.startsWith('Open trip Goa Trip 2026, Goa, India'), label);
     await byId(page, `trip-card-${GOA}`).click();
@@ -1265,7 +1379,7 @@ async function detailFlows(browser: Awaited<ReturnType<typeof chromium.launch>>)
 
     // ---- what the page shows
     check('shows the trip name and destination', (await textOf('trip-title')) === 'Goa Trip 2026' && (await textOf('trip-destination')) === 'Goa, India');
-    check('shows the phase (starts in 30 days = Upcoming)', (await textOf('trip-phase')) === 'Upcoming');
+    check('shows the phase (starts in 30 days = Upcoming)', titleCase(await textOf('trip-phase')) === 'Upcoming');
     check('shows the date range and the length in days', (await textOf('trip-dates')) === formatDateRange(startIso, endIso) && (await textOf('trip-length')) === '4 days', `${await textOf('trip-dates')} / ${await textOf('trip-length')}`);
     check('shows the description', (await textOf('trip-description')) === 'Beach, food and friends');
     check('shows the budget and the currency', (await textOf('trip-budget')) === '₹60,000' && (await textOf('trip-currency')) === 'INR');
@@ -1319,7 +1433,7 @@ async function detailFlows(browser: Awaited<ReturnType<typeof chromium.launch>>)
     await open(CREATOR_LEFT);
     check('if the creator is no longer on the trip: "a former member"', (await textOf('trip-creator')) === 'Created by a former member');
     await open(ARCHIVED);
-    check('a member can open an archived trip, with a clear notice', (await textOf('trip-archived')) === 'This trip is archived.' && (await textOf('trip-phase')) === 'Completed');
+    check('a member can open an archived trip, with a clear notice', (await textOf('trip-archived')) === 'This trip is archived.' && titleCase(await textOf('trip-phase')) === 'Completed');
 
     // ---- not available: ONE message for every cause
     const message = async () => (await textOf('trip-unavailable'));
@@ -1361,6 +1475,7 @@ async function detailFlows(browser: Awaited<ReturnType<typeof chromium.launch>>)
     await byId(page, 'former-toggle').click();
     check('a member sees the former members too, with their note', (await textOf('former-p3')).includes('A Former Friend') && (await textOf('former-note-p3')).startsWith('Left '));
     await page.setViewportSize({ width: 360, height: 780 });
+    await page.waitForTimeout(500); // the layout switches from the desktop dashboard to the phone layout
     check('phone width: a very long former name wraps; no sideways scrolling', await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1));
     check('phone width: the toggle is a comfortable touch target (44 px)', ((await byId(page, 'former-toggle').boundingBox())?.height ?? 0) >= 44);
     await shot(page, 'details-former-phone');
@@ -1380,8 +1495,8 @@ async function detailFlows(browser: Awaited<ReturnType<typeof chromium.launch>>)
       await installFakeSupabase(anon, anonBackend);
       const p = await anon.newPage();
       await p.goto(`${BASE}/trips/${GOA}`);
-      await byId(p, 'email').waitFor({ timeout: 20000 });
-      check('opening a trip address while signed out goes to sign-in', pathOf(p) === '/sign-in', pathOf(p));
+      await byId(p, 'landing').waitFor({ timeout: 20000 });
+      check('opening a trip address while signed out goes to the public website', pathOf(p) === '/welcome', pathOf(p));
       check('...and no trip data is requested', !anonBackend.requests.some((r) => r.path.startsWith('/rest/v1/trips')));
       await anon.close();
     }
@@ -1429,7 +1544,7 @@ async function detailFlows(browser: Awaited<ReturnType<typeof chromium.launch>>)
       for (const c of cases) {
         await p.goto(`${BASE}/trips/${c.id}`);
         await byId(p, 'trip-title').waitFor({ timeout: 20000 });
-        const phase = (await byId(p, 'trip-phase').innerText()).trim();
+        const phase = titleCase(await byId(p, 'trip-phase').innerText());
         const days = (await byId(p, 'trip-length').innerText()).trim();
         if (phase !== c.phase || days !== c.days) allGood = false;
         results.push(`${c.name}: ${phase}, ${days}`);
@@ -1437,9 +1552,9 @@ async function detailFlows(browser: Awaited<ReturnType<typeof chromium.launch>>)
       check(`${zone} (today is ${today}): starts-today and ends-today are Ongoing, tomorrow Upcoming, yesterday Completed, lengths right`, allGood, results.join(' | '));
       await p.goto(BASE);
       await byId(p, 'section-ongoing').waitFor({ timeout: 20000 });
-      const ongoing = (await byId(p, 'section-ongoing').innerText()).replace(/\s+/g, ' ');
-      const upcoming = (await byId(p, 'section-upcoming').innerText()).replace(/\s+/g, ' ');
-      const completed = (await byId(p, 'section-completed').innerText()).replace(/\s+/g, ' ');
+      const ongoing = await phaseText(p, 'ongoing');
+      const upcoming = await phaseText(p, 'upcoming');
+      const completed = await phaseText(p, 'completed');
       check(`${zone}: the Home list agrees with the details page`, ongoing.includes('Starts today') && ongoing.includes('Ends today') && ongoing.includes('One day today') && upcoming.includes('Starts tomorrow') && completed.includes('Ended yesterday') && !ongoing.includes('Starts tomorrow'), ongoing.slice(0, 120));
       await ctx.close();
     }
@@ -1558,8 +1673,9 @@ async function editFlows(browser: Awaited<ReturnType<typeof chromium.launch>>) {
     check('the request carries the user\'s login, not a secret key', !!u1?.auth?.startsWith('Bearer ') && !u1.auth.includes('sb_secret'));
     check('the trip page shows the new details', (await text('trip-title')) === 'Edited Trip' && (await text('trip-destination')) === 'New Place' && (await text('trip-budget')) === '₹75,000.50' && (await text('trip-description')) === 'No description' && (await text('trip-dates')) === formatDateRange(newStart, newEnd));
     await byId(page, 'trip-back-home').click();
-    await byId(page, 'section-upcoming').waitFor({ timeout: 10000 });
-    check('Home shows the new name', (await text('section-upcoming')).includes('Edited Trip') && !(await text('section-upcoming')).includes('Edit Me'));
+    await byId(page, 'greeting').waitFor({ timeout: 10000 });
+    const upcomingAfterEdit = await phaseText(page, 'upcoming');
+    check('Home shows the new name', upcomingAfterEdit.includes('Edited Trip') && !upcomingAfterEdit.includes('Edit Me'));
 
     // the second edit starts from the NEW version
     await go(`/trips/${T.EDIT}/edit`, 'trip-name');
@@ -1639,22 +1755,20 @@ async function editFlows(browser: Awaited<ReturnType<typeof chromium.launch>>) {
       await installFakeSupabase(anon, anonBackend);
       const p = await anon.newPage();
       await p.goto(`${BASE}/trips/${T.EDIT}/edit`);
-      await byId(p, 'email').waitFor({ timeout: 20000 });
-      check('signed out, the edit address goes to sign-in and requests nothing', pathOf(p) === '/sign-in' && !anonBackend.requests.some((r) => r.path.startsWith('/rest/v1/trips') || r.path.startsWith('/rest/v1/rpc')));
+      await byId(p, 'landing').waitFor({ timeout: 20000 });
+      check('signed out, the edit address goes to the public website and requests nothing', pathOf(p) === '/welcome' && !anonBackend.requests.some((r) => r.path.startsWith('/rest/v1/trips') || r.path.startsWith('/rest/v1/rpc')));
       await anon.close();
     }
 
-    // ============ Home: archived section ============
+    // ============ Archived screen ============
+    await go('/archived', 'section-archived');
+    check('the Archived screen shows "Archived (n)" counting only trips this person can access', (await text('section-archived')).toLowerCase().includes(`archived (${archivedExpected()})`) && !(await page.locator('body').innerText()).includes('Hidden Archived'), await text('section-archived'));
     await go('/', 'greeting');
-    await byId(page, 'section-archived').waitFor({ timeout: 10000 });
-    check('Home shows an "Archived (n)" section counting only trips this person can access', (await text('archived-toggle')).includes(`Archived (${archivedExpected()})`) && !(await page.locator('body').innerText()).includes('Hidden Archived'), await text('archived-toggle'));
-    check('it is collapsed by default (no archived card showing)', !(await exists(`trip-card-${T.ARCH_UP}`)));
-    check('archived trips are not in Ongoing, Upcoming or Completed', !/Archived/.test((await text('section-ongoing')) + (await text('section-upcoming')) + (await text('section-completed'))));
-    check('accessibility: the toggle says it is collapsed', (await byId(page, 'archived-toggle').getAttribute('aria-expanded')) === 'false');
-    await byId(page, 'archived-toggle').click();
+    check('archived trips are not in Ongoing, Upcoming or Completed, and Home has no archived toggle', !/Archived/.test((await phaseText(page, 'ongoing')) + (await phaseText(page, 'upcoming')) + (await phaseText(page, 'completed'))) && !(await exists('archived-toggle')));
+    await go('/archived', 'section-archived');
     await byId(page, `trip-card-${T.ARCH_UP}`).waitFor({ timeout: 5000 });
-    check('expanding shows the archived trips, each tagged "Archived"', (await exists(`archived-tag-${T.ARCH_UP}`)) && (await exists(`archived-tag-${T.ARCH_PAST}`)) && (await byId(page, 'archived-toggle').getAttribute('aria-expanded')) === 'true');
-    await shot(page, 'home-archived');
+    check('the archived trips are listed, each tagged "Archived"', (await exists(`archived-tag-${T.ARCH_UP}`)) && (await exists(`archived-tag-${T.ARCH_PAST}`)));
+    await shot(page, 'archived-screen');
     await byId(page, `trip-card-${T.ARCH_UP}`).click();
     check('an archived trip opens its page, with the Archived notice', await byId(page, 'trip-archived').waitFor({ timeout: 8000 }).then(() => true, () => false));
 
@@ -1681,9 +1795,10 @@ async function editFlows(browser: Awaited<ReturnType<typeof chromium.launch>>) {
     check('confirming archives the trip', archivedShown && (await text('trip-notice')) === 'Trip archived.');
     check('the request is exactly: this trip, archive, the current version', !!a1 && JSON.stringify(a1.body) === JSON.stringify({ p_trip_id: T.ONGOING, p_archived: true, p_expected_version: 1 }), JSON.stringify(a1?.body));
     check('an archived trip offers Restore and no longer offers Edit or Archive', (await exists('trip-restore')) && !(await exists('trip-edit')) && !(await exists('trip-archive')));
-    await byId(page, 'trip-back-home').click();
-    await byId(page, 'section-archived').waitFor({ timeout: 10000 });
-    check('on Home it left Ongoing and the Archived count went up by one', !(await text('section-ongoing').catch(() => '')).includes('Ongoing Trip') && (await text('archived-toggle')).includes(`Archived (${archivedExpected()})`), await text('archived-toggle'));
+    await go('/', 'greeting');
+    check('on Home it left Ongoing', !(await phaseText(page, 'ongoing').catch(() => '')).includes('Ongoing Trip'));
+    await go('/archived', 'section-archived');
+    check('...and the Archived count went up by one', (await text('section-archived')).toLowerCase().includes(`archived (${archivedExpected()})`), await text('section-archived'));
 
     // archived by someone else behind the page's back: archiving again is safe, not an error
     await go(`/trips/${T.STALE_ARCH}`, 'trip-archive');
@@ -1749,14 +1864,14 @@ async function editFlows(browser: Awaited<ReturnType<typeof chromium.launch>>) {
       const after = row(id);
       check(`${label}: nothing else about the trip changed`, (['name', 'destination', 'start_date', 'end_date', 'description', 'budget_minor', 'currency', 'created_by'] as const).every((k) => after[k] === beforeRow[k]) && after.status === 'active');
       await byId(page, 'trip-back-home').click();
-      await byId(page, `section-${section}`).waitFor({ timeout: 10000 });
-      check(`${label}: it returns to the "${section}" group on Home`, (await text(`section-${section}`)).includes(name));
+      await byId(page, 'greeting').waitFor({ timeout: 10000 });
+      check(`${label}: it returns to the "${section}" group on Home`, (await phaseText(page, section as 'completed' | 'ongoing' | 'upcoming')).includes(name));
     };
     await restoreAndCheck(T.ARCH_ONG, 'Archived Ongoing', 'ongoing', 'restoring a trip whose dates are happening now');
     await restoreAndCheck(T.ARCH_UP, 'Archived Upcoming', 'upcoming', 'restoring a future trip');
     await restoreAndCheck(T.ARCH_PAST, 'Archived Past', 'completed', 'restoring a finished trip');
-    await go('/', 'greeting');
-    check('the Archived count always equals the archived trips this person can access', (await text('archived-toggle')).includes(`Archived (${archivedExpected()})`), await text('archived-toggle'));
+    await go('/archived', 'section-archived');
+    check('the Archived count always equals the archived trips this person can access', (await text('section-archived')).toLowerCase().includes(`archived (${archivedExpected()})`), await text('section-archived'));
 
     // members cannot restore
     await go(`/trips/${T.ARCH_MEMBER}`, 'trip-archived');
@@ -1808,12 +1923,12 @@ async function editFlows(browser: Awaited<ReturnType<typeof chromium.launch>>) {
         await byId(p, 'trip-end').fill(asDmy(end));
         await byId(p, 'edit-save').click();
         await byId(p, 'trip-title').waitFor({ timeout: 10000 });
-        return (await byId(p, 'trip-phase').innerText()).trim();
+        return titleCase(await byId(p, 'trip-phase').innerText());
       };
       const homeHas = async (section: string) => {
         await p.goto(BASE);
-        await byId(p, `section-${section}`).waitFor({ timeout: 20000 }).catch(() => {});
-        return (await byId(p, `section-${section}`).innerText().catch(() => '')).includes('Zone Trip');
+        await byId(p, 'greeting').waitFor({ timeout: 20000 }).catch(() => {});
+        return (await phaseText(p, section as 'completed' | 'ongoing' | 'upcoming').catch(() => '')).includes('Zone Trip');
       };
       const startsToday = await edit(today, addDays(today, 2));
       const h1 = await homeHas('ongoing');
@@ -1832,9 +1947,11 @@ async function editFlows(browser: Awaited<ReturnType<typeof chromium.launch>>) {
       await byId(p, 'trip-archive').click();
       await byId(p, 'confirm-confirm').click();
       await byId(p, 'trip-archived').waitFor({ timeout: 8000 });
-      await p.goto(BASE);
+      await p.goto(`${BASE}/archived`);
       await byId(p, 'section-archived').waitFor({ timeout: 20000 });
-      const gone = !(await byId(p, 'section-upcoming').innerText().catch(() => '')).includes('Zone Trip');
+      await p.goto(BASE);
+      await byId(p, 'greeting').waitFor({ timeout: 20000 });
+      const gone = !(await phaseText(p, 'upcoming').catch(() => '')).includes('Zone Trip');
       await p.goto(`${BASE}/trips/${Z}`);
       await byId(p, 'trip-restore').click();
       await byId(p, 'confirm-confirm').click();
@@ -2143,8 +2260,8 @@ async function dateFlows(browser: Awaited<ReturnType<typeof chromium.launch>>) {
       await byId(page, 'date-picker').waitFor({ timeout: 5000 });
       await page.waitForTimeout(800); // let the fade-in finish
       const bg = (id: string) => byId(page, id).evaluate((e) => getComputedStyle(e).backgroundColor);
-      const wantSelected = theme === 'dark' ? 'rgb(127, 176, 143)' : 'rgb(31, 77, 58)';
-      const wantSurface = theme === 'dark' ? 'rgb(27, 37, 32)' : 'rgb(252, 250, 245)';
+      const wantSelected = 'rgb(47, 93, 68)'; // the forest-green fill in both themes
+      const wantSurface = theme === 'dark' ? 'rgb(28, 28, 28)' : 'rgb(235, 227, 208)';
       check(`${theme} theme: the calendar uses the theme's surface and its selected-day colour`, (await bg('date-picker')) === wantSurface && (await bg('date-picker-day-2026-12-27')) === wantSelected, `${await bg('date-picker')} / ${await bg('date-picker-day-2026-12-27')}`);
       await shot(page, `calendar-${theme}`);
       await ctx.close();
@@ -2380,7 +2497,7 @@ async function memberFlows(browser: Awaited<ReturnType<typeof chromium.launch>>)
     await byId(page, 'leave-trip').click();
     await byId(page, 'confirm-confirm').click();
     check('confirming sends only the trip', await settle(() => calls('leave_trip').length === leavesBefore + 1) && JSON.stringify(calls('leave_trip').at(-1)!.body) === JSON.stringify({ p_trip_id: T.A }));
-    check('you land on Home, and the trip is no longer in your list', (await byId(page, 'greeting').waitFor({ timeout: 8000 }).then(() => true, () => false)) && pathOf(page) === '/' && !(await exists(`trip-card-${T.A}`)));
+    check('you land on Home, and the trip is no longer in your list', (await byId(page, 'greeting').waitFor({ timeout: 8000 }).then(() => true, () => false)) && pathOf(page) === '/' && !(await homeHasCard(page, T.A)));
     check('opening that trip again gives the single "not available" message', await go(T.A, 'trip-unavailable'));
 
     // =============== an ordinary member ===============
@@ -2537,7 +2654,7 @@ async function memberFlows(browser: Awaited<ReturnType<typeof chromium.launch>>)
       await byId(p, 'confirm-dialog').waitFor({ timeout: 5000 });
       await p.waitForTimeout(800);
       const surface = await byId(p, 'confirm-dialog').evaluate((e) => getComputedStyle(e).backgroundColor);
-      check('Dark theme: the confirmation uses the dark surface', surface === 'rgb(27, 37, 32)', surface);
+      check('Dark theme: the confirmation uses the dark surface', surface === 'rgb(28, 28, 28)', surface);
       await shot(p, 'people-confirm-dark');
       await dark.close();
     }
@@ -2625,21 +2742,27 @@ async function inviteFlows(browser: Awaited<ReturnType<typeof chromium.launch>>)
     await byId(page, 'invite-link').waitFor({ timeout: 8000 });
     const firstToken = lastInvite().token as string;
     const linkText = await textOf(page, 'invite-link');
-    check('the link is shown as <address>/join/<64-character token>, and says it can be copied again later', new RegExp(`^${BASE.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/join/[0-9a-f]{64}$`).test(linkText) && linkText.endsWith(firstToken) && /copy it again any time/.test(await textOf(page, 'invite-once-warning')) && !/shown only once/.test(await textOf(page, 'invite-once-warning')), linkText);
-    check('it explains that people only send a request', /only sends a request|only send a request/.test(await textOf(page, 'invite-created-note')) && !/Replace link/.test(await textOf(page, 'invite-created-note')));
-    await byId(page, 'invite-copy').click();
-    check('Copy link puts the link on the clipboard and says so', (await byId(page, 'invite-copied').waitFor({ timeout: 5000 }).then(() => true, () => false)) && (await page.evaluate(() => navigator.clipboard.readText())) === linkText);
-    await shot(page, 'invite-created-light');
-    await byId(page, 'invite-done').click();
-    await settle(async () => !(await has(page, 'invite-link')));
-    check('after Done the secret link is gone from the page', !(await has(page, 'invite-link')) && !(await body(page)).includes(firstToken));
+    check('the link is shown as <address>/join/<64-character token>, in ONE panel, selectable and wrapping without overflow', new RegExp(`^${BASE.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/join/[0-9a-f]{64}$`).test(linkText) && linkText.endsWith(firstToken) && (await page.locator('[data-testid="invite-general"]').count()) === 1 && (await page.locator('[data-testid="invite-link"]').count()) === 1 && (await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1)), linkText);
+    check('there is no second panel and no second Copy link, and no Done button is needed', !(await has(page, 'invite-created')) && !(await has(page, 'invite-copy')) && !(await has(page, 'invite-done')) && (await page.locator('[data-testid="invite-copy-link"]').count()) === 1);
+    check('the single panel says it is Active, that people only send a request, and that an admin approves', (await textOf(page, 'invite-status')) === 'Active' && /only sends a request/.test(await textOf(page, 'invite-copy-note')));
     const generalId = lastInvite().id as string;
     check('the active link is on screen with when it was made (local time) and what it is, and offers Copy link and Revoke link, and NO Replace link', (await settle(async () => (await has(page, 'invite-copy-link')))) && (await textOf(page, `invite-created-at-${generalId}`)) === createdLabel(iso(lastInvite().createdAt)) && /^Invitation link · No requests yet · Expires in 7 days$/.test(await textOf(page, `invite-summary-${generalId}`)) && (await textOf(page, 'invite-copy-link')) === 'Copy link' && (await textOf(page, `invite-revoke-${generalId}`)) === 'Revoke link' && !(await has(page, 'invite-replace')) && !(await has(page, 'invite-open')), await textOf(page, `invite-summary-${generalId}`));
+    const getsAfterCreate = calls('get_general_invite_link').length;
+    await byId(page, 'invite-copy-link').click();
+    check('Copy link puts the SAME link on the clipboard, says so, and asks the server for nothing more', (await byId(page, 'invite-copied').waitFor({ timeout: 5000 }).then(() => true, () => false)) && (await page.evaluate(() => navigator.clipboard.readText())) === linkText && calls('get_general_invite_link').length === getsAfterCreate);
+    await shot(page, 'r3-invite-panel-desktop');
+    await byId(page, 'invite-general').screenshot({ path: path.join(SHOTS, 'r3-invite-panel-desktop-element.png') });
+    const vp0 = page.viewportSize();
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.waitForTimeout(500);
+    check('phone width: the unified invitation panel does not overflow horizontally', await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1));
+    await byId(page, 'invite-general').screenshot({ path: path.join(SHOTS, 'r3-invite-panel-phone.png') });
+    if (vp0) await page.setViewportSize(vp0);
     check('there is no Past invitations section', !(await has(page, 'invite-past-toggle')) && !/Past invitations/.test(await body(page)));
     await page.reload();
     await byId(page, 'trip-people').waitFor({ timeout: 20000 });
     await byId(page, 'invite-copy-link').waitFor({ timeout: 15000 });
-    check('after a reload the token is nowhere: not on the page, not in browser storage', !(await body(page)).includes(firstToken) && !(await page.evaluate(() => JSON.stringify([Object.entries(localStorage), Object.entries(sessionStorage)]))).includes(firstToken));
+    check('after a reload the admin\'s panel shows the same link again, and the token is nowhere in browser storage', (await textOf(page, 'invite-link')).endsWith(firstToken) && !(await page.evaluate(() => JSON.stringify([Object.entries(localStorage), Object.entries(sessionStorage)]))).includes(firstToken));
     check('the list the server sends back never contains the token (read from the real responses)', listBodies.length >= 2 && listBodies.every((b) => !b.includes(firstToken) && !/"token"/i.test(b)), `${listBodies.length} answers`);
 
     // ---- Copy link: the same link every time
@@ -2654,11 +2777,15 @@ async function inviteFlows(browser: Awaited<ReturnType<typeof chromium.launch>>)
     }
     check('Copy link, pressed three times, puts the very same link on the clipboard every time: the one that was created', copies.length === 3 && copies.every((c) => c === linkText), JSON.stringify(copies));
     check('each press asks only for this trip, and says it copied', calls('get_general_invite_link').slice(getsBefore).every((c) => JSON.stringify(c.body) === JSON.stringify({ p_trip_id: T.A })) && (await has(page, 'invite-copied')));
-    check('copying makes no new link, and the token is not left on the page or in browser storage', calls('create_invite').length === createsBefore + 1 && !(await body(page)).includes(firstToken) && !(await page.evaluate(() => JSON.stringify([Object.entries(localStorage), Object.entries(sessionStorage)]))).includes(firstToken));
-    ab.inviteFail = 'network';
-    await byId(page, 'invite-copy-link').click();
-    check('a connection failure while copying is explained, and nothing is copied', await settle(async () => /Can't reach the server/.test(await textOf(page, 'invite-error'))));
+    check('copying makes no new link, and the token is not left in browser storage', calls('create_invite').length === createsBefore + 1 && !(await page.evaluate(() => JSON.stringify([Object.entries(localStorage), Object.entries(sessionStorage)]))).includes(firstToken));
+    // the link cannot be fetched (connection problem): a retry state, never a wrong or stale address
+    ab.inviteFail = 'network-link';
+    await page.reload();
+    await byId(page, 'trip-people').waitFor({ timeout: 20000 });
+    check('if the link cannot be loaded, the panel says so with Try again, shows no address and Copy link is off', (await byId(page, 'invite-link-failed').waitFor({ timeout: 15000 }).then(() => true, () => false)) && !(await has(page, 'invite-link')) && (await byId(page, 'invite-copy-link').getAttribute('aria-disabled')) === 'true');
     ab.inviteFail = null;
+    await byId(page, 'invite-link-retry').click();
+    check('Try again then shows the same link', await settle(async () => (await has(page, 'invite-link')) && (await textOf(page, 'invite-link')).endsWith(firstToken)));
 
     // ---- an older link (made before links could be copied again)
     lastInvite().legacy = true;
@@ -2699,7 +2826,6 @@ async function inviteFlows(browser: Awaited<ReturnType<typeof chromium.launch>>)
     check('after revoking a new link can be made (30 days = 720 hours)', (await settle(() => calls('create_invite').length === createsBefore + 3)) && JSON.stringify(calls('create_invite').at(-1)!.body) === JSON.stringify({ p_trip_id: T.A, p_claim_member_id: null, p_expires_in_hours: 720 }));
     await byId(page, 'invite-link').waitFor({ timeout: 8000 });
     check('it is a different link from the revoked one', lastInvite().token !== firstToken && (await textOf(page, 'invite-link')).endsWith(lastInvite().token as string));
-    await byId(page, 'invite-done').click();
     await byId(page, 'invite-copy-link').waitFor({ timeout: 8000 });
     // and that one is revoked again so the claim-link steps below start with no general link
     await byId(page, `invite-revoke-${lastInvite().id}`).click();
@@ -2901,7 +3027,7 @@ async function inviteFlows(browser: Awaited<ReturnType<typeof chromium.launch>>)
     check('the remembered link is cleared once used', await out.evaluate(() => localStorage.getItem('tripmate.pending-invite') === null));
     await out.goto(BASE);
     await byId(out, 'greeting').waitFor({ timeout: 15000 });
-    check('the trip does NOT appear on their Home screen', !(await has(out, `trip-card-${T.J1}`)));
+    check('the trip does NOT appear on their Home screen', !(await homeHasCard(out, T.J1)));
     await out.goto(`${BASE}/trips/${T.J1}`);
     check('opening the trip itself gives the single "not available" answer (a pending person sees nothing)', await byId(out, 'trip-unavailable').waitFor({ timeout: 15000 }).then(() => true, () => false));
     check('and nothing about the trip appears on that page', !/Goa Joiners|Udaipur|Boss Bhavna|Ravi/.test(await out.locator('body').innerText()));
@@ -2915,7 +3041,7 @@ async function inviteFlows(browser: Awaited<ReturnType<typeof chromium.launch>>)
     j1._hidden = false;
     pendingJ1.status = 'approved';
     await out.goto(BASE);
-    check('after an administrator approves, the trip appears on their Home screen', await byId(out, `trip-card-${T.J1}`).waitFor({ timeout: 15000 }).then(() => true, () => false));
+    check('after an administrator approves, the trip appears on their Home screen', await showHomeCard(out, T.J1, 15000));
     await shot(out, 'join-after-approval');
 
     // a claim request: the friend's place is not touched until approval
@@ -3112,7 +3238,7 @@ async function expenseFlows(browser: Awaited<ReturnType<typeof chromium.launch>>
     // ------------------------------------------------------------------ the list
     await page.goto(`${BASE}${eList}`);
     await byId(page, 'expenses-list').waitFor({ timeout: 20000 });
-    check('the list shows the live expenses, newest day first (same day: newest first)', JSON.stringify(await rowIds()) === JSON.stringify([E.beach, E.breakfast, E.taxi]), JSON.stringify(await rowIds()));
+    check('the list shows the live expenses grouped by trip day, Day 1 first (inside a day the existing order is kept: newest first)', JSON.stringify(await rowIds()) === JSON.stringify([E.breakfast, E.taxi, E.beach]), JSON.stringify(await rowIds()));
     check('each row shows the title, the amount, the category and day, and who paid', (await textOf(`expense-title-${E.beach}`)) === 'Beach dinner' && (await textOf(`expense-amount-${E.beach}`)) === '₹1,200' && (await textOf(`expense-meta-${E.beach}`)) === `Food · ${formatDateRange(addDays(start, 1), addDays(start, 1))}` && (await textOf(`expense-paidby-${E.beach}`)) === 'Paid by Asha Rao', await textOf(`expense-meta-${E.beach}`));
     check('someone who left is named with "(left)" where they paid', (await textOf(`expense-paidby-${E.breakfast}`)) === 'Paid by Departed Dev (left)');
     check('the count and total are shown, and the deleted expense is NOT in the main list', (await textOf('expenses-count')) === '3 expenses · ₹2,700 in total' && !(await rowIds()).includes(E.hotel));
@@ -3124,9 +3250,15 @@ async function expenseFlows(browser: Awaited<ReturnType<typeof chromium.launch>>
     // balances
     await byId(page, 'expenses-tab-balances').click();
     await byId(page, 'balances-list').waitFor({ timeout: 8000 });
-    check('Balances says who is owed and who owes, from the database\'s figures', (await textOf(`balance-text-${ID.me}`)) === 'Asha Rao is owed ₹600' && (await textOf(`balance-text-${ID.ravi}`)) === 'Ravi Kumar is owed ₹300' && (await textOf(`balance-text-${ID.priya}`)) === 'Priya Shah owes ₹600' && (await textOf(`balance-text-${ID.gita}`)) === 'Gita owes ₹300', await textOf(`balance-text-${ID.priya}`));
-    check('a person who left and is at zero is shown as settled, marked "(left)"', (await textOf(`balance-text-${ID.dev}`)) === 'Departed Dev (left) is settled');
-    check('each line also says what the person paid and their share', (await textOf(`balance-detail-${ID.me}`)) === 'Paid ₹1,200 · share ₹600');
+    // a balance card shows name, status and amount separately; this rebuilds the old sentence ("Asha Rao is owed ₹600") for the same comparison
+    const sentence = async (id: string) => {
+      const st = (await textOf(`balance-status-${id}`)).toLowerCase();
+      const amt = (await has(`balance-amount-${id}`)) ? ` ${await textOf(`balance-amount-${id}`)}` : '';
+      return `${await textOf(`balance-name-${id}`)} ${st === 'settled' ? 'is settled' : st}${amt}`;
+    };
+    check('Balances says who is owed and who owes, from the database\'s figures', (await sentence(ID.me)) === 'Asha Rao is owed ₹600' && (await sentence(ID.ravi)) === 'Ravi Kumar is owed ₹300' && (await sentence(ID.priya)) === 'Priya Shah owes ₹600' && (await sentence(ID.gita)) === 'Gita owes ₹300', await sentence(ID.priya));
+    check('a person who left and is at zero is shown as settled, marked "(left)"', (await sentence(ID.dev)) === 'Departed Dev (left) is settled');
+    check('each line also says what the person paid and their share', (`${await textOf(`balance-paid-${ID.me}`)} · ${await textOf(`balance-share-${ID.me}`)}`) === 'Paid ₹1,200 · Share ₹600');
     check('it says plainly that repaying is not part of the app yet, and nobody is told they are settled while someone owes', (await has('balances-later')) && !(await has('balances-settled')));
     await shot(page, 'expenses-balances-light');
     const balanceCalls = calls('trip_member_balances');
@@ -3304,7 +3436,7 @@ async function expenseFlows(browser: Awaited<ReturnType<typeof chromium.launch>>
     await go(`${eNew}`, 'expenses-list');
     await byId(page, 'expenses-tab-balances').click();
     await byId(page, 'balances-list').waitFor({ timeout: 8000 });
-    check('and the balances now reflect it (paid 6 and owed 3.34 = owed 2.66; paid 4 and owed 3.33 = owed 0.67; Gita owes 3.33)', (await textOf(`balance-text-${ID.me}`)) === 'Asha Rao is owed ₹2.66' && (await textOf(`balance-text-${ID.ravi}`)) === 'Ravi Kumar is owed ₹0.67' && (await textOf(`balance-text-${ID.gita}`)) === 'Gita owes ₹3.33', await textOf(`balance-text-${ID.me}`));
+    check('and the balances now reflect it (paid 6 and owed 3.34 = owed 2.66; paid 4 and owed 3.33 = owed 0.67; Gita owes 3.33)', (await sentence(ID.me)) === 'Asha Rao is owed ₹2.66' && (await sentence(ID.ravi)) === 'Ravi Kumar is owed ₹0.67' && (await sentence(ID.gita)) === 'Gita owes ₹3.33', await sentence(ID.me));
 
     // duplicate retry: the save reaches the database but the answer is lost
     await go(`${eNew}/new`, 'expense-title');
@@ -3496,7 +3628,7 @@ async function expenseFlows(browser: Awaited<ReturnType<typeof chromium.launch>>
       await wide.goto(`${BASE}/trips/${T.A}/expenses`);
       await wide.locator('[data-testid="expenses-list"]:visible').waitFor({ timeout: 20000 });
       const box = await wide.locator('[data-testid="expenses-list"]:visible').boundingBox();
-      check('wide screen: the list keeps a comfortable reading width and stays centred', !!box && box.width <= 540 && Math.abs(box.x + box.width / 2 - 640) < 40, JSON.stringify(box));
+      check('wide screen: the list keeps a comfortable reading width and stays centred', !!box && box.width <= 900 && Math.abs(box.x + box.width / 2 - (248 + (1280 - 248) / 2)) < 40, JSON.stringify(box)); // desktop dashboard: a reading column centred beside the 248 px side navigation
       await shot(wide, 'expenses-list-wide');
       await ctx.close();
     }
@@ -4074,6 +4206,7 @@ async function inputFlows(browser: Awaited<ReturnType<typeof chromium.launch>>) 
       check(`${V}: the calendar offers 29 February only in a leap year`, await (async () => {
         const open = async (iso: string) => {
           await byId(page, 'date-picker-close').click();
+          await byId(page, 'date-picker').waitFor({ state: 'hidden', timeout: 5000 }); // the dialog fades out; do not reopen on top of it
           await typeInto('trip-start', `01/02/${iso}`);
           await byId(page, 'trip-start-calendar').click();
           await byId(page, 'date-picker').waitFor({ timeout: 5000 });
@@ -4085,6 +4218,7 @@ async function inputFlows(browser: Awaited<ReturnType<typeof chromium.launch>>) 
       })());
       const pickIso = `${new Date().getFullYear() + 1}-03-15`;
       await byId(page, 'date-picker-close').click();
+      await byId(page, 'date-picker').waitFor({ state: 'hidden', timeout: 5000 });
       await typeInto('trip-start', `01/03/${pickIso.slice(0, 4)}`);
       await byId(page, 'trip-start-calendar').click();
       await byId(page, 'date-picker').waitFor({ timeout: 5000 });
@@ -4171,6 +4305,8 @@ async function settlementFlows(browser: Awaited<ReturnType<typeof chromium.launc
       const textOf = async (id: string) => (await byId(page, id).innerText().catch(() => '')).replace(/\s+/g, ' ').trim();
       const has = async (id: string) => (await byId(page, id).count()) > 0;
       const settle = (fn: () => Promise<boolean> | boolean) => waitFor(fn, 8000);
+      // a group payment is a card (from, verb, to, amount); this rebuilds the old one-line sentence for the same comparisons
+      const lineText = async (i: number) => (await Promise.all(['from', 'verb', 'to', 'amount'].map(async (p) => (await byId(page, `settlement-line-${p}-${i}`).innerText().catch(() => '')).trim()))).join(' ');
       const open = async (tripId: string) => {
         await page.goto(`${BASE}/trips/${tripId}/expenses`);
         await byId(page, 'expenses-tab-balances').waitFor({ timeout: 20000 });
@@ -4178,9 +4314,9 @@ async function settlementFlows(browser: Awaited<ReturnType<typeof chromium.launc
         return byId(page, 'settlement-card').waitFor({ timeout: 15000 }).then(() => true, () => false);
       };
       const lineTexts = async () => {
-        const n = await page.locator('[data-testid^="settlement-line-"]:visible').count();
+        const n = await page.locator('[data-testid^="settlement-line-amount-"]:visible').count();
         const out: string[] = [];
-        for (let i = 0; i < n; i++) out.push(await textOf(`settlement-line-${i}`));
+        for (let i = 0; i < n; i++) out.push(await lineText(i));
         return out;
       };
       const noOverflow = () => page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1);
@@ -4209,7 +4345,7 @@ async function settlementFlows(browser: Awaited<ReturnType<typeof chromium.launc
       check(`${V}: expenses that cancel out also leave everyone settled`, (await open(T.SETTLED)) && (await settle(async () => (await textOf('settlement-headline')) === 'Everyone is settled.')) && (await textOf('settlement-mine-0')) === 'You are settled');
 
       // ---- archived
-      check(`${V}: an archived trip still shows the plan, read-only and marked for reference`, (await open(T.ARCH)) && (await settle(async () => (await textOf('settlement-line-0')) === 'Ravi Kumar pays Asha Rao ₹200')) && /for reference/.test(await textOf('settlement-archived')) && (await textOf('settlement-mine-0')) === 'You receive ₹200 from Ravi Kumar', await textOf('settlement-card'));
+      check(`${V}: an archived trip still shows the plan, read-only and marked for reference`, (await open(T.ARCH)) && (await settle(async () => (await lineText(0)) === 'Ravi Kumar pays Asha Rao ₹200')) && /for reference/.test(await textOf('settlement-archived')) && (await textOf('settlement-mine-0')) === 'You receive ₹200 from Ravi Kumar', await textOf('settlement-card'));
 
       // ---- inconsistent data fails safely
       const FORMER_MSG = 'Someone who left the trip still has a balance, which should not happen, so no payments can be suggested. Check the expenses that involve people who left.';
@@ -4273,6 +4409,937 @@ async function settlementFlows(browser: Awaited<ReturnType<typeof chromium.launc
   }
 }
 
+async function redesignFlows(browser: Awaited<ReturnType<typeof chromium.launch>>) {
+  console.log('\nQ. Redesign: public website, navigation, Home tabs, Search, Archived, Settings, motion, layouts');
+  const site = await startWebsite({ EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY: DUMMY_PUBLISHABLE_KEY, EXPO_PUBLIC_SUPABASE_URL: SUPABASE_URL });
+  try {
+    const ID = { me: uuid(9501), ravi: uuid(9502), priya: uuid(9503) } as const;
+    const T = { ONG: uuid(951), UP: uuid(952), PAST: uuid(953), ARCH: uuid(954), OWE: uuid(955) };
+    const RAVI = '22222222-2222-4222-8222-222222222222';
+    const PRIYA = '33333333-3333-4333-8333-333333333333';
+    const me = (id: string) => memberRow({ id, user_id: USER.id, display_name: 'Asha Rao', role: 'admin', joined_at: '2026-11-18T09:00:00+00:00' });
+    const ravi = () => memberRow({ id: ID.ravi, user_id: RAVI, display_name: 'Ravi Kumar', joined_at: '2026-11-18T10:00:00+00:00' });
+    const priya = () => memberRow({ id: ID.priya, user_id: PRIYA, display_name: 'Priya Shah', joined_at: '2026-11-18T10:30:00+00:00' });
+    const trip = (id: string, name: string, s: number, e: number, members: Record<string, any>[], over: Record<string, any> = {}) =>
+      tripRow({ id, name, destination: 'Placeville', start_date: dayFromToday(s), end_date: dayFromToday(e), members: members.map((m) => ({ id: m.id, status: m.status })), _members: members, ...over });
+    const seed = (b: FakeBackend) => {
+      b.trips = [
+        trip(T.ONG, 'Coorg Coffee Trail', -1, 2, [me(ID.me), ravi()]),
+        trip(T.UP, 'Hampi Weekend', 20, 22, [me(ID.me), ravi()]),
+        trip(T.PAST, 'Spiti Valley Loop', -30, -25, [me(ID.me)]),
+        trip(T.ARCH, 'Munnar Mist Weekend', -60, -58, [me(ID.me)], { status: 'archived' }),
+        trip(T.OWE, 'Owe Trip', 5, 8, [me(ID.me), ravi(), priya()]),
+      ];
+      b.expenses = [
+        {
+          id: uuid(9600), tripId: T.OWE, title: 'Hotel', amount_minor: 90000, category_id: null, spent_on: dayFromToday(5), notes: null, split_method: 'equal', created_by: ID.priya, updated_by: null,
+          created_at: '2026-11-19T10:00:00Z', updated_at: '2026-11-19T10:00:00Z', version: 1, deleted_at: null, deleted_by: null,
+          payers: [{ member_id: ID.priya, paid_minor: 90000 }],
+          splits: previewSplit(90000, 'equal', [ID.me, ID.ravi, ID.priya]).map((r) => ({ member_id: r.memberId, share_minor: r.shareMinor, input_value: null })),
+        },
+      ];
+    };
+    const overflow = (p: Page) => p.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1);
+
+    // ================= the public website (signed out) =================
+    {
+      const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+      const b = newBackend();
+      await installFakeSupabase(ctx, b);
+      const p = await ctx.newPage();
+      await p.goto(BASE);
+      await byId(p, 'landing').waitFor({ timeout: 20000 });
+      const body = async () => await p.locator('body').innerText();
+      check('website: the landing page shows the headline and the Get started and Log in actions', (await byId(p, 'hero-title').innerText()).includes('Travel together') && (await byId(p, 'hero-get-started').isVisible()) && (await byId(p, 'hero-login').isVisible()));
+      check('website: header has Features, How it works, About, Contact, Log in and Sign up', (await Promise.all(['nav-features', 'nav-how', 'nav-about', 'nav-contact', 'site-login', 'site-signup'].map(async (id) => byId(p, id).isVisible()))).every(Boolean));
+      check('website: exactly the six supported features are listed', (await byId(p, 'feature-card').count()) === 6);
+      const text = await body();
+      check('website: repayment recording is only "coming next"', /Coming next: recording and confirming repayments/.test(text) && !/record(s|ed)? your repayments now/i.test(text));
+      check('website: a product preview and a how-it-works section are present', (await byId(p, 'how-it-works').isVisible()) && (await byId(p, 'previews').isVisible()));
+      check('website: footer has Product, Company and Legal links, and no invented contact details', (await Promise.all(['footer-features', 'footer-how', 'footer-about', 'footer-contact', 'footer-help', 'footer-privacy', 'footer-terms'].map(async (id) => (await byId(p, id).count()) > 0))).every(Boolean) && (await p.locator('a[href^="mailto:"], a[href^="tel:"]').count()) === 0 && !/@[a-z0-9-]+\.[a-z]{2,}/i.test(await byId(p, 'site-footer').innerText()));
+      check('website: no browser horizontal overflow at 1280', await overflow(p));
+      await shot(p, 'website-desktop-light');
+      await byId(p, 'footer-privacy').click();
+      await byId(p, 'info-placeholder').waitFor({ timeout: 8000 });
+      check('website: Privacy Policy is a clearly marked placeholder with no policy text', pathOf(p) === '/info/privacy' && /placeholder/i.test(await byId(p, 'info-placeholder').innerText()));
+      await p.goto(`${BASE}/info/terms`);
+      check('website: Terms and Conditions placeholder is reachable signed out', await byId(p, 'info-placeholder').waitFor({ timeout: 8000 }).then(() => true, () => false));
+      await p.goto(BASE);
+      await byId(p, 'hero-get-started').click();
+      check('website: Get started opens sign-up', await byId(p, 'displayName').waitFor({ timeout: 10000 }).then(() => true, () => false) && pathOf(p) === '/sign-up', pathOf(p));
+      await p.goto(BASE);
+      await byId(p, 'hero-login').click();
+      check('website: Log in opens sign-in', await byId(p, 'email').waitFor({ timeout: 10000 }).then(() => true, () => false) && pathOf(p) === '/sign-in', pathOf(p));
+      for (const w of [768, 360]) {
+        await p.setViewportSize({ width: w, height: 900 });
+        await p.goto(BASE);
+        await byId(p, 'landing').waitFor({ timeout: 20000 });
+        check(`website: no horizontal overflow at ${w} px`, await overflow(p));
+        const edges = await Promise.all(['site-brand', 'site-signup', 'hero-get-started', 'hero-login'].map((id) => byId(p, id).boundingBox()));
+        check(`website: header and hero stay inside the ${w} px screen (nothing cut off at either edge)`, edges.every((b) => !!b && b.x >= -0.5 && b.x + b.width <= w + 0.5), JSON.stringify(edges));
+      }
+      check('website: at phone width the links fold into a Menu', (await byId(p, 'site-menu').isVisible()) && !(await byId(p, 'nav-features').count()));
+      await byId(p, 'site-menu').click();
+      check('website: the Menu lists the links and says it is expanded', (await byId(p, 'site-menu-list').isVisible()) && (await byId(p, 'site-menu').getAttribute('aria-expanded')) === 'true');
+      await shot(p, 'website-phone-light');
+      await ctx.close();
+    }
+    {
+      // dark website: the visitor's saved choice on this device
+      const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+      await ctx.addInitScript(() => window.localStorage.setItem('tripmate.theme-preference', 'dark'));
+      await installFakeSupabase(ctx, newBackend());
+      const p = await ctx.newPage();
+      await p.goto(BASE);
+      await byId(p, 'landing').waitFor({ timeout: 20000 });
+      check('website: dark theme uses the deep forest background', await waitFor(async () => (await screenBg(p)) === DARK_BG), await screenBg(p));
+      await shot(p, 'website-desktop-dark');
+      await ctx.close();
+    }
+
+    // ================= the phone app =================
+    {
+      const ctx = await browser.newContext({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true, deviceScaleFactor: 2 });
+      const b = newBackend();
+      seed(b);
+      await installFakeSupabase(ctx, b);
+      await sessionInStorage(ctx);
+      const p = await ctx.newPage();
+      const exists = async (id: string) => (await byId(p, id).count()) > 0;
+      await p.goto(BASE);
+      await byId(p, 'greeting').waitFor({ timeout: 20000 });
+      await byId(p, 'status-ongoing').waitFor({ timeout: 10000 });
+      const labels = await p.locator('[data-testid="bottom-nav"] [role="link"]').evaluateAll((els) => els.map((e) => e.getAttribute('aria-label')));
+      check('phone: persistent bottom navigation with Home, Search, Create trip, Archived, Profile in that order', JSON.stringify(labels) === JSON.stringify(['Home', 'Search', 'Create trip', 'Archived', 'Profile']), JSON.stringify(labels));
+      check('phone: no side navigation, no horizontal overflow', !(await exists('side-nav')) && (await overflow(p)));
+      const navBox = await byId(p, 'bottom-nav').boundingBox();
+      check('phone: the bar sits at the bottom edge of the screen', !!navBox && Math.abs(navBox.y + navBox.height - 844) <= 2, JSON.stringify(navBox));
+      check('phone: the active destination is marked (Home)', (await byId(p, 'nav-home').getAttribute('aria-current')) === 'page' && (await byId(p, 'nav-search').getAttribute('aria-current')) === null);
+      const boxes = await Promise.all(['nav-home', 'nav-search', 'nav-create', 'nav-archived', 'nav-profile'].map((id) => byId(p, id).boundingBox()));
+      check('phone: every destination is a comfortable touch target (44 px)', boxes.every((x) => !!x && x.width >= 44 && x.height >= 44), JSON.stringify(boxes));
+      const createBox = await byId(p, 'nav-create').boundingBox();
+      check('phone: Create trip is inside the bar, not a floating button', !!createBox && !!navBox && createBox.y >= navBox.y - 1 && createBox.y + createBox.height <= navBox.y + navBox.height + 1);
+      check('phone: the tabs read Completed | Ongoing | Upcoming and Ongoing is selected', (await p.locator('[role="tab"]:visible').allInnerTexts()).join('|') === 'Completed|Ongoing|Upcoming' && (await byId(p, 'status-ongoing').getAttribute('aria-selected')) === 'true');
+      check('phone: the Ongoing list shows the ongoing trip as an image-led card with its details', (await byId(p, 'section-ongoing').innerText()).includes('Coorg Coffee Trail') && /Placeville/.test(await byId(p, 'section-ongoing').innerText()) && /2 people/.test(await byId(p, 'section-ongoing').innerText()));
+      await shot(p, 'q-home-phone-light');
+      await byId(p, 'status-upcoming').click();
+      await byId(p, 'section-upcoming').waitFor({ timeout: 5000 });
+      check('phone: choosing Upcoming switches the list and the selected tab', (await byId(p, 'status-upcoming').getAttribute('aria-selected')) === 'true' && (await byId(p, 'section-upcoming').innerText()).includes('Hampi Weekend') && !(await byId(p, 'section-upcoming').innerText()).includes('Coorg'));
+      await byId(p, 'status-completed').click();
+      await byId(p, 'section-completed').waitFor({ timeout: 5000 });
+      check('phone: Completed lists the finished trip, and archived trips are not on Home', (await byId(p, 'section-completed').innerText()).includes('Spiti Valley Loop') && !(await p.locator('body').innerText()).includes('Munnar Mist'));
+
+      // ---- Search
+      await byId(p, 'home-search').click();
+      await byId(p, 'search-input').waitFor({ timeout: 8000 });
+      check('phone: the Home search field opens Search, with the navigation still shown and Search marked', pathOf(p) === '/search' && (await byId(p, 'nav-search').getAttribute('aria-current')) === 'page');
+      check('phone: before typing, Search asks for part of a trip name', /part of a trip name/i.test(await byId(p, 'search-hint').innerText()));
+      await byId(p, 'search-input').fill('coorg');
+      await byId(p, 'search-results').waitFor({ timeout: 5000 });
+      check('phone: typing part of a name finds the trip', (await byId(p, 'search-results').innerText()).includes('Coorg Coffee Trail') && !(await byId(p, 'search-results').innerText()).includes('Hampi'));
+      await shot(p, 'q-search-phone-light');
+      await byId(p, 'search-input').fill('placeville');
+      check('phone: destinations are NOT searched (only names)', await byId(p, 'search-empty').waitFor({ timeout: 5000 }).then(() => true, () => false));
+      await byId(p, 'search-input').fill('mist');
+      await byId(p, `trip-card-${T.ARCH}`).waitFor({ timeout: 5000 });
+      check('phone: an archived trip found by name is tagged Archived', await exists(`archived-tag-${T.ARCH}`));
+      await byId(p, 'search-input').fill('hampi');
+      await byId(p, `trip-card-${T.UP}`).click();
+      check('phone: a search result opens the existing trip page', await byId(p, 'trip-title').waitFor({ timeout: 8000 }).then(() => true, () => false) && (await byId(p, 'trip-title').innerText()) === 'Hampi Weekend');
+      check('phone: trip pages keep the navigation, with Home marked', (await exists('bottom-nav')) && (await byId(p, 'nav-home').getAttribute('aria-current')) === 'page');
+
+      // ---- Archived
+      await byId(p, 'nav-archived').click();
+      await byId(p, 'section-archived').waitFor({ timeout: 8000 });
+      check('phone: Archived lists the archived trip, tagged, and counts it', pathOf(p) === '/archived' && (await exists(`archived-tag-${T.ARCH}`)) && (await byId(p, 'section-archived').innerText()).toLowerCase().includes('archived (1)'));
+      await shot(p, 'q-archived-phone-light');
+      await byId(p, `trip-card-${T.ARCH}`).click();
+      await byId(p, 'trip-archived').waitFor({ timeout: 8000 });
+      check('phone: an archived trip opens with its notice and the existing Restore action', await exists('trip-restore'));
+
+      // ---- Create trip
+      await byId(p, 'nav-create').click();
+      await byId(p, 'trip-name').waitFor({ timeout: 8000 });
+      check('phone: Create trip opens the existing form (full screen, no bottom bar)', pathOf(p) === '/trips/new' && !(await exists('bottom-nav')));
+
+      // ---- Profile and Settings
+      await p.goto(BASE);
+      await byId(p, 'nav-profile').click();
+      await byId(p, 'profile-name').waitFor({ timeout: 8000 });
+      check('phone: Profile shows the name, UPI, currency and the Settings gear, not the theme', (await exists('profile-upi')) && (await exists('currency-INR')) && (await exists('open-settings')) && !(await exists('theme-dark')));
+      await shot(p, 'q-profile-phone-light');
+      await byId(p, 'open-settings').click();
+      await byId(p, 'theme-dark').waitFor({ timeout: 8000 });
+      const themeLabels = await p.locator('[role="radiogroup"][aria-label="Theme"] [role="radio"]').evaluateAll((els) => els.map((e) => e.getAttribute('aria-label')));
+      check('phone: Settings offers Appearance as Light and Dark only, and the sign-out action', JSON.stringify(themeLabels) === JSON.stringify(['Light', 'Dark']) && (await exists('sign-out')), JSON.stringify(themeLabels));
+      await shot(p, 'q-settings-phone-light');
+      await byId(p, 'theme-dark').click();
+      check('phone: choosing Dark in Settings changes the whole app', await waitFor(async () => (await screenBg(p)) === DARK_BG), await screenBg(p));
+      await shot(p, 'q-settings-phone-dark');
+      await byId(p, 'settings-back').click();
+      await byId(p, 'profile-name').waitFor({ timeout: 8000 });
+      await byId(p, 'nav-home').click();
+      await byId(p, 'status-ongoing').waitFor({ timeout: 8000 });
+      await shot(p, 'q-home-phone-dark');
+      check('phone: the Dark choice carries across screens', (await screenBg(p)) === DARK_BG);
+      await byId(p, 'nav-search').click();
+      await byId(p, 'search-input').fill('coorg');
+      await shot(p, 'q-search-phone-dark');
+      await byId(p, 'nav-archived').click();
+      await byId(p, 'section-archived').waitFor({ timeout: 8000 });
+      await shot(p, 'q-archived-phone-dark');
+      check('phone: no horizontal overflow in Dark either', await overflow(p));
+
+      // ---- Balances: two clearly different sections
+      await p.goto(`${BASE}/trips/${T.OWE}/expenses`);
+      await byId(p, 'expenses-tab-balances').waitFor({ timeout: 20000 });
+      await byId(p, 'expenses-tab-balances').click();
+      await byId(p, 'settlement-card').waitFor({ timeout: 15000 });
+      const mineBox = await byId(p, 'settlement-mine-section').boundingBox();
+      const listBox = await byId(p, 'settlement-list').boundingBox();
+      check('phone: "My Suggested Payments" and "Everyone\'s Payments" are two separate labelled sections', (await byId(p, 'settlement-mine-title').innerText()) === 'My Suggested Payments' && (await byId(p, 'settlement-all-title').innerText()).includes('Everyone') && !!mineBox && !!listBox && mineBox.y + mineBox.height <= listBox.y);
+      check('phone: the personal section says what you pay or receive', /^You (pay|receive)/.test(await byId(p, 'settlement-mine-0').innerText()), await byId(p, 'settlement-mine').innerText());
+      check('phone: the group list is not inside the personal section', (await byId(p, 'settlement-mine-section').locator('[data-testid="settlement-list"]').count()) === 0);
+      await shot(p, 'q-balances-phone-dark');
+      await ctx.close();
+    }
+    {
+      // light balances screenshot + reduced motion
+      const ctx = await browser.newContext({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true, deviceScaleFactor: 2, reducedMotion: 'reduce' });
+      const b = newBackend();
+      seed(b);
+      await installFakeSupabase(ctx, b);
+      await sessionInStorage(ctx);
+      const p = await ctx.newPage();
+      await p.goto(`${BASE}/trips/${T.OWE}/expenses`);
+      await byId(p, 'expenses-tab-balances').waitFor({ timeout: 20000 });
+      await byId(p, 'expenses-tab-balances').click();
+      await byId(p, 'settlement-card').waitFor({ timeout: 15000 });
+      await shot(p, 'q-balances-phone-light');
+      await p.goto(BASE);
+      await byId(p, 'status-ongoing').waitFor({ timeout: 20000 });
+      await byId(p, 'status-upcoming').click();
+      const before = Date.now();
+      await byId(p, 'section-upcoming').waitFor({ timeout: 5000 });
+      check('reduced motion: switching the status tab still works, with no animation needed', (await byId(p, 'section-upcoming').innerText()).includes('Hampi Weekend') && Date.now() - before < 2000);
+      const settled = await p.evaluate(() => getComputedStyle(document.querySelector('[data-testid="section-upcoming"]')!.parentElement!.parentElement!).opacity);
+      check('reduced motion: the new list is fully visible straight away', Number(settled) === 1, settled);
+      await ctx.close();
+    }
+
+    // ================= the desktop dashboard =================
+    {
+      const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+      const b = newBackend();
+      seed(b);
+      await installFakeSupabase(ctx, b);
+      await sessionInStorage(ctx);
+      const p = await ctx.newPage();
+      await p.goto(BASE);
+      await byId(p, 'greeting').waitFor({ timeout: 20000 });
+      check('desktop: a signed-in visitor lands in the dashboard, not on the public page', pathOf(p) === '/' && !(await byId(p, 'landing').count()));
+      check('desktop: side navigation with the five destinations, and no bottom bar', (await byId(p, 'side-nav').isVisible()) && !(await byId(p, 'bottom-nav').count()) && (await p.locator('[data-testid="side-nav"] [role="link"]').count()) === 5);
+      check('desktop: the same Completed | Ongoing | Upcoming tabs', (await p.locator('[role="tab"]:visible').allInnerTexts()).join('|') === 'Completed|Ongoing|Upcoming');
+      check('desktop: no horizontal overflow', await overflow(p));
+      await shot(p, 'q-dashboard-desktop-light');
+      await p.goto(`${BASE}/welcome`);
+      check('desktop: a signed-in visitor opening the public address is sent back to the app', await byId(p, 'greeting').waitFor({ timeout: 10000 }).then(() => true, () => false) && pathOf(p) === '/', pathOf(p));
+      await byId(p, 'nav-search').click();
+      check('desktop: side navigation works', await byId(p, 'search-input').waitFor({ timeout: 8000 }).then(() => true, () => false));
+      await ctx.close();
+    }
+    {
+      // tablet width
+      const ctx = await browser.newContext({ viewport: { width: 820, height: 1180 }, hasTouch: true });
+      const b = newBackend();
+      seed(b);
+      await installFakeSupabase(ctx, b);
+      await sessionInStorage(ctx);
+      const p = await ctx.newPage();
+      await p.goto(BASE);
+      await byId(p, 'greeting').waitFor({ timeout: 20000 });
+      check('tablet: bottom navigation is used and nothing overflows sideways', (await byId(p, 'bottom-nav').isVisible()) && !(await byId(p, 'side-nav').count()) && (await overflow(p)));
+      await shot(p, 'q-home-tablet-light');
+      await ctx.close();
+    }
+  } finally {
+    site.stop();
+  }
+}
+
+async function refinementFlows(browser: Awaited<ReturnType<typeof chromium.launch>>) {
+  console.log('\nR. Refinements: neutral dark theme, website theme switch, website sign-in/sign-up, sidebar, phone frames, day-wise expenses');
+  const site = await startWebsite({ EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY: DUMMY_PUBLISHABLE_KEY, EXPO_PUBLIC_SUPABASE_URL: SUPABASE_URL });
+  try {
+    const ID = { me: uuid(9701), ravi: uuid(9702), priya: uuid(9703) } as const;
+    const T = { COORG: uuid(971), UP: uuid(972), PAST: uuid(973), ARCH: uuid(974), EMPTY: uuid(975) };
+    const RAVI = '22222222-2222-4222-8222-222222222222';
+    const PRIYA = '33333333-3333-4333-8333-333333333333';
+    const me = (id: string) => memberRow({ id, user_id: USER.id, display_name: 'Asha Rao', role: 'admin', joined_at: '2026-11-18T09:00:00+00:00' });
+    const ravi = () => memberRow({ id: ID.ravi, user_id: RAVI, display_name: 'Ravi Kumar', joined_at: '2026-11-18T10:00:00+00:00' });
+    const priya = () => memberRow({ id: ID.priya, user_id: PRIYA, display_name: 'Priya Shah', joined_at: '2026-11-18T10:30:00+00:00' });
+    const trip = (id: string, name: string, dest: string, s: number, e: number, members: Record<string, any>[], over: Record<string, any> = {}) =>
+      tripRow({ id, name, destination: dest, start_date: dayFromToday(s), end_date: dayFromToday(e), members: members.map((m) => ({ id: m.id, status: m.status })), _members: members, ...over });
+    let n = 0;
+    const exp = (tripId: string, title: string, amount: number, dayOffset: number, by: string, over: Record<string, any> = {}): Record<string, any> => ({
+      id: uuid(9800 + ++n), tripId, title, amount_minor: amount, category_id: null, spent_on: dayFromToday(dayOffset), notes: null, split_method: 'equal', created_by: by, updated_by: null,
+      created_at: `2026-11-2${(n % 9) + 1}T10:00:00Z`, updated_at: '2026-11-25T10:00:00Z', version: 1, deleted_at: null, deleted_by: null,
+      payers: [{ member_id: by, paid_minor: amount }],
+      splits: previewSplit(amount, 'equal', [ID.me, ID.ravi, ID.priya]).map((r) => ({ member_id: r.memberId, share_minor: r.shareMinor, input_value: null })),
+      ...over,
+    });
+    const seed = (b: FakeBackend) => {
+      b.trips = [
+        trip(T.COORG, 'Coorg Coffee Trail', 'Coorg, Karnataka', -3, 1, [me(ID.me), ravi(), priya()]),
+        trip(T.UP, 'Hampi Weekend', 'Hampi', 20, 22, [me(ID.me), ravi()]),
+        trip(T.PAST, 'Spiti Valley Loop', 'Spiti', -40, -34, [me(ID.me), ravi()]),
+        trip(T.ARCH, 'Munnar Mist Weekend', 'Munnar', -70, -68, [me(ID.me)], { status: 'archived' }),
+        trip(T.EMPTY, 'Gokarna Beach Camp', 'Gokarna', 30, 33, [me(ID.me)]),
+      ];
+      b.expenses = [
+        exp(T.COORG, 'Breakfast', 30000, -3, ID.me),
+        exp(T.COORG, 'Fuel', 150000, -3, ID.ravi),
+        exp(T.COORG, 'Hotel', 300000, -3, ID.priya),
+        exp(T.COORG, 'Lunch', 80000, -2, ID.me),
+        exp(T.COORG, 'Activities', 120000, -2, ID.priya),
+        exp(T.COORG, 'Dinner', 150000, -1, ID.ravi),
+        exp(T.COORG, 'Shopping', 50000, -1, ID.me),
+        // recorded LAST (newest created_at) but dated on day 1: it must appear under Day 1
+        exp(T.COORG, 'Forgotten taxi', 70000, -3, ID.priya, { created_at: '2026-11-26T20:00:00Z' }),
+      ];
+    };
+    const overflow = (p: Page) => p.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1);
+    const dark = (ctx: BrowserContext) => ctx.addInitScript(() => window.localStorage.setItem('tripmate.theme-preference', 'dark'));
+    const text = async (p: Page, id: string) => (await byId(p, id).innerText().catch(() => '')).replace(/\s+/g, ' ');
+
+    // ================= the neutral dark theme =================
+    {
+      const ctx = await browser.newContext({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true, deviceScaleFactor: 2 });
+      await dark(ctx);
+      const b = newBackend();
+      seed(b);
+      b.profile = { ...b.profile, theme_preference: 'dark' };
+      await installFakeSupabase(ctx, b);
+      await sessionInStorage(ctx);
+      const p = await ctx.newPage();
+      await p.goto(BASE);
+      await byId(p, 'status-ongoing').waitFor({ timeout: 20000 });
+      const bg = await screenBg(p);
+      const [r, g, bl] = (bg.match(/\d+/g) ?? []).map(Number) as [number, number, number];
+      check('dark: the page background is the neutral charcoal #101010, not green-black', bg === 'rgb(16, 16, 16)' && Math.max(r, g, bl) - Math.min(r, g, bl) <= 4, bg);
+      const navBg = await byId(p, 'bottom-nav').evaluate((e) => getComputedStyle(e).backgroundColor);
+      check('dark: cards and bars use the neutral surface #1C1C1C', navBg === 'rgb(28, 28, 28)', navBg);
+      const create = await byId(p, 'nav-create').locator('div').first().evaluate((e) => getComputedStyle(e).backgroundColor);
+      check('dark: the Create button keeps the forest green fill #2F5D44', create === 'rgb(47, 93, 68)', create);
+      await shot(p, 'r-home-phone-dark');
+      await p.goto(`${BASE}/trips/${T.COORG}/expenses`);
+      await byId(p, 'expenses-tab-balances').waitFor({ timeout: 20000 });
+      await byId(p, 'expenses-tab-balances').click();
+      await byId(p, 'settlement-card').waitFor({ timeout: 15000 });
+      const mineBg = await byId(p, 'settlement-mine-section').evaluate((e) => getComputedStyle(e).backgroundColor);
+      const allBg = await byId(p, 'settlement-list').evaluateHandle((e) => e.parentElement!).then((h) => h.evaluate((e) => getComputedStyle(e as Element).backgroundColor));
+      check('dark: "My Suggested Payments" (#272727) and "Everyone\'s Payments" (#1C1C1C) are visibly different surfaces', mineBg === 'rgb(39, 39, 39)' && allBg === 'rgb(28, 28, 28)', `${mineBg} / ${allBg}`);
+      await shot(p, 'r-balances-phone-dark');
+      await p.goto(`${BASE}/profile`);
+      await byId(p, 'profile-name').waitFor({ timeout: 20000 });
+      await shot(p, 'r-profile-phone-dark');
+      await p.goto(`${BASE}/settings`);
+      await byId(p, 'theme-dark').waitFor({ timeout: 20000 });
+      await shot(p, 'r-settings-phone-dark');
+      check('dark: no horizontal overflow', await overflow(p));
+      await ctx.close();
+    }
+
+    // ================= the day-wise expenses =================
+    for (const variant of [
+      { name: 'phone', opts: { viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true, deviceScaleFactor: 2 } },
+      { name: 'desktop', opts: { viewport: { width: 1280, height: 900 } } },
+      { name: 'Kiritimati', opts: { viewport: { width: 1280, height: 900 }, timezoneId: 'Pacific/Kiritimati' } },
+      { name: 'Pago_Pago', opts: { viewport: { width: 1280, height: 900 }, timezoneId: 'Pacific/Pago_Pago' } },
+    ]) {
+      const V = variant.name;
+      const ctx = await browser.newContext(variant.opts);
+      const b = newBackend();
+      seed(b);
+      await installFakeSupabase(ctx, b, { keepCollapsed: true });
+      await sessionInStorage(ctx);
+      const p = await ctx.newPage();
+      await p.goto(`${BASE}/trips/${T.COORG}/expenses`);
+      await byId(p, 'expenses-list').waitFor({ timeout: 20000 });
+      const d1 = dayFromToday(-3), d2 = dayFromToday(-2), d3 = dayFromToday(-1);
+      const rowsIn = (d: string) => p.locator(`[data-testid="expense-day-${d}"] [data-testid^="expense-row-"]`).count();
+      const titles = await p.locator('[data-testid^="expense-day-title-"]:visible').allInnerTexts();
+      check(`${V}: expenses are grouped into Day 1, Day 2, Day 3 in order (Day number = days since the trip start + 1)`, JSON.stringify(titles) === JSON.stringify(['Day 1', 'Day 2', 'Day 3']), JSON.stringify(titles));
+      check(`${V}: all day cards start COLLAPSED: no individual expense is shown`, (await rowsIn(d1)) === 0 && (await rowsIn(d2)) === 0 && (await rowsIn(d3)) === 0 && (await byId(p, `expense-day-toggle-${d1}`).getAttribute('aria-expanded')) === 'false');
+      check(`${V}: a collapsed card shows the day number, full weekday and date, expense count, total and an Expand cue`, (await text(p, `expense-day-date-${d1}`)).split(',').length >= 2 && /^\w+day, \d{1,2} \w+ \d{4}$/.test(await text(p, `expense-day-date-${d1}`)) && (await text(p, `expense-day-count-${d1}`)) === '4 expenses' && (await text(p, `expense-day-hint-${d1}`)) === 'Expand' && (await byId(p, `expense-day-chevron-${d1}`).isVisible()));
+      check(`${V}: Day 1 total is the sum of its four expenses (₹300 + ₹1,500 + ₹3,000 + ₹700 = ₹5,500)`, (await text(p, `expense-day-total-${d1}`)).includes('₹5,500'), await text(p, `expense-day-total-${d1}`));
+      check(`${V}: Day 2 total ₹2,000 and Day 3 total ₹2,000; Day 2 holds 2 expenses`, (await text(p, `expense-day-total-${d2}`)).includes('₹2,000') && (await text(p, `expense-day-total-${d3}`)).includes('₹2,000') && (await text(p, `expense-day-count-${d2}`)) === '2 expenses');
+      check(`${V}: the trip's overall count and total stay at the top`, /8 expenses/.test(await text(p, 'expenses-count')) && (await text(p, 'expenses-count')).includes('₹9,500'), await text(p, 'expenses-count'));
+      check(`${V}: only days with expenses get a card (no empty days)`, (await p.locator('[data-testid^="expense-day-title-"]:visible').count()) === 3);
+      await shot(p, V === 'phone' ? 'r2-expenses-collapsed-phone' : 'r2-expenses-collapsed-desktop');
+      // open Day 1
+      await byId(p, `expense-day-toggle-${d1}`).click();
+      check(`${V}: tapping Day 1 opens it and shows its four expenses; the cue becomes Collapse`, (await waitFor(async () => (await rowsIn(d1)) === 4)) && (await text(p, `expense-day-hint-${d1}`)) === 'Collapse' && (await byId(p, `expense-day-toggle-${d1}`).getAttribute('aria-expanded')) === 'true');
+      check(`${V}: an expense recorded last but dated on day 1 is under Day 1`, (await byId(p, `expense-day-${d1}`).innerText()).includes('Forgotten taxi') && (await rowsIn(d3)) === 0);
+      check(`${V}: each expense shows its category icon, title, category, amount and who paid`, /Hotel/.test(await byId(p, `expense-day-${d1}`).innerText()) && /Paid by/i.test(await byId(p, `expense-day-${d1}`).innerText()) && (await p.locator(`[data-testid="expense-day-${d1}"] [data-testid^="expense-icon-"]`).count()) === 4);
+      await shot(p, V === 'phone' ? 'r2-expenses-expanded-phone' : 'r2-expenses-expanded-desktop');
+      // several days open together
+      await byId(p, `expense-day-toggle-${d2}`).click();
+      check(`${V}: Day 2 can be open at the same time as Day 1`, (await waitFor(async () => (await rowsIn(d2)) === 2)) && (await rowsIn(d1)) === 4);
+      // a refresh of the data keeps them open
+      await p.evaluate(() => window.dispatchEvent(new Event('focus')));
+      await p.waitForTimeout(600);
+      check(`${V}: the open cards stay open when the data refreshes`, (await rowsIn(d1)) === 4 && (await rowsIn(d2)) === 2);
+      // collapse again
+      await byId(p, `expense-day-toggle-${d1}`).click();
+      check(`${V}: tapping the header again collapses Day 1 (Day 2 stays open)`, (await waitFor(async () => (await rowsIn(d1)) === 0)) && (await rowsIn(d2)) === 2 && (await text(p, `expense-day-hint-${d1}`)) === 'Expand');
+      // an expense still opens its page
+      await p.locator(`[data-testid="expense-day-${d2}"] [data-testid^="expense-row-"]`).first().click();
+      check(`${V}: an expense inside an open day opens the existing detail screen`, await waitFor(async () => /\/expenses\/[0-9a-f-]{36}/.test(pathOf(p))), pathOf(p));
+      await p.goBack();
+      await byId(p, 'expenses-list').waitFor({ timeout: 10000 });
+      if (V === 'phone') {
+        await shot(p, 'r-expenses-phone-light');
+        check('phone: no horizontal overflow on the day-wise list', await overflow(p));
+      }
+      await ctx.close();
+    }
+    {
+      const ctx = await browser.newContext({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true, deviceScaleFactor: 2 });
+      await dark(ctx);
+      const b = newBackend();
+      seed(b);
+      b.profile = { ...b.profile, theme_preference: 'dark' };
+      await installFakeSupabase(ctx, b);
+      await sessionInStorage(ctx);
+      const p = await ctx.newPage();
+      await p.goto(`${BASE}/trips/${T.COORG}/expenses`);
+      await byId(p, 'expenses-list').waitFor({ timeout: 20000 });
+      await shot(p, 'r-expenses-phone-dark');
+      await ctx.close();
+    }
+    {
+      const ctx = await browser.newContext({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true, deviceScaleFactor: 2 });
+      const b = newBackend();
+      seed(b);
+      await installFakeSupabase(ctx, b);
+      await sessionInStorage(ctx);
+      const p = await ctx.newPage();
+      await p.goto(BASE);
+      await byId(p, 'status-ongoing').waitFor({ timeout: 20000 });
+      await shot(p, 'r-home-phone-light');
+      await p.goto(`${BASE}/profile`);
+      await byId(p, 'profile-name').waitFor({ timeout: 20000 });
+      await shot(p, 'r-profile-phone-light');
+      await p.goto(`${BASE}/settings`);
+      await byId(p, 'theme-dark').waitFor({ timeout: 20000 });
+      check('settings: links to About, Contact, Help, Privacy and Terms are available while signed in', (await Promise.all(['about', 'contact', 'help', 'privacy', 'terms'].map((x) => byId(p, `settings-info-${x}`).count()))).every((c) => c === 1));
+      check('settings: it explains that the device choice is kept through sign-in', /kept on this device, including through sign-in and sign-out/i.test(await p.locator('body').innerText()));
+      await shot(p, 'r-settings-phone-light');
+      await byId(p, 'settings-info-privacy').click();
+      await byId(p, 'info-placeholder').waitFor({ timeout: 8000 });
+      check('info: a signed-in person can read the Privacy placeholder, and the authenticated navigation is not shown on it', pathOf(p) === '/info/privacy' && (await byId(p, 'bottom-nav').count()) === 0 && (await byId(p, 'side-nav').count()) === 0, pathOf(p));
+      await p.goto(`${BASE}/welcome`);
+      check('routing: a signed-in person opening /welcome still goes to the dashboard', await byId(p, 'greeting').waitFor({ timeout: 10000 }).then(() => true, () => false) && pathOf(p) === '/');
+      await ctx.close();
+    }
+
+    // ================= desktop dashboard sidebar =================
+    {
+      const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+      const b = newBackend();
+      seed(b);
+      await installFakeSupabase(ctx, b);
+      await sessionInStorage(ctx);
+      const p = await ctx.newPage();
+      await p.goto(BASE);
+      await byId(p, 'greeting').waitFor({ timeout: 20000 });
+      await byId(p, 'side-profile-name').waitFor({ timeout: 10000 });
+      const nav = await byId(p, 'side-nav').boundingBox();
+      const prof = await byId(p, 'nav-profile').boundingBox();
+      const arch = await byId(p, 'nav-archived').boundingBox();
+      check('sidebar: Home, Search, Create Trip and Archived are the main items; Profile is separate', (await p.locator('[data-testid="side-nav"] [role="link"]').count()) === 5 && !!arch && !!prof && prof.y > arch.y + arch.height + 100);
+      check('sidebar: Profile sits at the bottom of the sidebar', !!nav && !!prof && Math.abs(nav.y + nav.height - (prof.y + prof.height)) <= 40, JSON.stringify({ nav, prof }));
+      check('sidebar: Profile shows an avatar and the person\'s name', (await byId(p, 'side-avatar').count()) === 1 && (await text(p, 'side-profile-name')) === 'Asha Rao');
+      await p.setViewportSize({ width: 1280, height: 600 });
+      await p.waitForTimeout(300);
+      const prof2 = await byId(p, 'nav-profile').boundingBox();
+      check('sidebar: Profile stays anchored at the bottom when the window is shorter', !!prof2 && prof2.y + prof2.height >= 540, JSON.stringify(prof2));
+      await p.setViewportSize({ width: 1280, height: 900 });
+      await byId(p, 'nav-profile').click();
+      await byId(p, 'profile-name').waitFor({ timeout: 8000 });
+      check('sidebar: clicking Profile opens the Profile screen, marked as the current page', pathOf(p) === '/profile' && (await byId(p, 'nav-profile').getAttribute('aria-current')) === 'page');
+      check('sidebar: the gear still leads to Settings', await byId(p, 'open-settings').isVisible());
+      await shot(p, 'r-dashboard-desktop-light');
+      await ctx.close();
+    }
+    {
+      const ctx = await browser.newContext({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
+      const b = newBackend();
+      seed(b);
+      await installFakeSupabase(ctx, b);
+      await sessionInStorage(ctx);
+      const p = await ctx.newPage();
+      await p.goto(BASE);
+      await byId(p, 'status-ongoing').waitFor({ timeout: 20000 });
+      check('phone: the bottom navigation still has the five items, including Profile', (await p.locator('[data-testid="bottom-nav"] [role="link"]').count()) === 5 && (await byId(p, 'nav-profile').isVisible()));
+      await ctx.close();
+    }
+
+    // ================= the public website: theme switch, sign-in and sign-up =================
+    {
+      const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+      const b = newBackend();
+      await installFakeSupabase(ctx, b);
+      const p = await ctx.newPage();
+      await p.goto(BASE);
+      await byId(p, 'landing').waitFor({ timeout: 20000 });
+      check('website: the header has a two-state Light / Dark switch beside Log in and Sign up, and no System option', (await Promise.all(['site-theme-light', 'site-theme-dark'].map((id) => byId(p, id).isVisible()))).every(Boolean) && (await byId(p, 'site-theme-system').count()) === 0 && (await byId(p, 'site-theme-light').getAttribute('aria-checked')) === 'true');
+      await byId(p, 'site-theme-group').screenshot({ path: path.join(SHOTS, 'r3-appearance-control-light.png') });
+      await byId(p, 'site-theme-dark').click();
+      await p.waitForTimeout(400);
+      await byId(p, 'site-theme-group').screenshot({ path: path.join(SHOTS, 'r3-appearance-control-dark.png') });
+      check('website: choosing Dark changes the landing page without signing in', await waitFor(async () => (await screenBg(p)) === 'rgb(16, 16, 16)'), await screenBg(p));
+      await shot(p, 'r-website-desktop-dark');
+      await p.reload();
+      await byId(p, 'landing').waitFor({ timeout: 20000 });
+      check('website: the choice survives a refresh', (await byId(p, 'site-theme-dark').getAttribute('aria-checked')) === 'true' && (await screenBg(p)) === 'rgb(16, 16, 16)');
+      await byId(p, 'hero-login').click();
+      await byId(p, 'email').waitFor({ timeout: 10000 });
+      check('website: the sign-in page keeps the chosen theme and has NO theme switch', (await screenBg(p)) === 'rgb(16, 16, 16)' && (await byId(p, 'site-theme-dark').count()) === 0 && (await byId(p, 'site-theme-light').count()) === 0);
+      await p.goto(`${BASE}/info/terms`);
+      await byId(p, 'info-placeholder').waitFor({ timeout: 10000 });
+      check('website: the information pages keep the theme and carry the switch', (await byId(p, 'site-theme-dark').getAttribute('aria-checked')) === 'true');
+      await byId(p, 'site-theme-light').click();
+      check('website: switching back to Light works on an information page', await waitFor(async () => (await screenBg(p)) === 'rgb(244, 238, 225)'));
+      await p.goto(BASE);
+      await byId(p, 'landing').waitFor({ timeout: 20000 });
+      await shot(p, 'r-website-desktop-light');
+      // the phone frames
+      const frames = await byId(p, 'phone-frame').count();
+      check('website: each app preview sits in a phone frame with a visible bezel', frames >= 3);
+      const frameBg = await byId(p, 'phone-frame').first().locator('div').first().evaluate((e) => getComputedStyle(e).backgroundColor);
+      const pageBg = await screenBg(p);
+      check('website: the bezel is clearly different from the page behind it', frameBg !== pageBg && frameBg !== 'rgba(0, 0, 0, 0)', `${frameBg} vs ${pageBg}`);
+      const previews = await byId(p, 'previews').innerText();
+      check('website: the sample data is consistent (the Ongoing tab shows an Ongoing trip, nobody both pays and receives)', /ONGOING/.test(previews) && !/COMPLETED/.test(previews) && !/You receive/.test(previews) && /3 payments settle everyone/.test(previews));
+      await byId(p, 'previews').scrollIntoViewIfNeeded();
+      await p.waitForTimeout(400);
+      await byId(p, 'previews').screenshot({ path: path.join(SHOTS, 'r-website-phone-frames-light.png') });
+      await byId(p, 'site-theme-dark').click();
+      await p.waitForTimeout(500);
+      await byId(p, 'previews').screenshot({ path: path.join(SHOTS, 'r-website-phone-frames-dark.png') });
+      await ctx.close();
+    }
+    for (const mode of ['light', 'dark'] as const) {
+      const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+      if (mode === 'dark') await dark(ctx);
+      await installFakeSupabase(ctx, newBackend());
+      const p = await ctx.newPage();
+      await p.goto(`${BASE}/sign-in`);
+      await byId(p, 'email').waitFor({ timeout: 20000 });
+      check(`login (${mode}): split layout with the TripMate branding and headline on the left and the form on the right`, (await byId(p, 'auth-brand-panel').isVisible()) && /Make memories, not money disputes/.test(await text(p, 'auth-headline')) && (await byId(p, 'auth-collage').isVisible()) && (await byId(p, 'auth-form-panel').isVisible()));
+      const left = await byId(p, 'auth-brand-panel').boundingBox();
+      const right = await byId(p, 'auth-form-panel').boundingBox();
+      check(`login (${mode}): the form is to the right of the branding`, !!left && !!right && right.x > left.x + left.width - 1);
+      const bodyText = await p.locator('body').innerText();
+      check(`login (${mode}): only the supported fields and actions (no Google, Facebook, phone or password-reset options)`, !/google|facebook|apple|phone|forgot|reset password/i.test(bodyText) && (await byId(p, 'submit').isVisible()) && (await byId(p, 'password').isVisible()));
+      check(`login (${mode}): the footer is present and there is no appearance switch`, (await byId(p, 'site-footer').isVisible()) && (await byId(p, 'site-theme-light').count()) === 0 && (await byId(p, 'site-theme-dark').count()) === 0 && (await byId(p, 'footer-privacy').count()) === 1 && (await byId(p, 'footer-terms').count()) === 1);
+      check(`login (${mode}): no horizontal overflow`, await overflow(p));
+      await shot(p, `r-login-desktop-${mode}`);
+      await p.goto(`${BASE}/sign-up`);
+      await byId(p, 'displayName').waitFor({ timeout: 20000 });
+      check(`sign up (${mode}): split layout, name, email and password fields, and the password rule`, (await byId(p, 'auth-brand-panel').isVisible()) && (await byId(p, 'email').isVisible()) && /At least \d+ characters/.test(await p.locator('body').innerText()));
+      await byId(p, 'submit').click();
+      check(`sign up (${mode}): the existing validation messages still appear`, await vis(p, 'Enter your name').waitFor({ timeout: 5000 }).then(() => true, () => false));
+      check(`sign up (${mode}): no appearance switch either`, (await byId(p, 'site-theme-light').count()) === 0 && (await byId(p, 'site-theme-dark').count()) === 0);
+      // the footer is its own band: full width, a different colour from the branding panel above it, with a top border
+      const footerBox = await byId(p, 'site-footer').boundingBox();
+      const vw = (await p.viewportSize())!.width;
+      const footerBg = await byId(p, 'site-footer').evaluate((e) => getComputedStyle(e).backgroundColor);
+      const panelBg = await byId(p, 'auth-brand-panel').evaluate((e) => getComputedStyle(e).backgroundColor);
+      const pageBgNow = await screenBg(p);
+      check(`sign up (${mode}): the footer spans the full width and its colour differs from the branding panel and the page (${footerBg} vs ${panelBg} / ${pageBgNow})`, !!footerBox && footerBox.width >= vw - 1 && footerBg !== panelBg && footerBg !== pageBgNow);
+      await shot(p, `r-signup-desktop-${mode}`);
+      await ctx.close();
+    }
+    {
+      // narrow website: a single column with the form first
+      const ctx = await browser.newContext({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true, deviceScaleFactor: 2 });
+      await installFakeSupabase(ctx, newBackend());
+      const p = await ctx.newPage();
+      await p.goto(BASE);
+      check('website on a phone browser: signed-out visitors still get the public landing page', await byId(p, 'landing').waitFor({ timeout: 20000 }).then(() => true, () => false) && pathOf(p) === '/welcome');
+      await p.goto(`${BASE}/sign-in`);
+      await byId(p, 'email').waitFor({ timeout: 20000 });
+      check('narrow sign-in: single column, compact travel picture, form visible, no split panel', (await byId(p, 'auth-compact-visual').isVisible()) && !(await byId(p, 'auth-brand-panel').count()) && (await byId(p, 'submit').isVisible()));
+      check('narrow sign-in: the bottom navigation is not shown', (await byId(p, 'bottom-nav').count()) === 0);
+      check('narrow sign-in: no horizontal overflow', await overflow(p));
+      await shot(p, 'r-login-phone-browser-light');
+      await ctx.close();
+    }
+    // ================= theme persistence through authentication =================
+    for (const [device, account] of [['dark', 'light'], ['light', 'dark']] as const) {
+      const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+      const b = newBackend();
+      seed(b);
+      b.profile = { ...b.profile, theme_preference: account };
+      await installFakeSupabase(ctx, b);
+      const p = await ctx.newPage();
+      const bg = device === 'dark' ? 'rgb(16, 16, 16)' : 'rgb(244, 238, 225)';
+      await p.goto(BASE);
+      await byId(p, 'landing').waitFor({ timeout: 20000 });
+      await byId(p, `site-theme-${device}`).click();
+      await p.waitForTimeout(400);
+      await byId(p, 'hero-login').click();
+      await byId(p, 'email').waitFor({ timeout: 10000 });
+      check(`${device} on the landing page -> Login keeps ${device}, with no switch`, (await screenBg(p)) === bg && (await byId(p, 'site-theme-light').count()) === 0);
+      await p.goto(`${BASE}/sign-up`);
+      await byId(p, 'displayName').waitFor({ timeout: 20000 });
+      check(`${device}: Sign Up keeps ${device} as well (and Login <-> Sign Up preserves it)`, (await screenBg(p)) === bg);
+      await p.goto(`${BASE}/sign-in`);
+      await byId(p, 'email').waitFor({ timeout: 20000 });
+      await byId(p, 'email').fill('asha@example.com');
+      await byId(p, 'password').fill('Goa2026trip');
+      await byId(p, 'submit').click();
+      await byId(p, 'greeting').waitFor({ timeout: 15000 });
+      await p.waitForTimeout(800);
+      check(`${device} chosen before signing in (account says ${account}): the dashboard stays ${device}`, (await screenBg(p)) === bg, await screenBg(p));
+      check('...and signing in made no profile write just to sync the theme', !b.requests.some((r) => r.method === 'PATCH'));
+      check('routing: after sign-in the visitor is in the dashboard, not on the landing page', pathOf(p) === '/' && (await byId(p, 'side-nav').count()) === 1);
+      await p.reload();
+      await byId(p, 'greeting').waitFor({ timeout: 15000 });
+      check(`${device}: a refresh keeps it`, await waitFor(async () => (await screenBg(p)) === bg));
+      await byId(p, 'nav-profile').click();
+      await byId(p, 'open-settings').click();
+      await byId(p, 'sign-out').click();
+      await byId(p, 'landing').waitFor({ timeout: 15000 });
+      check(`${device}: signing out keeps it, and the landing page switch shows the same state`, (await screenBg(p)) === bg && (await byId(p, `site-theme-${device}`).getAttribute('aria-checked')) === 'true');
+      await ctx.close();
+    }
+    {
+      // no saved choice on the device: the account's Dark is used and then stays; an explicit change updates the account once
+      const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+      const b = newBackend();
+      seed(b);
+      b.profile = { ...b.profile, theme_preference: 'dark' };
+      await installFakeSupabase(ctx, b);
+      const p = await ctx.newPage();
+      await p.goto(`${BASE}/sign-in`);
+      await byId(p, 'email').fill('asha@example.com');
+      await byId(p, 'password').fill('Goa2026trip');
+      await byId(p, 'submit').click();
+      await byId(p, 'greeting').waitFor({ timeout: 15000 });
+      check('no device choice + account Dark: the dashboard uses the account\'s Dark', await waitFor(async () => (await screenBg(p)) === 'rgb(16, 16, 16)'), await screenBg(p));
+      check('...without writing to the account', !b.requests.some((r) => r.method === 'PATCH'));
+      await byId(p, 'nav-profile').click();
+      await byId(p, 'open-settings').click();
+      await byId(p, 'theme-light').click();
+      const saved = await waitFor(() => b.requests.filter((r) => r.method === 'PATCH' && r.body?.theme_preference === 'light').length === 1);
+      check('an explicit change in Settings updates the account (once)', saved);
+      await ctx.close();
+    }
+  } finally {
+    site.stop();
+  }
+}
+
+async function insightsFlows(browser: Awaited<ReturnType<typeof chromium.launch>>) {
+  console.log('\nS. Phase 3: Insights (bars + donut), redesigned Balances, collapsible days, three tabs');
+  const site = await startWebsite({ EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY: DUMMY_PUBLISHABLE_KEY, EXPO_PUBLIC_SUPABASE_URL: SUPABASE_URL });
+  try {
+    const ID = { me: uuid(9751), ravi: uuid(9752), priya: uuid(9753) } as const;
+    const T = { COORG: uuid(981), EMPTY: uuid(982), ARCH: uuid(983), SINGLE: uuid(984) };
+    const RAVI = '22222222-2222-4222-8222-222222222222';
+    const PRIYA = '33333333-3333-4333-8333-333333333333';
+    const CAT = { transportation: uuid(9700), accommodation: uuid(9701), food: uuid(9702), shopping: uuid(9703), activities: uuid(9704), fuel: uuid(9705), other: uuid(9706) };
+    const me = () => memberRow({ id: ID.me, user_id: USER.id, display_name: 'Asha Rao', role: 'admin', joined_at: '2026-11-18T09:00:00+00:00' });
+    const ravi = () => memberRow({ id: ID.ravi, user_id: RAVI, display_name: 'Ravi Kumar', joined_at: '2026-11-18T10:00:00+00:00' });
+    const priya = () => memberRow({ id: ID.priya, user_id: PRIYA, display_name: 'Priya Shah', joined_at: '2026-11-18T10:30:00+00:00' });
+    const trip = (id: string, name: string, dest: string, s: number, e: number, members: Record<string, any>[], over: Record<string, any> = {}) =>
+      tripRow({ id, name, destination: dest, start_date: dayFromToday(s), end_date: dayFromToday(e), members: members.map((m) => ({ id: m.id, status: m.status })), _members: members, ...over });
+    let n = 0;
+    const exp = (tripId: string, title: string, amount: number, dayOffset: number, by: string, cat: string | null, over: Record<string, any> = {}): Record<string, any> => ({
+      id: uuid(9900 + ++n), tripId, title, amount_minor: amount, category_id: cat, spent_on: dayFromToday(dayOffset), notes: null, split_method: 'equal', created_by: by, updated_by: null,
+      created_at: `2026-11-2${(n % 9) + 1}T10:00:00Z`, updated_at: '2026-11-25T10:00:00Z', version: 1, deleted_at: null, deleted_by: null,
+      payers: [{ member_id: by, paid_minor: amount }],
+      splits: previewSplit(amount, 'equal', [ID.me, ID.ravi, ID.priya]).map((r) => ({ member_id: r.memberId, share_minor: r.shareMinor, input_value: null })),
+      ...over,
+    });
+    const seed = (b: FakeBackend) => {
+      b.trips = [
+        trip(T.COORG, 'Coorg Coffee Trail', 'Coorg, Karnataka', -3, 1, [me(), ravi(), priya()]),
+        trip(T.EMPTY, 'Gokarna Beach Camp', 'Gokarna', 30, 33, [me()]),
+        trip(T.ARCH, 'Munnar Mist Weekend', 'Munnar', -70, -68, [me(), ravi()], { status: 'archived' }),
+        trip(T.SINGLE, 'Hampi Weekend', 'Hampi', -2, 1, [me(), ravi()]),
+      ];
+      b.expenses = [
+        exp(T.COORG, 'Breakfast', 30000, -3, ID.me, CAT.food),
+        exp(T.COORG, 'Fuel', 150000, -3, ID.ravi, CAT.fuel),
+        exp(T.COORG, 'Hotel', 300000, -3, ID.priya, CAT.accommodation),
+        exp(T.COORG, 'Lunch', 80000, -2, ID.me, CAT.food),
+        exp(T.COORG, 'Activities', 120000, -2, ID.priya, CAT.activities),
+        exp(T.COORG, 'Dinner', 150000, -1, ID.ravi, CAT.food),
+        exp(T.COORG, 'Shopping', 50000, -1, ID.me, CAT.shopping),
+        exp(T.COORG, 'Taxi', 70000, -3, ID.priya, CAT.transportation),
+        exp(T.COORG, 'Snacks', 20000, -2, ID.ravi, null), // no category
+        exp(T.COORG, 'Misc', 10000, -1, ID.me, CAT.other), // a real "Other"
+        exp(T.COORG, 'Cancelled tour', 99999, -2, ID.me, CAT.transportation, { deleted_at: '2026-11-25T12:00:00Z', deleted_by: ID.me }), // deleted: never counted
+        exp(T.ARCH, 'Homestay', 450000, -70, ID.me, CAT.accommodation),
+        exp(T.ARCH, 'Meals', 150000, -69, ID.ravi, CAT.food),
+        exp(T.SINGLE, 'Cab', 60000, -2, ID.me, CAT.transportation),
+      ];
+    };
+    const overflow = (p: Page) => p.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1);
+    const dark = (ctx: BrowserContext) => ctx.addInitScript(() => window.localStorage.setItem('tripmate.theme-preference', 'dark'));
+    const text = async (p: Page, id: string) => (await byId(p, id).innerText().catch(() => '')).replace(/\s+/g, ' ');
+    const money = (s: string) => Number(s.replace(/[^0-9.]/g, ''));
+    const colorOf = (p: Page, id: string) => byId(p, id).evaluate((e) => getComputedStyle(e).color);
+    const rgb = (c: string) => (c.match(/\d+/g) ?? []).map(Number) as [number, number, number];
+
+    const variants = [
+      { name: 'phone-light', opts: { viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true, deviceScaleFactor: 2 }, dark: false },
+      { name: 'phone-dark', opts: { viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true, deviceScaleFactor: 2 }, dark: true },
+      { name: 'desktop-light', opts: { viewport: { width: 1280, height: 900 } }, dark: false },
+      { name: 'desktop-dark', opts: { viewport: { width: 1280, height: 900 } }, dark: true },
+    ] as const;
+
+    for (const v of variants) {
+      const V = v.name;
+      const ctx = await browser.newContext(v.opts);
+      if (v.dark) await dark(ctx);
+      const b = newBackend();
+      seed(b);
+      if (v.dark) b.profile = { ...b.profile, theme_preference: 'dark' };
+      await installFakeSupabase(ctx, b, { keepCollapsed: true });
+      await sessionInStorage(ctx);
+      const p = await ctx.newPage();
+      await p.goto(`${BASE}/trips/${T.COORG}/expenses`);
+      await byId(p, 'expenses-tab-insights').waitFor({ timeout: 20000 });
+      const tabs = await p.locator('[role="tablist"] [role="tab"]:visible').allInnerTexts().catch(() => []);
+      check(`${V}: the tabs are Expenses, Balances and Insights`, JSON.stringify(tabs.map((x) => x.trim())) === JSON.stringify(['Expenses', 'Balances', 'Insights']), JSON.stringify(tabs));
+
+      // ---------- Balances ----------
+      await byId(p, 'expenses-tab-balances').click();
+      await byId(p, 'balances-list').waitFor({ timeout: 15000 });
+      const cards = await p.locator('[data-testid^="balance-"][data-testid$="' + '"]').count();
+      void cards;
+      const meCard = byId(p, `balance-${ID.me}`);
+      check(`${V}: each member is a card with avatar, name, You label, status, amount and the paid/share breakdown`, (await text(p, `balance-name-${ID.me}`)) === 'Asha Rao' && /\bYou\b/.test(await meCard.innerText()) && /^(Is owed|Owes|Settled)$/.test(await text(p, `balance-status-${ID.me}`)) && /^₹/.test(await text(p, `balance-amount-${ID.me}`)) && /^Paid ₹/.test(await text(p, `balance-paid-${ID.me}`)) && /^Share ₹/.test(await text(p, `balance-share-${ID.me}`)));
+      // Asha paid 30000+80000+50000+10000 = 170000 and her share is 980000/3 ~ 326667 minus... (equal split of each expense): she owes
+      const statusMe = await text(p, `balance-status-${ID.me}`);
+      const statusPriya = await text(p, `balance-status-${ID.priya}`);
+      check(`${V}: the figures are the database's: Asha owes, Priya is owed (paid ₹4,900 of ₹9,800... shown as Paid/Share)`, statusMe === 'Owes' && statusPriya === 'Is owed', `${statusMe} / ${statusPriya}`);
+      const owesColour = rgb(await colorOf(p, `balance-amount-${ID.me}`));
+      const owedColour = rgb(await colorOf(p, `balance-amount-${ID.priya}`));
+      check(`${V}: money owed is red-toned and money receivable is green-toned (meaning unchanged)`, owesColour[0] > owesColour[1] && owedColour[1] > owedColour[0], `${owesColour} / ${owedColour}`);
+      check(`${V}: personal and group sections stay distinct: "My Suggested Payments" and "Everyone's Payments" with a group settlement plan label`, (await byId(p, 'settlement-mine-section').isVisible()) && /My Suggested Payments/.test(await text(p, 'settlement-mine-title')) && /Everyone's Payments/.test(await text(p, 'settlement-all-title')) && /Group settlement plan/i.test(await byId(p, 'settlement-card').innerText()));
+      const mineRows = await p.locator('[data-testid^="settlement-mine-row-"]').count();
+      const mineText0 = await text(p, 'settlement-mine-0');
+      check(`${V}: my suggested payments are cards with a direction icon (pay or receive), the name and the amount`, mineRows >= 1 && /^You (pay|receive)/.test(mineText0), mineText0);
+      const lineCount = await p.locator('[data-testid^="settlement-line-amount-"]').count();
+      const sentence = `${await text(p, 'settlement-line-from-0')} ${await text(p, 'settlement-line-verb-0')} ${await text(p, 'settlement-line-to-0')} ${await text(p, 'settlement-line-amount-0')}`;
+      check(`${V}: every group payment is its own card: who pays whom and the amount (${sentence})`, lineCount >= 1 && /^.+ pays .+ ₹/.test(sentence));
+      check(`${V}: the plan's headline, count and the suggestions-only disclaimer are kept`, /payments? settle/.test(await text(p, 'settlement-headline')) && /suggestions only/i.test(await text(p, 'settlement-disclaimer')));
+      check(`${V}: no payment recording controls are offered`, (await p.getByRole('button', { name: /record|mark as paid|settle up/i }).count()) === 0);
+      if (V === 'phone-light' || V === 'phone-dark' || V === 'desktop-light') await shot(p, `r3-balances-${V}`);
+      if (V.startsWith('phone')) check(`${V}: Balances has no horizontal overflow`, await overflow(p));
+
+      // ---------- Insights ----------
+      await byId(p, 'expenses-tab-insights').click();
+      await byId(p, 'insights-summary').waitFor({ timeout: 15000 });
+      check(`${V}: the summary shows the exact total (₹9,800), 10 expenses (the deleted one is not counted) and 8 categories`, (await text(p, 'insights-total')) === '₹9,800' && (await text(p, 'insights-count')) === '10' && (await text(p, 'insights-categories')) === '8', `${await text(p, 'insights-total')} ${await text(p, 'insights-count')} ${await text(p, 'insights-categories')}`);
+      const barKeys = await p.locator('[data-testid^="insights-bar-name-"]').evaluateAll((els) => els.map((e) => e.getAttribute('data-testid')!.replace('insights-bar-name-', '')));
+      check(`${V}: one bar per category used, biggest first (Accommodation, Food, Fuel and tolls, Activities...)`, JSON.stringify(barKeys.slice(0, 4)) === JSON.stringify(['accommodation', 'food', 'fuel_tolls', 'activities']) && barKeys.length === 8, JSON.stringify(barKeys));
+      const barAmounts = await p.locator('[data-testid^="insights-bar-amount-"]').allInnerTexts();
+      const barSum = barAmounts.reduce((a, s) => a + money(s), 0);
+      check(`${V}: the bar amounts add up to the trip total (₹${barSum})`, barSum === 9800, JSON.stringify(barAmounts));
+      check(`${V}: Uncategorized and a real Other category are separate, and the deleted expense is excluded (Transportation ₹700, not ₹1,699.99)`, (await text(p, 'insights-bar-amount-uncategorized')) === '₹200' && (await text(p, 'insights-bar-amount-other')) === '₹100' && (await text(p, 'insights-bar-amount-transportation')) === '₹700');
+      const pcts = await p.locator('[data-testid^="insights-legend-percent-"]').allInnerTexts();
+      const pctSum = Math.round(pcts.reduce((a, s) => a + parseFloat(s), 0) * 10) / 10;
+      check(`${V}: the legend gives each category's name, amount and percentage, and the percentages add up to 100% (${pctSum})`, pcts.length === 8 && pctSum === 100 && (await text(p, 'insights-legend-percent-accommodation')) === '30.6%' && (await text(p, 'insights-legend-amount-food')) === '₹2,600');
+      const donutLabel = (await byId(p, 'insights-donut').getAttribute('aria-label')) ?? '';
+      check(`${V}: the donut has the total in its centre and a readable text description`, (await text(p, 'insights-donut-total')) === '₹9,800' && /Total ₹9,800/.test(donutLabel) && /Accommodation ₹3,000, 30\.6%/.test(donutLabel), donutLabel.slice(0, 120));
+      // same colour for the same category in the bars and in the legend
+      const barColour = await byId(p, 'insights-bar-fill-food').evaluate((e) => getComputedStyle(e).backgroundColor);
+      const swatchColour = await byId(p, 'insights-legend-food').locator('div').first().evaluate((e) => getComputedStyle(e).backgroundColor);
+      check(`${V}: the bar chart and the donut legend use the same colour for the same category`, barColour === swatchColour, `${barColour} vs ${swatchColour}`);
+      const tiles = await byId(p, 'insights-donut').locator('div[style*="rotate"]').count();
+      check(`${V}: the donut ring is drawn (${tiles} tiles)`, tiles >= 200);
+      // the app reads some data through POSTed database functions; those are reads, so only calls that can change data count
+      const writes = b.requests.filter((r) => r.method !== 'GET' && r.method !== 'OPTIONS' && !/\/auth\//.test(r.path) && !/rpc\/(list_|get_|trip_member_balances)/.test(r.path));
+      check(`${V}: opening Insights made no write of any kind`, writes.length === 0, JSON.stringify(writes.map((r) => r.path)));
+      if (V.startsWith('phone')) check(`${V}: Insights has no horizontal overflow`, await overflow(p));
+      await shot(p, `r3-insights-${V}`);
+
+      await p.goto(`${BASE}/trips/${T.COORG}`);
+      await byId(p, 'trip-people').waitFor({ timeout: 20000 });
+      await byId(p, 'trip-people').scrollIntoViewIfNeeded();
+      await p.waitForTimeout(300);
+      check(`${V}: People are member cards with Admin/Member, You and Guest tags and a manage control`, (await p.locator('[data-testid^="member-name-"]').count()) === 3 && /Admin/.test(await byId(p, `member-${ID.me}`).innerText()) && /You/.test(await byId(p, `member-${ID.me}`).innerText()) && (await byId(p, 'add-guest').isVisible()));
+      await shot(p, `r3-members-${V}`);
+      // the Settings gear on Profile: teeth and a centre hole, no filled circle behind it, a 44px target, labelled
+      await p.goto(`${BASE}/profile`);
+      await byId(p, 'open-settings').waitFor({ timeout: 20000 });
+      const gearBox = await byId(p, 'open-settings').boundingBox();
+      const gearBg = await byId(p, 'open-settings').evaluate((e) => getComputedStyle(e).backgroundColor);
+      check(`${V}: the Settings gear is a labelled 44px target with no filled circle behind it`, !!gearBox && gearBox.width >= 43.9 && gearBox.height >= 43.9 && (await byId(p, 'open-settings').getAttribute('aria-label')) === 'Settings' && (gearBg === "rgba(0, 0, 0, 0)" || gearBg === "transparent"), `${gearBg} ${JSON.stringify(gearBox)}`);
+      await p.waitForTimeout(300);
+      await byId(p, 'open-settings').locator('xpath=..').screenshot({ path: path.join(SHOTS, `r4-settings-icon-${V}.png`) });
+      await p.goto(`${BASE}/trips/${T.COORG}/expenses`);
+      await byId(p, 'expenses-tab-insights').waitFor({ timeout: 20000 });
+      if (V === 'phone-light') {
+        await byId(p, 'expenses-tab-insights').click();
+        // a category edit is reflected: Hotel loses its category (reload to read the data again)
+        const hotel = b.expenses.find((e: any) => e.title === 'Hotel')!;
+        hotel.category_id = null;
+        await p.reload();
+        await byId(p, 'expenses-tab-insights').click();
+        await byId(p, 'insights-summary').waitFor({ timeout: 15000 });
+        check('a category change moves the amount: Accommodation disappears and Uncategorized becomes ₹3,200; the total is unchanged', (await byId(p, 'insights-bar-accommodation').count()) === 0 && (await text(p, 'insights-bar-amount-uncategorized')) === '₹3,200' && (await text(p, 'insights-total')) === '₹9,800');
+        hotel.category_id = CAT.accommodation;
+        // deleting an expense updates the numbers
+        const dinner = b.expenses.find((e: any) => e.title === 'Dinner')!;
+        dinner.deleted_at = '2026-11-26T09:00:00Z';
+        await p.reload();
+        await byId(p, 'expenses-tab-insights').click();
+        await byId(p, 'insights-summary').waitFor({ timeout: 15000 });
+        check('deleting an expense updates Insights: total ₹8,300 and 9 expenses (restoring brings it back)', (await text(p, 'insights-total')) === '₹8,300' && (await text(p, 'insights-count')) === '9');
+        dinner.deleted_at = null;
+        await p.reload();
+        await byId(p, 'expenses-tab-insights').click();
+        await byId(p, 'insights-summary').waitFor({ timeout: 15000 });
+        check('restoring it puts the figures back (₹9,800, 10 expenses)', (await text(p, 'insights-total')) === '₹9,800' && (await text(p, 'insights-count')) === '10');
+      }
+      await ctx.close();
+    }
+
+    // ---------- empty, single category and archived ----------
+    {
+      const ctx = await browser.newContext({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
+      const b = newBackend();
+      seed(b);
+      await installFakeSupabase(ctx, b, { keepCollapsed: true });
+      await sessionInStorage(ctx);
+      const p = await ctx.newPage();
+      await p.goto(`${BASE}/trips/${T.EMPTY}/expenses`);
+      await byId(p, 'expenses-tab-insights').waitFor({ timeout: 20000 });
+      await byId(p, 'expenses-tab-insights').click();
+      check('zero expenses: a friendly empty message, no charts, no errors', await byId(p, 'insights-empty').waitFor({ timeout: 10000 }).then(() => true, () => false) && (await byId(p, 'insights-donut').count()) === 0 && (await byId(p, 'insights-error').count()) === 0);
+      await p.goto(`${BASE}/trips/${T.SINGLE}/expenses`);
+      await byId(p, 'expenses-tab-insights').click();
+      await byId(p, 'insights-summary').waitFor({ timeout: 15000 });
+      check('a single category: one bar, one legend row at 100%, and the donut shows the whole ring', (await p.locator('[data-testid^="insights-bar-name-"]').count()) === 1 && (await text(p, 'insights-legend-percent-transportation')) === '100%' && (await text(p, 'insights-total')) === '₹600');
+      await p.goto(`${BASE}/trips/${T.ARCH}/expenses`);
+      await byId(p, 'expenses-tab-insights').click();
+      await byId(p, 'insights-summary').waitFor({ timeout: 15000 });
+      check('an archived trip still shows Insights (read-only), in the trip currency', (await text(p, 'insights-total')) === '₹6,000' && (await byId(p, 'insights-bar-accommodation').isVisible()));
+      await ctx.close();
+    }
+    {
+      // a failed read shows an error with Try again, never partial totals
+      const ctx = await browser.newContext({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
+      const b = newBackend();
+      seed(b);
+      b.failExpenseReads = true;
+      await installFakeSupabase(ctx, b, { keepCollapsed: true });
+      await sessionInStorage(ctx);
+      const p = await ctx.newPage();
+      await p.goto(`${BASE}/trips/${T.COORG}/expenses`);
+      await byId(p, 'expenses-tab-insights').waitFor({ timeout: 20000 });
+      await byId(p, 'expenses-tab-insights').click();
+      check('if the expenses cannot be read, Insights shows an error with Try again and no totals', (await byId(p, 'insights-error').waitFor({ timeout: 90000 }).then(() => true, () => false)) && (await byId(p, 'insights-total').count()) === 0 && (await byId(p, 'insights-retry').count()) === 1);
+      b.failExpenseReads = false;
+      await byId(p, 'insights-retry').click();
+      check('Try again then shows the insights', await byId(p, 'insights-summary').waitFor({ timeout: 20000 }).then(() => true, () => false));
+      await ctx.close();
+    }
+  } finally {
+    site.stop();
+  }
+}
+
+async function bigTripFlows(browser: Awaited<ReturnType<typeof chromium.launch>>) {
+  console.log('\nT. A trip with more than 1,000 expenses: complete paged reads, totals, Insights, later-page failure');
+  const site = await startWebsite({ EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY: DUMMY_PUBLISHABLE_KEY, EXPO_PUBLIC_SUPABASE_URL: SUPABASE_URL });
+  try {
+    const ID = { me: uuid(9851), ravi: uuid(9852) } as const;
+    const BIG = uuid(991);
+    const RAVI = '22222222-2222-4222-8222-222222222222';
+    const me = memberRow({ id: ID.me, user_id: USER.id, display_name: 'Asha Rao', role: 'admin', joined_at: '2026-11-18T09:00:00+00:00' });
+    const ravi = memberRow({ id: ID.ravi, user_id: RAVI, display_name: 'Ravi Kumar', joined_at: '2026-11-18T10:00:00+00:00' });
+    const N = 1200;
+    const DAYS = 20;
+    const seed = (b: FakeBackend) => {
+      b.trips = [tripRow({ id: BIG, name: 'Grand Tour', destination: 'Everywhere', start_date: dayFromToday(-DAYS), end_date: dayFromToday(1), members: [me, ravi].map((m) => ({ id: m.id, status: m.status })), _members: [me, ravi] })];
+      b.expenses = Array.from({ length: N }, (_, i) => {
+        const amount = 1000 + (i % 13) * 100; // paise
+        return {
+          id: uuid(20000 + i), tripId: BIG, title: `Item ${i}`, amount_minor: amount, category_id: uuid(9700 + (i % 7)), spent_on: dayFromToday(-DAYS + (i % DAYS)), notes: null, split_method: 'equal',
+          created_by: ID.me, updated_by: null, created_at: `2026-11-2${(i % 8) + 1}T10:${String(i % 60).padStart(2, '0')}:00Z`, updated_at: '2026-11-25T10:00:00Z', version: 1,
+          deleted_at: i % 10 === 0 ? '2026-11-26T10:00:00Z' : null, deleted_by: i % 10 === 0 ? ID.me : null,
+          payers: [{ member_id: ID.me, paid_minor: amount }],
+          splits: previewSplit(amount, 'equal', [ID.me, ID.ravi]).map((r) => ({ member_id: r.memberId, share_minor: r.shareMinor, input_value: null })),
+        };
+      });
+    };
+    const live = (b: FakeBackend) => b.expenses.filter((e: any) => !e.deleted_at);
+    const rupees = (minor: number) => `₹${(minor / 100).toLocaleString('en-IN', { minimumFractionDigits: minor % 100 === 0 ? 0 : 2, maximumFractionDigits: 2 })}`;
+    const text = async (p: Page, id: string) => (await byId(p, id).innerText().catch(() => '')).replace(/\s+/g, ' ');
+
+    const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+    const b = newBackend();
+    seed(b);
+    await installFakeSupabase(ctx, b, { keepCollapsed: true });
+    await sessionInStorage(ctx);
+    const p = await ctx.newPage();
+    await p.goto(`${BASE}/trips/${BIG}/expenses`);
+    await byId(p, 'expenses-count').waitFor({ timeout: 60000 });
+    const activeTotal = live(b).reduce((a: number, e: any) => a + e.amount_minor, 0);
+    const activeCount = live(b).length;
+    check(`all ${N} expenses were read although one response holds at most 1,000 rows: the Expenses tab counts ${activeCount} active and totals ${rupees(activeTotal)}`, (await text(p, 'expenses-count')).startsWith(`${activeCount} expenses`) && (await text(p, 'expenses-count')).includes(rupees(activeTotal)), await text(p, 'expenses-count'));
+    const expPages = b.expenseReadRequests.filter((r) => r.table === 'expenses').map((r) => r.from);
+    check('the expenses were fetched in pages (rows 0 and 1000), and payers and shares too', JSON.stringify(expPages.slice(0, 2)) === JSON.stringify([0, 1000]) && b.expenseReadRequests.some((r) => r.table === 'expense_payers' && r.from === 1000) && b.expenseReadRequests.some((r) => r.table === 'expense_splits' && r.from === 1000), JSON.stringify(b.expenseReadRequests.slice(0, 8)));
+    const dayTotals = await p.locator('[data-testid^="expense-day-total-"]').allInnerTexts();
+    const dayCounts = await p.locator('[data-testid^="expense-day-count-"]').allInnerTexts();
+    const num = (s: string) => Number(s.replace(/[^0-9.]/g, ''));
+    const activeDays = new Set(live(b).map((e: any) => e.spent_on)).size;
+    check(`${activeDays} day cards (days with only deleted expenses get none), whose counts add up to ${activeCount} and whose totals add up to the overall total`, dayTotals.length === activeDays && dayCounts.reduce((a, s) => a + num(s), 0) === activeCount && Math.round(dayTotals.reduce((a, s) => a + num(s), 0) * 100) === activeTotal, `${dayTotals.length} days`);
+    check('the deleted expenses are in their own section and in no day total', /Deleted \(120\)/.test(await text(p, 'expenses-deleted-toggle')));
+
+    await byId(p, 'expenses-tab-insights').click();
+    await byId(p, 'insights-summary').waitFor({ timeout: 30000 });
+    check('Insights total equals the complete active expense total, and its count equals the active count', (await text(p, 'insights-total')) === rupees(activeTotal) && (await text(p, 'insights-count')) === String(activeCount) && (await text(p, 'insights-categories')) === '7', `${await text(p, 'insights-total')} / ${await text(p, 'insights-count')}`);
+    const barSum = (await p.locator('[data-testid^="insights-bar-amount-"]').allInnerTexts()).reduce((a, s) => a + num(s), 0);
+    check('the category bars add up to the same total', Math.round(barSum * 100) === activeTotal, String(barSum));
+
+    await byId(p, 'expenses-tab-balances').click();
+    await byId(p, 'balances-list').waitFor({ timeout: 30000 });
+    const rpc = b.requests.filter((r) => r.path.includes('trip_member_balances'));
+    check('the official balances come from the database function as before (one call, no paging, a handful of rows)', rpc.length >= 1 && (await p.locator('[data-testid^="balance-name-"]').count()) === 2);
+    await ctx.close();
+
+    // a later page fails: nothing partial is shown, and Try again works
+    const ctx2 = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+    const b2 = newBackend();
+    seed(b2);
+    b2.failExpensePageFrom = 1000;
+    await installFakeSupabase(ctx2, b2, { keepCollapsed: true });
+    await sessionInStorage(ctx2);
+    const p2 = await ctx2.newPage();
+    await p2.goto(`${BASE}/trips/${BIG}/expenses`);
+    check('when page 2 cannot be fetched the Expenses tab shows an error, with no count, no day cards and no totals', (await byId(p2, 'expenses-error').waitFor({ timeout: 90000 }).then(() => true, () => false)) && (await byId(p2, 'expenses-count').count()) === 0 && (await p2.locator('[data-testid^="expense-day-"]').count()) === 0);
+    await byId(p2, 'expenses-tab-insights').click();
+    check('Insights shows its error too, never a partial total', (await byId(p2, 'insights-error').waitFor({ timeout: 90000 }).then(() => true, () => false)) && (await byId(p2, 'insights-total').count()) === 0);
+    b2.failExpensePageFrom = null;
+    await byId(p2, 'insights-retry').click();
+    check('Try again then shows the complete figures', (await byId(p2, 'insights-summary').waitFor({ timeout: 60000 }).then(() => true, () => false)) && (await text(p2, 'insights-count')) === String(live(b2).length));
+    await ctx2.close();
+  } finally {
+    site.stop();
+  }
+}
+
 async function main() {
   const browser = await chromium.launch({ channel: 'msedge', headless: true });
   try {
@@ -4288,6 +5355,18 @@ async function main() {
       await inputFlows(browser);
     } else if (process.env.UI_ONLY === 'P') {
       await settlementFlows(browser);
+    } else if (process.env.UI_ONLY === 'R') {
+      await refinementFlows(browser);
+    } else if (process.env.UI_ONLY === 'T') {
+      await bigTripFlows(browser);
+    } else if (process.env.UI_ONLY === 'S') {
+      await insightsFlows(browser);
+    } else if (process.env.UI_ONLY === 'Q') {
+      await redesignFlows(browser);
+    } else if (process.env.UI_ONLY === 'D') {
+      await signedInFlows(browser);
+    } else if (process.env.UI_ONLY === 'E') {
+      await tripFlows(browser);
     } else {
       await setupScreens(browser);
       await accountFlows(browser);
@@ -4302,6 +5381,10 @@ async function main() {
       await splitFlows(browser);
       await inputFlows(browser);
       await settlementFlows(browser);
+      await redesignFlows(browser);
+      await refinementFlows(browser);
+      await insightsFlows(browser);
+      await bigTripFlows(browser);
     }
   } finally {
     await browser.close();

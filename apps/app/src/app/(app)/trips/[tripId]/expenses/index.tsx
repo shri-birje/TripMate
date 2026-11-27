@@ -4,7 +4,9 @@ import { Pressable, View } from 'react-native';
 import {
   balanceKind,
   canAddExpense,
+  dayHeading,
   expenseTotals,
+  groupExpensesByDay,
   formatDateRange,
   paidByLabel,
   personLabels,
@@ -17,16 +19,20 @@ import { AppText } from '../../../../../components/AppText';
 import { Banner } from '../../../../../components/Banner';
 import { Button } from '../../../../../components/Button';
 import { Card } from '../../../../../components/Card';
-import { SegmentedControl } from '../../../../../components/SegmentedControl';
+import { SurfaceContext } from '../../../../../components/Surface';
+import { UnderlineTabs } from '../../../../../components/UnderlineTabs';
 import { useUserId } from '../../../../../features/auth/AuthProvider';
 import { useExpenseCategories, useExpenses, useTripBalances } from '../../../../../features/trips/expenseApi';
+import { MemberBalances } from '../../../../../features/trips/BalancesView';
+import { ExpenseDayCard, ExpenseRow } from '../../../../../features/trips/ExpenseDayCard';
+import { InsightsTab } from '../../../../../features/trips/InsightsTab';
 import { SettlementPlanCard } from '../../../../../features/trips/SettlementPlanCard';
 import { TripScope } from '../../../../../features/trips/TripScope';
 import { formatMoney } from '../../../../../lib/format';
 import { useTheme } from '../../../../../theme/ThemeProvider';
-import { radius, spacing } from '../../../../../theme/tokens';
+import { spacing } from '../../../../../theme/tokens';
 
-type Tab = 'list' | 'balances';
+type Tab = 'list' | 'balances' | 'insights';
 
 const NOTICES: Record<string, string> = {
   added: 'Expense added.',
@@ -68,12 +74,13 @@ function ExpensesBody({ details, reload, notice }: { details: TripDetails; reloa
           {notice}
         </Banner>
       )}
-      <SegmentedControl<Tab>
+      <UnderlineTabs<Tab>
         label="Show"
         testIDPrefix="expenses-tab"
         options={[
           { value: 'list', label: 'Expenses' },
           { value: 'balances', label: 'Balances' },
+          { value: 'insights', label: 'Insights' },
         ]}
         value={tab}
         onChange={setTab}
@@ -101,10 +108,12 @@ function ExpensesBody({ details, reload, notice }: { details: TripDetails; reloa
               {expenses.error.kind !== 'unavailable' && <Button testID="expenses-retry" label="Try again" variant="secondary" onPress={() => void expenses.refetch()} loading={expenses.isFetching} />}
             </Card>
           )}
-          {expenses.data && <ExpenseList details={details} expenses={expenses.data} categories={categories.data ?? []} />}
+          {expenses.data && <ExpenseList key={trip.id} details={details} expenses={expenses.data} categories={categories.data ?? []} />}
         </>
-      ) : (
+      ) : tab === 'balances' ? (
         <BalancesTab details={details} reload={reload} />
+      ) : (
+        <InsightsTab details={details} />
       )}
     </>
   );
@@ -112,10 +121,20 @@ function ExpensesBody({ details, reload, notice }: { details: TripDetails; reloa
 
 function ExpenseList({ details, expenses, categories }: { details: TripDetails; expenses: StoredExpense[]; categories: readonly ExpenseCategory[] }) {
   const [showDeleted, setShowDeleted] = useState(false);
+  // Which trip days are open. All start closed; several can be open together. Held here so a refresh of the data keeps them as they are.
+  const [expandedDays, setExpandedDays] = useState<ReadonlySet<string>>(() => new Set());
+  const toggleDay = (iso: string) =>
+    setExpandedDays((prev) => {
+      const next = new Set(prev);
+      if (next.has(iso)) next.delete(iso);
+      else next.add(iso);
+      return next;
+    });
   const labels = personLabels(details);
   const live = expenses.filter((e) => !e.deleted);
   const deleted = expenses.filter((e) => e.deleted);
   const totals = expenseTotals(expenses);
+  const days = groupExpensesByDay(live, details.trip.startDate);
 
   if (expenses.length === 0) {
     return (
@@ -139,11 +158,20 @@ function ExpenseList({ details, expenses, categories }: { details: TripDetails; 
           Every expense has been deleted. You can restore them below.
         </AppText>
       )}
-      <View style={{ gap: spacing.sm }} testID="expenses-list">
-        {live.map((e) => (
-          <ExpenseRow key={e.id} details={details} expense={e} categories={categories} labels={labels} />
+      {/* One panel per trip day that has expenses: Day 1 is the trip's start day, worked out from each expense's own date. */}
+      <View style={{ gap: spacing.lg }} testID="expenses-list">
+        {days.map((g) => (
+          <ExpenseDayCard
+            key={g.dateIso}
+            group={g}
+            details={details}
+            categories={categories}
+            labels={labels}
+            open={expandedDays.has(g.dateIso)}
+            onToggle={() => toggleDay(g.dateIso)}
+          />
         ))}
-      </View>
+      </View>
       {deleted.length > 0 && (
         <View style={{ gap: spacing.sm }}>
           <Pressable
@@ -159,11 +187,13 @@ function ExpenseList({ details, expenses, categories }: { details: TripDetails; 
             </AppText>
           </Pressable>
           {showDeleted && (
-            <View style={{ gap: spacing.sm }} testID="expenses-deleted-list">
-              {deleted.map((e) => (
-                <ExpenseRow key={e.id} details={details} expense={e} categories={categories} labels={labels} />
-              ))}
-            </View>
+            <Card>
+              <View style={{ gap: spacing.xs }} testID="expenses-deleted-list">
+                {deleted.map((e) => (
+                  <ExpenseRow key={e.id} details={details} expense={e} categories={categories} labels={labels} />
+                ))}
+              </View>
+            </Card>
           )}
         </View>
       )}
@@ -171,46 +201,9 @@ function ExpenseList({ details, expenses, categories }: { details: TripDetails; 
   );
 }
 
-function ExpenseRow({ details, expense: e, categories, labels }: { details: TripDetails; expense: StoredExpense; categories: readonly ExpenseCategory[]; labels: ReturnType<typeof personLabels> }) {
-  const router = useRouter();
-  const { colors } = useTheme();
-  const category = e.categoryId === null ? null : (categories.find((c) => c.id === e.categoryId)?.name ?? null);
-  return (
-    <Pressable
-      testID={`expense-row-${e.id}`}
-      onPress={() => router.push(`/trips/${details.trip.id}/expenses/${e.id}`)}
-      role="link"
-      aria-label={`${e.title}, ${formatMoney(e.amountMinor, details.trip.currency)}${e.deleted ? ', deleted' : ''}`}
-      style={{ padding: spacing.md, gap: spacing.xs, borderRadius: radius.lg, borderWidth: 1, borderColor: colors.border, backgroundColor: colors.surface, opacity: e.deleted ? 0.7 : 1 }}
-    >
-      <View style={{ flexDirection: 'row', justifyContent: 'space-between', gap: spacing.md }}>
-        <AppText testID={`expense-title-${e.id}`} style={{ flex: 1, fontWeight: '600', textDecorationLine: e.deleted ? 'line-through' : 'none' }}>
-          {e.title}
-        </AppText>
-        <AppText testID={`expense-amount-${e.id}`} style={{ fontWeight: '700' }}>
-          {formatMoney(e.amountMinor, details.trip.currency)}
-        </AppText>
-      </View>
-      <AppText variant="small" tone="secondary" testID={`expense-meta-${e.id}`}>
-        {[category, formatDateRange(e.spentOn, e.spentOn)].filter(Boolean).join(' · ')}
-      </AppText>
-      <AppText variant="small" tone="secondary" testID={`expense-paidby-${e.id}`}>
-        {paidByLabel(e, labels)}
-      </AppText>
-      {e.deleted && (
-        <AppText variant="small" tone="error" testID={`expense-deleted-${e.id}`}>
-          Deleted
-        </AppText>
-      )}
-    </Pressable>
-  );
-}
-
 function BalancesTab({ details, reload }: { details: TripDetails; reload: () => void }) {
   const { trip } = details;
-  const { colors } = useTheme();
   const balances = useTripBalances(trip.id);
-  const labels = personLabels(details);
   void reload;
 
   if (balances.isPending) {
@@ -231,44 +224,9 @@ function BalancesTab({ details, reload }: { details: TripDetails; reload: () => 
     );
   }
   const lines = balances.data ?? [];
-  const everyoneSettled = lines.every((l) => balanceKind(l) === 'settled');
-  const ordered = [...lines].sort((a, b) => {
-    const fa = labels.get(a.memberId)?.former ? 1 : 0;
-    const fb = labels.get(b.memberId)?.former ? 1 : 0;
-    return fa - fb || b.netMinor - a.netMinor;
-  });
   return (
     <>
-      <Card>
-        <AppText variant="heading">Who owes whom</AppText>
-        <AppText variant="small" tone="secondary" testID="balances-note">
-          Each balance adds up every expense on the trip: what a person paid, minus their share.
-        </AppText>
-        {everyoneSettled && (
-          <AppText tone="ok" testID="balances-settled">
-            {lines.length > 0 && expenseLinesExist(lines) ? 'Everyone is settled.' : 'Nobody owes anything yet.'}
-          </AppText>
-        )}
-        <View style={{ gap: spacing.sm }} testID="balances-list">
-          {ordered.map((l) => {
-            const kind = balanceKind(l);
-            const name = personName(labels, l.memberId);
-            const sentence = kind === 'owes' ? `${name} owes ${formatMoney(-l.netMinor, trip.currency)}` : kind === 'owed' ? `${name} is owed ${formatMoney(l.netMinor, trip.currency)}` : `${name} is settled`;
-            return (
-              <View key={l.memberId} testID={`balance-${l.memberId}`} style={{ flexDirection: 'row', justifyContent: 'space-between', gap: spacing.md, borderBottomWidth: 1, borderBottomColor: colors.border, paddingBottom: spacing.sm }}>
-                <View style={{ flex: 1, gap: 2 }}>
-                  <AppText testID={`balance-text-${l.memberId}`} tone={kind === 'owed' ? 'ok' : kind === 'owes' ? 'error' : 'secondary'} style={{ fontWeight: '600' }}>
-                    {sentence}
-                  </AppText>
-                  <AppText variant="small" tone="secondary" testID={`balance-detail-${l.memberId}`}>
-                    {`Paid ${formatMoney(l.paidMinor, trip.currency)} · share ${formatMoney(l.shareMinor, trip.currency)}`}
-                  </AppText>
-                </View>
-              </View>
-            );
-          })}
-        </View>
-      </Card>
+      <MemberBalances details={details} lines={lines} />
       <SettlementPlanCard details={details} lines={lines} />
       <AppText variant="small" tone="secondary" testID="balances-later">
         Recording repayments is not part of the app yet. These figures only show where everyone stands.
@@ -276,6 +234,3 @@ function BalancesTab({ details, reload }: { details: TripDetails; reload: () => 
     </>
   );
 }
-
-/** Whether any money has moved at all (someone paid or owes), so "settled" reads right for an empty trip. */
-const expenseLinesExist = (lines: { paidMinor: number; shareMinor: number }[]) => lines.some((l) => l.paidMinor > 0 || l.shareMinor > 0);

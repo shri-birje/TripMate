@@ -17,6 +17,8 @@ export * from './dateInput';
 export * from './calendar';
 export * from './expense';
 export * from './expenseView';
+export * from './expenseDays';
+export * from './expenseInsights';
 export * from './expenseHistory';
 export * from './inputFilter';
 export * from './settlementPlan';

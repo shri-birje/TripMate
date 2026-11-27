@@ -58,18 +58,24 @@ interface PgError {
 
 type Reply<T> = PromiseLike<{ data: T | null; error: PgError | null }>;
 
-interface ReadQuery<T> extends PromiseLike<{ data: T[] | null; error: PgError | null }> {
+interface ReadQuery<T> extends PromiseLike<{ data: T[] | null; error: PgError | null; count?: number | null }> {
   eq(column: string, value: string): ReadQuery<T>;
   order(column: string, options?: { ascending?: boolean }): ReadQuery<T>;
+  /** Rows `from` to `to`, both included (zero based). */
+  range(from: number, to: number): ReadQuery<T>;
+}
+
+interface SelectOptions {
+  count?: 'exact';
 }
 
 export type ExpenseFunction = 'create_expense' | 'update_expense' | 'delete_expense' | 'restore_expense' | 'trip_member_balances';
 
 export interface ExpenseClient {
   rpc(fn: ExpenseFunction, args: Record<string, unknown>): Reply<unknown>;
-  from(table: 'expenses'): { select(columns: string): ReadQuery<ExpenseRowRecord> };
-  from(table: 'expense_payers'): { select(columns: string): ReadQuery<PayerRowRecord> };
-  from(table: 'expense_splits'): { select(columns: string): ReadQuery<ShareRowRecord> };
+  from(table: 'expenses'): { select(columns: string, options?: SelectOptions): ReadQuery<ExpenseRowRecord> };
+  from(table: 'expense_payers'): { select(columns: string, options?: SelectOptions): ReadQuery<PayerRowRecord> };
+  from(table: 'expense_splits'): { select(columns: string, options?: SelectOptions): ReadQuery<ShareRowRecord> };
   from(table: 'categories'): { select(columns: string): ReadQuery<CategoryRowRecord> };
   from(table: 'expense_revisions'): { select(columns: string): ReadQuery<RevisionRowRecord> };
 }
@@ -200,6 +206,50 @@ async function read<T>(query: ReadQuery<T>): Promise<T[]> {
   return reply.data ?? [];
 }
 
+/** How many rows are asked for per request. Supabase caps one response (1,000 rows by default), so a trip is read in pages of this size. */
+export const EXPENSE_PAGE_SIZE = 1000;
+
+/** Raised inside a paged read when the data moved while the pages were being read; the whole read is simply started again. */
+class MovedWhileReading extends Error {}
+
+/**
+ * Reads EVERY row of a query, page by page, and proves it did:
+ *  - every request asks the database for the exact total (`count`), and the total must be the same on every page (if it moves,
+ *    something was added or removed meanwhile, so the read starts again);
+ *  - paging stops only when the rows collected equal that total, never because a page "looked short" (so a server that caps a response
+ *    below the page size cannot make the read stop early);
+ *  - a row seen twice (the data shifted under the pages) or an empty page before the total is reached starts the read again;
+ *  - a failed page fails the whole read. Rows from earlier pages are never returned as if they were the full list.
+ * The query must have a unique, stable ORDER so pages never overlap or leave gaps.
+ */
+async function readAllPages<T>(page: (from: number, to: number) => ReadQuery<T>, keyOf: (row: T) => string): Promise<T[]> {
+  const rows: T[] = [];
+  const seen = new Set<string>();
+  let total: number | null = null;
+  for (;;) {
+    let reply: Awaited<ReturnType<typeof page>>;
+    try {
+      reply = await page(rows.length, rows.length + EXPENSE_PAGE_SIZE - 1);
+    } catch (e) {
+      throw toError({ message: e instanceof Error ? e.message : '' });
+    }
+    if (reply.error) throw toError(reply.error);
+    const count = reply.count;
+    if (typeof count !== 'number' || !Number.isSafeInteger(count) || count < 0) throw E('unknown'); // cannot prove completeness
+    if (total === null) total = count;
+    else if (count !== total) throw new MovedWhileReading();
+    const data = reply.data ?? [];
+    for (const row of data) {
+      const key = keyOf(row);
+      if (seen.has(key)) throw new MovedWhileReading();
+      seen.add(key);
+      rows.push(row);
+    }
+    if (rows.length === total) return rows;
+    if (rows.length > total || data.length === 0) throw new MovedWhileReading();
+  }
+}
+
 const asRecord = (v: unknown): Record<string, unknown> | null => (typeof v === 'object' && v !== null ? (v as Record<string, unknown>) : null);
 const badTrip = () => E('unavailable');
 const badId = () => E('not_found');
@@ -305,14 +355,31 @@ export async function restoreExpense(client: ExpenseClient, ref: ExpenseRef): Pr
  */
 export async function listExpenses(client: ExpenseClient, tripId: string): Promise<StoredExpense[]> {
   if (!isValidTripId(tripId)) throw badTrip();
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const expenses = await read(client.from('expenses').select(EXPENSE_COLUMNS).eq('trip_id', tripId).order('spent_on', { ascending: false }).order('created_at', { ascending: false }));
-    const payers = await read(client.from('expense_payers').select(PAYER_COLUMNS).eq('trip_id', tripId));
-    const shares = await read(client.from('expense_splits').select(SHARE_COLUMNS).eq('trip_id', tripId));
-    const joined = expensesFromRows(expenses, payers, shares);
-    if (joined) return joined;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      // Each table is read in full, page by page, in a unique order (a trip holds up to 2,000 expenses and several payer and share rows each).
+      const expenses = await readAllPages(
+        (from, to) =>
+          client.from('expenses').select(EXPENSE_COLUMNS, { count: 'exact' }).eq('trip_id', tripId)
+            .order('spent_on', { ascending: false }).order('created_at', { ascending: false }).order('id', { ascending: false }).range(from, to),
+        (r) => r.id,
+      );
+      const payers = await readAllPages(
+        (from, to) => client.from('expense_payers').select(PAYER_COLUMNS, { count: 'exact' }).eq('trip_id', tripId).order('expense_id', { ascending: true }).order('trip_member_id', { ascending: true }).range(from, to),
+        (r) => `${r.expense_id}/${r.trip_member_id}`,
+      );
+      const shares = await readAllPages(
+        (from, to) => client.from('expense_splits').select(SHARE_COLUMNS, { count: 'exact' }).eq('trip_id', tripId).order('expense_id', { ascending: true }).order('trip_member_id', { ascending: true }).range(from, to),
+        (r) => `${r.expense_id}/${r.trip_member_id}`,
+      );
+      // Every expense must have its payers and shares and the amounts must add up: if a change landed between the reads, this fails and we read again.
+      const joined = expensesFromRows(expenses, payers, shares);
+      if (joined) return joined;
+    } catch (e) {
+      if (!(e instanceof MovedWhileReading)) throw e;
+    }
   }
-  throw E('unknown');
+  throw E('unknown'); // never a partial list
 }
 
 /** One expense of the trip, or a 'not_found' error (the same answer whether it never existed, belongs to another trip, or you may not see it). */

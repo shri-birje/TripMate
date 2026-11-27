@@ -29,7 +29,7 @@ const A = '00000000-0000-4000-8000-0000000000a1';
 const B = '00000000-0000-4000-8000-0000000000b2';
 const C = '00000000-0000-4000-8000-0000000000c3';
 
-type PgReply = { data: unknown; error: { code?: string; message?: string; details?: string } | null };
+type PgReply = { data: unknown; error: { code?: string; message?: string; details?: string } | null; count?: number | null };
 interface Tables {
   expenses?: unknown[];
   expense_payers?: unknown[];
@@ -43,7 +43,7 @@ interface Tables {
 /** A fake of the slice of Supabase's client the service uses. Records every call. */
 function fake(rpcReply: PgReply | (() => PgReply) = { data: [], error: null }, tables: Tables = {}) {
   const rpcCalls: { fn: ExpenseFunction; args: Record<string, unknown> }[] = [];
-  const reads: { table: string; columns: string; filters: [string, string][]; orders: [string, boolean][] }[] = [];
+  const reads: { table: string; columns: string; filters: [string, string][]; orders: [string, boolean][]; ranges: [number, number][]; counted: boolean }[] = [];
   const replies = [...(tables.readReplies ?? [])];
   const client = {
     rpc: (fn: ExpenseFunction, args: Record<string, unknown>) => {
@@ -51,16 +51,23 @@ function fake(rpcReply: PgReply | (() => PgReply) = { data: [], error: null }, t
       return Promise.resolve(typeof rpcReply === 'function' ? rpcReply() : rpcReply);
     },
     from: (table: string) => ({
-      select: (columns: string) => {
-        const rec = { table, columns, filters: [] as [string, string][], orders: [] as [string, boolean][] };
+      select: (columns: string, options?: { count?: string }) => {
+        const rec = { table, columns, filters: [] as [string, string][], orders: [] as [string, boolean][], ranges: [] as [number, number][], counted: options?.count === 'exact' };
         reads.push(rec);
         const q = {
           eq: (c: string, v: string) => (rec.filters.push([c, v]), q),
           order: (c: string, o?: { ascending?: boolean }) => (rec.orders.push([c, o?.ascending !== false]), q),
+          range: (from: number, to: number) => (rec.ranges.push([from, to]), q),
           then: (ok: (v: PgReply) => unknown, bad?: (e: unknown) => unknown) => {
             const next = replies.shift();
             const rows = (tables as Record<string, unknown[] | undefined>)[table] ?? [];
-            return Promise.resolve(next ?? { data: rows, error: null }).then(ok, bad);
+            // like the real database: the requested slice of the rows, and (when asked) the exact total
+            const last = rec.ranges.at(-1);
+            const slice = last ? rows.slice(last[0], last[1] + 1) : rows;
+            const reply: PgReply = next
+              ? 'count' in next || !Array.isArray(next.data) ? next : { ...next, count: next.data.length } // a canned reply counts its own rows unless it says otherwise
+              : { data: slice, error: null, count: rows.length };
+            return Promise.resolve(reply).then(ok, bad);
           },
         };
         return q;
@@ -274,12 +281,14 @@ describe('reading expenses (direct reads under row-level security)', () => {
     expect(list[0]).toMatchObject({ id: EXP, amountMinor: 600, version: 1, deleted: false });
     expect(list[0]!.shares.map((s) => s.memberId)).toEqual([A, B]);
     expect(reads.map((r) => r.table)).toEqual(['expenses', 'expense_payers', 'expense_splits']);
+    expect(reads[1]!.orders).toEqual([['expense_id', true], ['trip_member_id', true]]);
     expect(reads.map((r) => r.columns)).toEqual([EXPENSE_COLUMNS, PAYER_COLUMNS, SHARE_COLUMNS]);
     for (const r of reads) {
       expect(r.columns).not.toContain('*');
       expect(r.filters).toEqual([['trip_id', TRIP]]);
     }
-    expect(reads[0]!.orders).toEqual([['spent_on', false], ['created_at', false]]);
+    expect(reads[0]!.orders).toEqual([['spent_on', false], ['created_at', false], ['id', false]]); // unique tie-breaker last
+    expect(reads.every((r) => r.counted && r.ranges.length === 1 && r.ranges[0]![0] === 0)).toBe(true);
   });
 
   it('never asks for another person\'s identity: no user id, email or name column is requested', () => {
@@ -303,9 +312,133 @@ describe('reading expenses (direct reads under row-level security)', () => {
     expect(reads).toHaveLength(6);
   });
 
-  it('gives up with "unknown" if they still disagree on the second try (never shows half an expense)', async () => {
-    const bad = { readReplies: Array.from({ length: 2 }, () => [{ data: [row()], error: null }, { data: [] as unknown[], error: null }, { data: shares, error: null }]).flat() };
+  it('gives up with "unknown" if they still disagree on the third try (never shows half an expense)', async () => {
+    const bad = { readReplies: Array.from({ length: 3 }, () => [{ data: [row()], error: null }, { data: [] as unknown[], error: null }, { data: shares, error: null }]).flat() };
     expect((await rejection(listExpenses(fake(undefined, bad).client, TRIP))).kind).toBe('unknown');
+  });
+
+  describe('paging (a trip holds up to 2,000 expenses; one response holds at most 1,000 rows)', () => {
+    const PAGE = 1000;
+    const id = (n: number) => `00000000-0000-4000-9000-${String(n).padStart(12, '0')}`;
+    /** n expenses, each paid and shared by A alone, on days that repeat so ordering has to use the tie-breakers. */
+    const world = (n: number, over: (i: number) => Record<string, unknown> = () => ({})) => {
+      const expenses = Array.from({ length: n }, (_, i) => row({ id: id(i + 1), title: `E${i}`, amount_minor: 100 + (i % 7), spent_on: `2026-12-${String(1 + (i % 28)).padStart(2, '0')}`, created_at: `2026-11-24T10:${String(i % 60).padStart(2, '0')}:00Z`, ...over(i) }));
+      const payersFor = expenses.map((e) => ({ expense_id: e.id, trip_member_id: A, paid_minor: e.amount_minor }));
+      const sharesFor = expenses.map((e) => ({ expense_id: e.id, trip_member_id: A, share_minor: e.amount_minor }));
+      return { expenses, expense_payers: payersFor, expense_splits: sharesFor };
+    };
+    const sum = (list: { amountMinor: number; deleted: boolean }[]) => list.filter((e) => !e.deleted).reduce((a, e) => a + e.amountMinor, 0);
+
+    it('an empty trip is an empty list from one page of each table', async () => {
+      const { client, reads } = fake(undefined, world(0));
+      expect(await listExpenses(client, TRIP)).toEqual([]);
+      expect(reads).toHaveLength(3);
+    });
+
+    it('one expense', async () => {
+      expect(await listExpenses(fake(undefined, world(1)).client, TRIP)).toHaveLength(1);
+    });
+
+    it('exactly one page (1,000) needs no second request per table when the total is reached', async () => {
+      const { client, reads } = fake(undefined, world(PAGE));
+      expect(await listExpenses(client, TRIP)).toHaveLength(PAGE);
+      expect(reads).toHaveLength(3);
+    });
+
+    it('one more than a page (1,001) takes a second page and loses nothing', async () => {
+      const w = world(PAGE + 1);
+      const { client, reads } = fake(undefined, w);
+      const list = await listExpenses(client, TRIP);
+      expect(list).toHaveLength(PAGE + 1);
+      expect(new Set(list.map((e) => e.id)).size).toBe(PAGE + 1);
+      expect(reads.filter((r) => r.table === 'expenses').map((r) => r.ranges[0])).toEqual([[0, 999], [1000, 1999]]);
+    });
+
+    it('the supported maximum of 2,000 expenses is complete, unique and its totals are exact', async () => {
+      const w = world(2000);
+      const { client, reads } = fake(undefined, w);
+      const list = await listExpenses(client, TRIP);
+      expect(list).toHaveLength(2000);
+      expect(new Set(list.map((e) => e.id)).size).toBe(2000);
+      expect(sum(list)).toBe(w.expenses.reduce((a, e) => a + (e.amount_minor as number), 0));
+      expect(reads.filter((r) => r.table === 'expenses')).toHaveLength(2);
+      expect(reads.filter((r) => r.table === 'expense_payers')).toHaveLength(2);
+    });
+
+    it('payers and shares from several pages are joined to the right expenses', async () => {
+      const list = await listExpenses(fake(undefined, world(1200)).client, TRIP);
+      for (const e of list) {
+        expect(e.payers.map((p) => p.paidMinor)).toEqual([e.amountMinor]);
+        expect(e.shares.map((s) => s.shareMinor)).toEqual([e.amountMinor]);
+      }
+    });
+
+    it('a server that returns fewer rows per page than asked is still read to the end (paging follows the total, not the page length)', async () => {
+      const w = world(250);
+      const { client } = fake(undefined, w);
+      type Q = Record<string, (...a: unknown[]) => Q>;
+      const wrap = (inner: Q): Q => ({
+        ...inner,
+        eq: (...a: unknown[]) => wrap(inner.eq!(...a)),
+        order: (...a: unknown[]) => wrap(inner.order!(...a)),
+        range: (from: unknown, to: unknown) => wrap(inner.range!(from, Math.min(to as number, (from as number) + 99))), // never more than 100 rows
+      });
+      const capped = {
+        ...client,
+        from: (table: string) => ({ select: (columns: string, options?: unknown) => wrap((client.from as unknown as (t: string) => { select: (c: string, o?: unknown) => Q })(table).select(columns, options)) }),
+      } as unknown as ExpenseClient;
+      expect(await listExpenses(capped, TRIP)).toHaveLength(250);
+    });
+
+    it('the pages meet without overlap or gap', async () => {
+      const list = await listExpenses(fake(undefined, world(1500)).client, TRIP);
+      expect(new Set(list.map((e) => e.id)).size).toBe(1500);
+    });
+
+    it('a failure while fetching a LATER page fails the whole read (no partial list), with the same error kinds as before', async () => {
+      const w = world(1500);
+      const firstPage: PgReply = { data: w.expenses.slice(0, PAGE), error: null, count: 1500 };
+      expect((await rejection(listExpenses(fake(undefined, { ...w, readReplies: [firstPage, err('Failed to fetch')] }).client, TRIP))).kind).toBe('network');
+      expect((await rejection(listExpenses(fake(undefined, { ...w, readReplies: [firstPage, err('x', { code: '42501' })] }).client, TRIP))).kind).toBe('auth');
+    });
+
+    it('if the total changes between pages the read starts again and then succeeds with the complete data', async () => {
+      const w = world(1500);
+      const first: PgReply = { data: w.expenses.slice(0, PAGE), error: null, count: 1500 };
+      const moved: PgReply = { data: w.expenses.slice(PAGE, 1501), error: null, count: 1501 }; // someone added an expense meanwhile
+      expect(await listExpenses(fake(undefined, { ...w, readReplies: [first, moved] }).client, TRIP)).toHaveLength(1500);
+    });
+
+    it('a row that appears on two pages (the data shifted under the pages) is never returned twice: the read starts again', async () => {
+      const w = world(1500);
+      const first: PgReply = { data: w.expenses.slice(0, PAGE), error: null, count: 1500 };
+      const overlapping: PgReply = { data: w.expenses.slice(PAGE - 1, 1500), error: null, count: 1500 }; // starts one row early
+      const list = await listExpenses(fake(undefined, { ...w, readReplies: [first, overlapping] }).client, TRIP);
+      expect(new Set(list.map((e) => e.id)).size).toBe(list.length);
+      expect(list).toHaveLength(1500);
+    });
+
+    it('a short page before the total is reached (a row went missing) is never accepted as complete', async () => {
+      const w = world(1500);
+      const first: PgReply = { data: w.expenses.slice(0, PAGE), error: null, count: 1500 };
+      const empty: PgReply = { data: [], error: null, count: 1500 };
+      const stuck = Array.from({ length: 3 }, () => [first, empty]).flat();
+      expect((await rejection(listExpenses(fake(undefined, { ...w, readReplies: stuck }).client, TRIP))).kind).toBe('unknown');
+    });
+
+    it('without an exact total the read cannot prove it is complete, so it fails instead of guessing', async () => {
+      const w = world(3);
+      const noCount: PgReply = { data: w.expenses, error: null, count: null };
+      expect((await rejection(listExpenses(fake(undefined, { ...w, readReplies: [noCount] }).client, TRIP))).kind).toBe('unknown');
+    });
+
+    it('deleted expenses stay in the list (flagged) but are not in the active total', async () => {
+      const w = world(1200, (i) => (i % 10 === 0 ? { deleted_at: '2026-11-25T10:00:00Z', deleted_by: A } : {}));
+      const list = await listExpenses(fake(undefined, w).client, TRIP);
+      expect(list).toHaveLength(1200);
+      expect(list.filter((e) => e.deleted)).toHaveLength(120);
+      expect(sum(list)).toBe(w.expenses.filter((e) => !e.deleted_at).reduce((a, e) => a + (e.amount_minor as number), 0));
+    });
   });
 
   it('maps read failures like write failures, and a trip the database hides as the single "unavailable" answer', async () => {

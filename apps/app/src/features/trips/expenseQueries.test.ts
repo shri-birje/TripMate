@@ -26,7 +26,7 @@ function fake(rpcReplies: Reply[] | ((fn: string, n: number) => Reply)) {
     from: (table: string) => ({
       select: () => {
         reads.push(table);
-        const q = { eq: () => q, order: () => q, then: (ok: (v: Reply) => unknown) => Promise.resolve({ data: [], error: null }).then(ok) };
+        const q = { eq: () => q, order: () => q, range: () => q, then: (ok: (v: Reply & { count: number }) => unknown) => Promise.resolve({ data: [], error: null, count: 0 }).then(ok) };
         return q;
       },
     }),
@@ -85,7 +85,7 @@ describe('queries', () => {
   });
 
   it('a read the database refuses (a stranger, a former member) surfaces the single unavailable error and is not retried', async () => {
-    const client = { from: () => ({ select: () => { const q = { eq: () => q, order: () => q, then: (ok: (v: Reply) => unknown) => Promise.resolve({ data: null, error: { code: '42501', message: 'permission denied' } }).then(ok) }; return q; } }), rpc: () => Promise.resolve({ data: null, error: { message: 'trip_not_found' } }) } as unknown as ExpenseClient;
+    const client = { from: () => ({ select: () => { const q = { eq: () => q, order: () => q, range: () => q, then: (ok: (v: Reply) => unknown) => Promise.resolve({ data: null, error: { code: '42501', message: 'permission denied' } }).then(ok) }; return q; } }), rpc: () => Promise.resolve({ data: null, error: { message: 'trip_not_found' } }) } as unknown as ExpenseClient;
     const qc = newClient();
     expect((await rejection(qc.fetchQuery(balancesQueryOptions(client, USER, TRIP)))).kind).toBe('unavailable');
     expect((await rejection(qc.fetchQuery(expensesQueryOptions(client, USER, TRIP)))).kind).toBe('auth');

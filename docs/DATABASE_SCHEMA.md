@@ -351,6 +351,8 @@ Multi-currency (Feature 15) later adds nullable columns (`original_amount_minor`
 Append-only: `UPDATE` and `DELETE` are revoked from all application roles.
 
 ### 4.10 `repayments`
+> **M7 revision (proposed 2026-11-26, ADR-066; see `M7_REPAYMENTS_DESIGN.md` section 5):** the table below is the earlier design. The proposed M7 version has four states (`pending`, `confirmed`, `rejected`, `cancelled`; `paid` and the projected balance are dropped), `decided_by`, `decided_at` and `decision_note` instead of `paid_at`, `confirmed_at` and `cancelled_at`, no `from_suggestion`, and an append-only `repayment_events` table. Nothing here is built yet.
+
 **Purpose:** Recorded money transfers between two members. Reduces outstanding balances according to its status.
 
 | Column | Type | Constraints |
@@ -478,6 +480,8 @@ net(m) = paid(m) − share(m) + sent(m) − received(m)
          Σ net(m) over all members of T = 0   (invariant, asserted in tests)
 ```
 
+> **Superseded in part (M7 design, revision 4, approved 2026-11-26, ADR-066):** only the **confirmed, unreversed** figure is official; there is no projected figure and no `paid` state; `net(m) = expense_net(m) + confirmed_sent(m) − confirmed_received(m)`. Repayment tables, the state and reversal machines and the ten functions are specified in `M7_REPAYMENTS_DESIGN.md` sections 5 to 7 and 13; the text below is the earlier design and is rewritten when migration #12 is built.
+
 Two figures are exposed (ADR-010; resolves open question Q-3 by providing both):
 
 | Figure | "status counts" means | Used for |
@@ -560,6 +564,14 @@ Three independent last-line guards, as triggers, for rules that migration #8 enf
 - **New codes:** `split_total_mismatch` (exact amounts or percentages do not add up), `invalid_split_value` (a typed value out of range), `split_not_derived` (final guard). Retries compare the method and every typed value; history snapshots carry the typed values (`input_value` inside each split entry) and never any name or account id.
 - **Final enforcement:** a deferred trigger checks that the stored shares of every non-equal expense equal what the database derives from the stored typed values, and that an equal expense holds none. Rule I-1, the locks, versions, ADR-043 and ADR-047 are unchanged and tested with the new methods.
 
+### 9.0c M7 Checkpoint 2: repayments and reversals (migration #12, `20261126000000_repayments.sql`; built and tested locally, NOT applied live)
+- **Tables:** `repayments` (four states `pending`, `confirmed`, `rejected`, `cancelled`; `amount_minor` 1 to 10^12; `method` upi, cash, bank or other; optional `note` of at most 200 characters; `created_by`, `decided_by`, `decided_at`, `decision_note`, `version`), `repayment_reversals` (`requested_by` = the authenticated actor, `requested_for` = the represented party, one of the two parties and immutable; `status` requested, override_proposed, applied, declined, withdrawn or override_refused; override fields; `is_override`), `repayment_events` (append-only; `actor_member_id` and `represented_member_id`; member ids only). Partial unique indexes allow at most one open and one applied reversal per repayment.
+- **Balance:** `net = member_expense_net_minor (the M5 formula, moved unchanged) + member_repayment_adjustment_minor (confirmed_sent - confirmed_received over confirmed repayments with no applied reversal)`. `member_net_minor` keeps its signature and privileges and is now their sum, so the ADR-047 guard and Rule I-1 see repayments without being rewritten. `trip_member_balances` is recreated with `sent_minor` and `received_minor`.
+- **Capacity:** `repayment_capacity(trip, from, to) = min(max(0, debt(from) - all pending repayments of from), max(0, credit(to) - all pending repayments to to))`; checked at recording and again, against the real confirmed balances, at confirmation; enforced by the functions and independently by a trigger.
+- **Guards:** state-machine triggers on `repayments` and `repayment_reversals`; an after-update Rule I-1 check when a repayment is confirmed or a reversal applied; append-only events; an actor and represented-participant consistency check; and `trip_members_a_repayment_pending_guard` (an active-to-inactive change is refused while a pending repayment or an open reversal involves the member).
+- **Only executable override category:** `counterparty_unresponsive` (a CHECK constraint, the function and the trigger). `counterparty_account_inaccessible` is deferred and appears nowhere in executable SQL.
+- **Security:** SELECT-only RLS for active members, no write grant, every function SECURITY DEFINER with an empty `search_path`, the ten functions granted to `authenticated` only, all helpers closed. Lock order: the trip row (through `member_change_context`), then the repayment row, then the reversal row; guards only read.
+
 ### 9.1 Decisions this design implements
 Database functions derive and validate equal splits; TypeScript is the reference and preview; `spent_on date`; the ADR-043 date guard considers non-deleted expenses and restore re-checks the current dates; triggers enforce ADR-043 and ADR-047 with function-level preflight; an additive unique index on `trip_members (id, trip_id)`; rule I-1 for former members; multiple payers whose amounts add up exactly to the total; first-pass splits are equal among all active members and equal among selected active members (the screen sends the explicit participant list); personal expenses and exact, percentage and shares splits are deferred.
 
@@ -593,6 +605,7 @@ trip_member_balances(p_trip_id) -> (member_id, paid_minor, share_minor, net_mino
 ### 9.4 Rules and guards (amendments 2 and 3)
 - **Rounding:** `allocate_equal` gives every participant `floor(total / n)` and one extra paisa to the first `total mod n` participants ordered by `id::text collate "C"`.
 - **Balance:** `net(m) = sum(paid) - sum(share)` over NON-DELETED shared expenses of the trip, former members included. Zero-sum across the trip. (M7 extends the same function with repayments and ADR-047 then tests both the confirmed and the projected figure.)
+  > M7 note (revision 4.2, approved): this parenthesis is superseded. M7 keeps this formula as `member_expense_net_minor` and adds a confirmed, unreversed repayment adjustment in `member_net_minor`; there is no projected figure. Reversal rows carry `requested_by` (authenticated actor) and `requested_for` (represented party, immutable); events carry `actor_member_id` and `represented_member_id`. **Only `counterparty_unresponsive` is an executable override category in migration #12**; `counterparty_account_inaccessible` is deferred (V1).
 - **Rule I-1 (final enforcement inside the write functions, after the rows are written and before commit):** for every former member (removed or left) appearing in the old OR new rows of the changed expense, `net` is recomputed over the COMPLETE resulting ledger of the trip; any non-zero value raises `former_member_balance` and the whole transaction rolls back (rows, version and revision included). Create can only involve active members, so it cannot change a former member's balance, but the check runs for uniformity.
 - **ADR-047 trigger:** `BEFORE UPDATE OF status ON trip_members FOR EACH ROW WHEN (old.status = 'active' AND new.status <> 'active')` calls `assert_member_settled`; a non-zero balance raises `balance_not_settled` with the signed paise amount in the error detail. It covers `remove_member`, `leave_trip` and any other path. Claiming a guest keeps the same member row, so balances carry over and the trigger does not fire.
 - **ADR-043 trigger:** `BEFORE UPDATE OF start_date, end_date ON trips FOR EACH ROW WHEN (dates changed)` calls `assert_expenses_within_dates`; only NON-DELETED expenses count; a stranded expense raises `expenses_outside_dates`. `restore_expense` re-checks the current trip dates (`outside_trip_dates`). Archiving, currency and every other column are not affected.

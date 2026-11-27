@@ -25,10 +25,12 @@ let db: PGlite;
 
 /** Functions that signed-in users are allowed to run. Add a name here ONLY after reviewing the function. */
 const ALLOWED_CALLABLE_FUNCTIONS = [
-  'add_guest_member', 'create_expense', 'create_invite', 'create_trip', 'decide_join_request', 'delete_expense', 'get_general_invite_link', 'is_trip_member', 'leave_trip', 'list_join_requests',
-  'list_trip_invites', 'list_trip_members', 'preview_invite', 'remove_member', 'rename_guest_member', 'request_to_join',
-  'restore_expense', 'revoke_invite', 'set_member_role', 'set_trip_archived', 'trip_member_balances', 'update_expense', 'update_trip',
-]; // set_trip_archived and update_trip reviewed for M3.3; the six member functions for M3.4; the invitation and join-request functions for M3.5 (approval-based, ADR-059); the four expense write functions and trip_member_balances for M5 (ADR-063)
+  'add_guest_member', 'cancel_repayment', 'confirm_repayment', 'create_expense', 'create_invite', 'create_repayment', 'create_trip',
+  'decide_join_request', 'decide_override', 'delete_expense', 'get_general_invite_link', 'is_trip_member', 'leave_trip', 'list_join_requests',
+  'list_trip_invites', 'list_trip_members', 'preview_invite', 'propose_override', 'reject_repayment', 'remind_reversal', 'remove_member',
+  'rename_guest_member', 'request_reversal', 'request_to_join', 'respond_reversal', 'restore_expense', 'revoke_invite', 'set_member_role',
+  'set_trip_archived', 'trip_member_balances', 'update_expense', 'update_trip', 'withdraw_reversal',
+]; // set_trip_archived and update_trip reviewed for M3.3; the six member functions for M3.4; the invitation and join-request functions for M3.5 (approval-based, ADR-059); the four expense write functions and trip_member_balances for M5 (ADR-063); the ten repayment and reversal functions for M7 (ADR-066)
 
 /**
  * Functions that SIGNED-OUT visitors (anon) may run. Until M3.5 this list was empty. preview_invite is the one
@@ -224,6 +226,11 @@ describe('the expense tables (M5, ADR-063)', () => {
       'expense_canonical', 'expense_stored_canonical', 'expense_record_revision',
       'trips_currency_guard', 'expense_rows_member_guard', 'check_expense_equal_split',
       'allocate_weighted', 'expense_parse_split_inputs', 'expense_derive_shares', 'expense_derive_from_request', 'expense_splits_json_v2', 'check_expense_split_inputs',
+
+      'member_expense_net_minor', 'member_repayment_adjustment_minor', 'member_is_active_admin', 'repayment_capacity', 'repayment_participants',
+      'repayment_decide_problem', 'repayment_cancel_problem', 'reversal_request_problem', 'reversal_respond_problem', 'repayment_override_problem',
+      'repayments_guard', 'repayment_reversals_guard', 'repayments_i1_after', 'repayment_events_append_only', 'repayment_events_check',
+      'trip_members_repayment_pending_guard',
     ];
     const fns = await functions();
     for (const name of internal) {

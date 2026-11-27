@@ -461,7 +461,7 @@ describe('the helper and the trigger function are closed to the app', () => {
     const fns = (await db.query<{ proname: string }>(
       `select p.proname from pg_proc p join pg_namespace n on n.oid = p.pronamespace where n.nspname = 'public' and has_function_privilege('authenticated', p.oid, 'EXECUTE') order by 1`,
     )).rows.map((r) => r.proname);
-    expect(fns).toEqual(['add_guest_member', 'create_expense', 'create_invite', 'create_trip', 'decide_join_request', 'delete_expense', 'get_general_invite_link', 'is_trip_member', 'leave_trip', 'list_join_requests', 'list_trip_invites', 'list_trip_members', 'preview_invite', 'remove_member', 'rename_guest_member', 'request_to_join', 'restore_expense', 'revoke_invite', 'set_member_role', 'set_trip_archived', 'trip_member_balances', 'update_expense', 'update_trip']);
+    expect(fns).toEqual(['add_guest_member', 'cancel_repayment', 'confirm_repayment', 'create_expense', 'create_invite', 'create_repayment', 'create_trip', 'decide_join_request', 'decide_override', 'delete_expense', 'get_general_invite_link', 'is_trip_member', 'leave_trip', 'list_join_requests', 'list_trip_invites', 'list_trip_members', 'preview_invite', 'propose_override', 'reject_repayment', 'remind_reversal', 'remove_member', 'rename_guest_member', 'request_reversal', 'request_to_join', 'respond_reversal', 'restore_expense', 'revoke_invite', 'set_member_role', 'set_trip_archived', 'trip_member_balances', 'update_expense', 'update_trip', 'withdraw_reversal']);
   });
 
   it('direct writes to trips are still denied for everyone, including administrators', async () => {

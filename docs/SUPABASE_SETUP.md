@@ -247,6 +247,78 @@ Run `supabase/migrations/20261125000000_expense_split_methods.sql` in the SQL Ed
 
 4. Try it in the app: add an expense with Percentages (for example 50, 30, 20), open it (it shows the percentages and the stored amounts), edit it to Shares, and open History to see both changes.
 
+## Step 17 - Repayments and reversals (M7 Checkpoint 2): migration 20261126000000
+
+**Do this only when you decide to apply it. Nothing in the app uses repayments yet (Checkpoint 3 and 4), so applying it changes nothing you can see, apart from the balances function gaining two columns.** The migration is safe to run again; leave the file as it is.
+
+**What it does:** adds the tables `repayments`, `repayment_reversals` and `repayment_events`; ten functions (`create_repayment`, `confirm_repayment`, `reject_repayment`, `cancel_repayment`, `request_reversal`, `respond_reversal`, `withdraw_reversal`, `remind_reversal`, `propose_override`, `decide_override`); the helper functions and triggers; replaces ONE existing function (`member_net_minor`, same signature, same privileges, so the balance protections of ADR-047 and Rule I-1 keep working); and recreates `trip_member_balances` with two extra columns (`sent_minor`, `received_minor`; the app reads columns by name, so the Balances screen keeps working). It does not change migrations 1 to 11 and does not touch your data.
+
+1. Open the Supabase SQL Editor, paste the whole content of `supabase/migrations/20261126000000_repayments.sql`, and run it. Expect **"Success. No rows returned"**. If it says an earlier migration must be applied first, apply that one (Steps 1 to 16) and run this again.
+2. Run `npm run verify:supabase`: expect `PASSED` with **0 failures and 0 warnings** (it now also checks that the ten functions, the helpers and the three tables are closed to signed-out visitors).
+3. Read-only checks (change nothing). Run them one at a time.
+
+   a. Exactly one version of each of the ten functions (expect 10 rows, each `count = 1`):
+
+   ```sql
+   select proname, count(*) as versions
+     from pg_proc
+    where pronamespace = 'public'::regnamespace
+      and proname in ('create_repayment', 'confirm_repayment', 'reject_repayment', 'cancel_repayment', 'request_reversal',
+                      'respond_reversal', 'withdraw_reversal', 'remind_reversal', 'propose_override', 'decide_override')
+    group by proname order by proname;
+   ```
+
+   b. The three tables exist and row-level security is ON (expect three rows, all `true`):
+
+   ```sql
+   select relname, relrowsecurity from pg_class
+    where relnamespace = 'public'::regnamespace and relname in ('repayments', 'repayment_reversals', 'repayment_events') order by relname;
+   ```
+
+   c. **Only `counterparty_unresponsive` is allowed as an override category** (expect one row, and the text must contain `counterparty_unresponsive` and NOT `counterparty_account_inaccessible`):
+
+   ```sql
+   select pg_get_constraintdef(oid) from pg_constraint where conname = 'repayment_reversals_override_category';
+   ```
+
+   d. The triggers (expect 8 rows):
+
+   ```sql
+   select tgname from pg_trigger
+    where not tgisinternal and tgname in ('repayments_zz_guard', 'repayments_zz_i1', 'repayment_reversals_zz_guard', 'repayment_reversals_zz_i1',
+          'repayment_events_no_change', 'repayment_events_no_truncate', 'repayment_events_zz_check', 'trip_members_a_repayment_pending_guard')
+    order by 1;
+   ```
+
+   e. The balances function has the two new columns (expect text that contains `sent_minor` and `received_minor`):
+
+   ```sql
+   select pg_get_function_result('public.trip_member_balances(uuid)'::regprocedure);
+   ```
+
+   f. Privileges (expect `true, false, false, false`: signed-in users can run `create_repayment`; nobody outside can run the capacity helper, the net helper, or anything as signed-out):
+
+   ```sql
+   select has_function_privilege('authenticated', 'public.create_repayment(uuid, uuid, uuid, uuid, bigint, text, text)', 'EXECUTE') as signed_in_runs_create,
+          has_function_privilege('anon', 'public.create_repayment(uuid, uuid, uuid, uuid, bigint, text, text)', 'EXECUTE') as signed_out_runs_create,
+          has_function_privilege('authenticated', 'public.repayment_capacity(uuid, uuid, uuid)', 'EXECUTE') as signed_in_runs_capacity_helper,
+          has_function_privilege('authenticated', 'public.member_net_minor(uuid, uuid)', 'EXECUTE') as signed_in_runs_net_helper;
+   ```
+
+   g. Nobody can write to the tables directly (expect `false` in every column):
+
+   ```sql
+   select has_table_privilege('authenticated', 'public.repayments', 'INSERT') as can_insert,
+          has_table_privilege('authenticated', 'public.repayments', 'UPDATE') as can_update,
+          has_table_privilege('authenticated', 'public.repayments', 'DELETE') as can_delete,
+          has_table_privilege('anon', 'public.repayments', 'SELECT') as signed_out_can_read;
+   ```
+
+4. Confirm that the existing app still works: open a trip's Balances tab; the balances and the suggested payments look exactly as before (no repayment exists yet, so nothing changes).
+5. **A real two-session race check is NOT run by the project's automated tests** (the local test engine has a single session). It can only be checked on the live project, and only once the screens (Checkpoint 4) exist; it is planned for Checkpoint 6.
+
+If something fails, do not edit the migration: tell me which query gave a different result and I will fix it with a new forward migration.
+
 ## Troubleshooting
 
 | You see | Meaning and fix |

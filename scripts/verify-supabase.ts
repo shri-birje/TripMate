@@ -159,6 +159,7 @@ async function checkTrips(url: string, key: string) {
     const LINK_MIGRATION = 'supabase/migrations/20261123100000_reusable_general_link.sql';
     const EXPENSE_MIGRATION = 'supabase/migrations/20261123200000_expenses.sql';
     const SPLIT_MIGRATION = 'supabase/migrations/20261125000000_expense_split_methods.sql';
+    const REPAYMENT_MIGRATION = 'supabase/migrations/20261126000000_repayments.sql';
     const probes: { name: string; args: Record<string, unknown>; mustBeClosed: boolean; migration?: string }[] = [
       { name: 'update_trip', args: { p_trip_id: nobody, p_expected_version: 1, p_name: 'x', p_destination: 'y', p_start_date: '2030-01-01', p_end_date: '2030-01-02' }, mustBeClosed: true },
       { name: 'set_trip_archived', args: { p_trip_id: nobody, p_archived: true, p_expected_version: 1 }, mustBeClosed: true },
@@ -192,6 +193,21 @@ async function checkTrips(url: string, key: string) {
       // ---- Milestone M5 (Checkpoint 5): split methods. Internal helpers, closed to everyone.
       { name: 'allocate_weighted', args: { p_total: 1, p_member_ids: [], p_weights: [] }, mustBeClosed: true, migration: SPLIT_MIGRATION },
       { name: 'expense_derive_shares', args: { p_method: 'equal', p_total: 1, p_ids: [], p_values: [] }, mustBeClosed: true, migration: SPLIT_MIGRATION },
+      // ---- Milestone M7 (Checkpoint 2): repayments and reversals. The ten functions are for signed-in members only; the helpers are closed to everyone.
+      { name: 'create_repayment', args: { p_trip_id: nobody, p_repayment_id: nobody, p_from_member_id: nobody, p_to_member_id: nobody, p_amount_minor: 1, p_method: 'cash', p_note: null }, mustBeClosed: true, migration: REPAYMENT_MIGRATION },
+      { name: 'confirm_repayment', args: { p_trip_id: nobody, p_repayment_id: nobody, p_expected_version: 1 }, mustBeClosed: true, migration: REPAYMENT_MIGRATION },
+      { name: 'reject_repayment', args: { p_trip_id: nobody, p_repayment_id: nobody, p_expected_version: 1, p_reason: null }, mustBeClosed: true, migration: REPAYMENT_MIGRATION },
+      { name: 'cancel_repayment', args: { p_trip_id: nobody, p_repayment_id: nobody, p_expected_version: 1 }, mustBeClosed: true, migration: REPAYMENT_MIGRATION },
+      { name: 'request_reversal', args: { p_trip_id: nobody, p_reversal_id: nobody, p_repayment_id: nobody, p_reason: 'x', p_requested_for: null }, mustBeClosed: true, migration: REPAYMENT_MIGRATION },
+      { name: 'respond_reversal', args: { p_trip_id: nobody, p_reversal_id: nobody, p_expected_version: 1, p_decision: 'decline', p_note: null }, mustBeClosed: true, migration: REPAYMENT_MIGRATION },
+      { name: 'withdraw_reversal', args: { p_trip_id: nobody, p_reversal_id: nobody, p_expected_version: 1 }, mustBeClosed: true, migration: REPAYMENT_MIGRATION },
+      { name: 'remind_reversal', args: { p_trip_id: nobody, p_reversal_id: nobody }, mustBeClosed: true, migration: REPAYMENT_MIGRATION },
+      { name: 'propose_override', args: { p_trip_id: nobody, p_reversal_id: nobody, p_expected_version: 1, p_category: 'counterparty_unresponsive', p_reason: 'x' }, mustBeClosed: true, migration: REPAYMENT_MIGRATION },
+      { name: 'decide_override', args: { p_trip_id: nobody, p_reversal_id: nobody, p_expected_version: 1, p_decision: 'refuse', p_note: null }, mustBeClosed: true, migration: REPAYMENT_MIGRATION },
+      { name: 'repayment_capacity', args: { p_trip_id: nobody, p_from: nobody, p_to: nobody }, mustBeClosed: true, migration: REPAYMENT_MIGRATION },
+      { name: 'member_expense_net_minor', args: { p_trip_id: nobody, p_member_id: nobody }, mustBeClosed: true, migration: REPAYMENT_MIGRATION },
+      { name: 'member_repayment_adjustment_minor', args: { p_trip_id: nobody, p_member_id: nobody }, mustBeClosed: true, migration: REPAYMENT_MIGRATION },
+      { name: 'repayment_participants', args: { p_repayment_id: nobody }, mustBeClosed: true, migration: REPAYMENT_MIGRATION },
       // (The Checkpoint 2 guards, migrations 20261124000000 and 20261124100000, are TRIGGER functions. The API never exposes trigger functions,
       //  so they cannot be probed from outside: they are checked with the read-only SQL in SUPABASE_SETUP.md instead.)
     ];
@@ -200,8 +216,19 @@ async function checkTrips(url: string, key: string) {
       const c = (r.body?.code as string | undefined) ?? '';
       if (r.status >= 200 && r.status < 300) fail(`A signed-out visitor could RUN ${probe.name}(). Security rules are wrong!`);
       else if (c === '42501') ok(`${probe.name}() cannot be run by signed-out visitors (permission denied)`);
-      else if (r.status === 404 || c === 'PGRST202') warn(`${probe.name}() is not available yet. Run ${probe.migration ?? EDIT_MIGRATION} in the Supabase SQL Editor (${probe.migration === JOIN_MIGRATION ? 'approval-based joining' : probe.migration === INVITE_MIGRATION ? 'invitations' : probe.migration ? 'managing people' : 'trip editing and archiving'} needs it).`);
+      else if (r.status === 404 || c === 'PGRST202') warn(`${probe.name}() is not available yet. Run ${probe.migration ?? EDIT_MIGRATION} in the Supabase SQL Editor (${probe.migration === JOIN_MIGRATION ? 'approval-based joining' : probe.migration === INVITE_MIGRATION ? 'invitations' : probe.migration === REPAYMENT_MIGRATION ? 'repayments and reversals' : probe.migration === SPLIT_MIGRATION ? 'split methods' : probe.migration === EXPENSE_MIGRATION ? 'expenses' : probe.migration ? 'managing people' : 'trip editing and archiving'} needs it).`);
       else warn(`${probe.name}() refused a signed-out visitor, but with an unexpected code (HTTP ${r.status}, ${c || 'none'})`);
+    }
+
+    // ---- The repayment tables (Milestone M7): they must exist after migration 20261126000000 and give a signed-out visitor nothing.
+    for (const table of ['repayments', 'repayment_reversals', 'repayment_events']) {
+      const read = await call(`${url}/rest/v1/${table}?select=*&limit=1`, key);
+      const code = (read.body?.code as string | undefined) ?? '';
+      if (read.status === 404 || code === 'PGRST205' || code === '42P01') warn(`The ${table} table does not exist yet. Run ${REPAYMENT_MIGRATION} in the Supabase SQL Editor.`);
+      else if (read.status === 401 || read.status === 403 || code === '42501') ok(`${table} exists and signed-out visitors are denied access`);
+      else if (read.status >= 200 && read.status < 300 && Array.isArray(read.body) && (read.body as unknown[]).length === 0) ok(`${table} exists and shows signed-out visitors nothing`);
+      else if (read.status === 200) fail(`A signed-out visitor can READ ${table} rows. Row-level security is wrong!`);
+      else warn(`Unexpected answer reading ${table} (HTTP ${read.status}, code ${code || 'none'})`);
     }
 
     // ---- The expense tables (Milestone M5): they must exist after migration 20261123200000 and give a signed-out visitor nothing.

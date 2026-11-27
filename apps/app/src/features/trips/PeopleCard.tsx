@@ -5,11 +5,14 @@ import { addState, formerMemberNote, leaveState, memberActions, myRole, validate
 import { AppText } from '../../components/AppText';
 import { Banner } from '../../components/Banner';
 import { Button } from '../../components/Button';
+import { Avatar } from '../../components/Avatar';
 import { Card } from '../../components/Card';
 import { ConfirmDialog } from '../../components/ConfirmDialog';
+import { Icon } from '../../components/Icon';
+import { SurfaceContext } from '../../components/Surface';
 import { TextField } from '../../components/TextField';
 import { useTheme } from '../../theme/ThemeProvider';
-import { spacing } from '../../theme/tokens';
+import { radius, spacing } from '../../theme/tokens';
 import { InvitePanel } from './InvitePanel';
 import { JoinRequestsPanel } from './JoinRequestsPanel';
 import { useAddGuest, useLeaveTrip, useRemoveMember, useRenameGuest, useSetMemberRole } from './tripMemberApi';
@@ -212,7 +215,10 @@ export function PeopleCard({ details, userId, reload, onLeft }: Props) {
 
   return (
     <Card>
-      <AppText variant="heading">{`People (${members.length})`}</AppText>
+      <View style={{ flexDirection: 'row', alignItems: 'center', gap: spacing.sm }}>
+        <Icon name="users" color={colors.primaryText} size={26} />
+        <AppText variant="heading">{`People (${members.length})`}</AppText>
+      </View>
       <AppText variant="small" tone="secondary" testID="trip-creator">
         {creatorIsMe ? 'Created by you' : creatorName ? `Created by ${creatorName}` : 'Created by a former member'}
       </AppText>
@@ -252,12 +258,19 @@ export function PeopleCard({ details, userId, reload, onLeft }: Props) {
           const open = openMenu === m.id;
           const editing = renaming?.id === m.id;
           return (
-            <View key={m.id} style={{ gap: spacing.xs }}>
-              <View testID={`member-${m.id}`} style={{ flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', gap: spacing.sm }}>
-                <AppText>{m.displayName}</AppText>
-                {m.role === 'admin' && <Tag label="Admin" color={colors.primary} />}
-                {m.userId !== null && m.userId === userId && <Tag label="You" color={colors.textSecondary} />}
-                {m.isGuest && <Tag label="Guest" color={colors.textSecondary} />}
+            <View key={m.id} style={{ gap: spacing.xs, padding: spacing.sm + 2, borderRadius: radius.md, backgroundColor: colors.surface2 }}>
+              <View testID={`member-${m.id}`} style={{ flexDirection: 'row', alignItems: 'center', gap: spacing.sm + 2 }}>
+                <Avatar name={m.displayName} size={40} />
+                <View style={{ flex: 1, gap: 4 }}>
+                  <AppText style={{ fontWeight: '700' }} testID={`member-name-${m.id}`}>
+                    {m.displayName}
+                  </AppText>
+                  <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: spacing.xs }}>
+                    <Tag label={m.role === 'admin' ? 'Admin' : 'Member'} color={m.role === 'admin' ? colors.primaryText : colors.textSecondaryOnSurface} />
+                    {m.userId !== null && m.userId === userId && <Tag label="You" color={colors.textSecondaryOnSurface} />}
+                    {m.isGuest && <Tag label="Guest" color={colors.textSecondaryOnSurface} />}
+                  </View>
+                </View>
                 {actions.any && (
                   <Pressable
                     testID={`member-manage-${m.id}`}
@@ -268,11 +281,11 @@ export function PeopleCard({ details, userId, reload, onLeft }: Props) {
                     role="button"
                     aria-expanded={open}
                     aria-label={`Manage ${m.displayName}`}
-                    style={{ minHeight: 44, minWidth: 44, justifyContent: 'center', paddingHorizontal: spacing.xs }}
+                    // @ts-expect-error `title` is a web-only tooltip that react-native-web passes through
+                    title={`Manage ${m.displayName}`}
+                    style={{ minHeight: 44, minWidth: 44, borderRadius: radius.md, alignItems: 'center', justifyContent: 'center', backgroundColor: open ? colors.surface : 'transparent' }}
                   >
-                    <AppText variant="small" tone="brand" style={{ fontWeight: '600' }}>
-                      {open ? 'Close' : 'Manage'}
-                    </AppText>
+                    <Icon name={open ? 'chevron' : 'dots'} color={colors.primaryText} size={24} />
                   </Pressable>
                 )}
               </View>
@@ -303,7 +316,8 @@ export function PeopleCard({ details, userId, reload, onLeft }: Props) {
               )}
 
               {editing && renaming && (
-                <View style={{ gap: spacing.xs }}>
+                <SurfaceContext.Provider value="page">
+                <View style={{ gap: spacing.xs, padding: spacing.sm, borderRadius: radius.md, backgroundColor: colors.background }}>
                   <TextField
                     testID={`rename-input-${m.id}`}
                     label={`New name for ${m.displayName}`}
@@ -324,6 +338,7 @@ export function PeopleCard({ details, userId, reload, onLeft }: Props) {
                     </View>
                   </View>
                 </View>
+                </SurfaceContext.Provider>
               )}
             </View>
           );
@@ -331,7 +346,7 @@ export function PeopleCard({ details, userId, reload, onLeft }: Props) {
       </View>
 
       {adding.canAdd && (
-        <View style={{ gap: spacing.xs }} testID="add-guest">
+        <Section title="Add a friend" testID="add-guest">
           <TextField
             testID="add-guest-name"
             label="Add a friend by name"
@@ -348,7 +363,7 @@ export function PeopleCard({ details, userId, reload, onLeft }: Props) {
             onSubmitEditing={submitAdd}
           />
           <Button testID="add-guest-submit" label="Add friend" loading={add.isPending} onPress={submitAdd} />
-        </View>
+        </Section>
       )}
       {!adding.canAdd && adding.reason === 'full' && (
         <AppText variant="small" tone="secondary" testID="add-guest-full">
@@ -395,7 +410,7 @@ export function PeopleCard({ details, userId, reload, onLeft }: Props) {
               {formerMembers.map((m) => (
                 <View key={m.id} testID={`former-${m.id}`} style={{ flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', gap: spacing.sm }}>
                   <AppText tone="secondary">{m.displayName}</AppText>
-                  {m.isGuest && <Tag label="Guest" color={colors.textSecondary} />}
+                  {m.isGuest && <Tag label="Guest" color={colors.textSecondaryOnSurface} />}
                   <AppText variant="small" tone="secondary" testID={`former-note-${m.id}`}>
                     {formerMemberNote(m)}
                   </AppText>
@@ -421,11 +436,28 @@ export function PeopleCard({ details, userId, reload, onLeft }: Props) {
 }
 
 function Tag({ label, color }: { label: string; color: string }) {
+  const { colors } = useTheme();
   return (
-    <View style={{ borderWidth: 1, borderColor: color, borderRadius: 999, paddingHorizontal: spacing.sm, paddingVertical: 1 }}>
-      <AppText variant="small" style={{ color, fontWeight: '600' }}>
+    <View style={{ backgroundColor: colors.surface, borderRadius: 999, paddingHorizontal: spacing.sm + 2, paddingVertical: 2 }}>
+      <AppText variant="small" style={{ color, fontWeight: '700' }}>
         {label}
       </AppText>
+    </View>
+  );
+}
+
+/** A visually separate block inside the People card (add a friend, invite link, join requests). */
+function Section({ title, children, testID }: { title: string; children: React.ReactNode; testID?: string }) {
+  const { colors } = useTheme();
+  return (
+    <View testID={testID} style={{ gap: spacing.sm, padding: spacing.md, borderRadius: radius.md, backgroundColor: colors.background }}>
+      {/* the block sits on the page colour, so inputs (which take the lighter tonal fill on the page) stay visible inside it */}
+      <SurfaceContext.Provider value="page">
+      <AppText variant="heading" style={{ fontSize: 17, lineHeight: 23 }}>
+        {title}
+      </AppText>
+      {children}
+      </SurfaceContext.Provider>
     </View>
   );
 }

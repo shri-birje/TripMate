@@ -5,9 +5,9 @@ import { AppText } from '../../components/AppText';
 import { Banner } from '../../components/Banner';
 import { Button } from '../../components/Button';
 import { Card } from '../../components/Card';
-import { Screen } from '../../components/Screen';
 import { TextField } from '../../components/TextField';
 import { useAuth } from '../../features/auth/AuthProvider';
+import { AuthShell } from '../../features/auth/AuthShell';
 import { spacing } from '../../theme/tokens';
 
 export default function SignInScreen() {
@@ -33,14 +33,7 @@ export default function SignInScreen() {
   }
 
   return (
-    <Screen>
-      <View style={{ marginTop: spacing.xl, gap: spacing.xs }}>
-        <AppText variant="title" tone="brand">
-          TripMate
-        </AppText>
-        <AppText tone="secondary">Welcome back. Sign in to see your trips.</AppText>
-      </View>
-
+    <AuthShell title="Welcome back" subtitle="Sign in to see your trips." nativeTitle="TripMate" nativeSubtitle="Welcome back. Sign in to see your trips.">
       <Card>
         {formError && <Banner kind="error" testID="form-error">{formError}</Banner>}
         <TextField
@@ -79,6 +72,6 @@ export default function SignInScreen() {
           </AppText>
         </Link>
       </View>
-    </Screen>
+    </AuthShell>
   );
 }

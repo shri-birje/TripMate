@@ -6,25 +6,24 @@ import { spacing } from '../../theme/tokens';
 
 const LABEL: Record<TripPhase, string> = { upcoming: 'Upcoming', ongoing: 'Ongoing', completed: 'Completed' };
 
-/** A small pill showing where a trip is in time. Colours come from the theme (both themes pass the contrast checks). */
-export function PhaseBadge({ phase }: { phase: TripPhase }) {
+/**
+ * A small filled label showing where a trip is in time (or that it is archived). Flat tonal fills:
+ * ongoing = forest, upcoming = wood, completed/archived = sand. All pairs pass the contrast checks in both themes.
+ */
+export function StatusChip({ kind, testID }: { kind: TripPhase | 'archived'; testID?: string }) {
   const { colors } = useTheme();
-  const color = phase === 'ongoing' ? colors.statusOk : phase === 'upcoming' ? colors.primary : colors.textSecondary;
+  const fill = kind === 'ongoing' ? colors.primary : kind === 'upcoming' ? colors.woodText : colors.surface2;
+  const text = kind === 'ongoing' ? colors.onPrimary : kind === 'upcoming' ? colors.onWood : colors.textSecondaryOnSurface;
   return (
-    <View
-      testID="trip-phase"
-      style={{
-        alignSelf: 'flex-start',
-        borderWidth: 1,
-        borderColor: color,
-        borderRadius: 999,
-        paddingHorizontal: spacing.sm + 2,
-        paddingVertical: 2,
-      }}
-    >
-      <AppText variant="small" style={{ color, fontWeight: '600' }}>
-        {LABEL[phase]}
+    <View testID={testID} style={{ alignSelf: 'flex-start', backgroundColor: fill, borderRadius: 999, paddingHorizontal: spacing.sm + 2, paddingVertical: 3 }}>
+      <AppText variant="small" style={{ color: text, fontWeight: '700', fontSize: 11, lineHeight: 15, letterSpacing: 0.5, textTransform: 'uppercase' }}>
+        {kind === 'archived' ? 'Archived' : LABEL[kind]}
       </AppText>
     </View>
   );
+}
+
+/** The phase label on Trip Details (keeps its test id). */
+export function PhaseBadge({ phase }: { phase: TripPhase }) {
+  return <StatusChip kind={phase} testID="trip-phase" />;
 }

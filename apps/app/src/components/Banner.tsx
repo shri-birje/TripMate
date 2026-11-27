@@ -9,10 +9,11 @@ interface Props {
   testID?: string;
 }
 
-/** A short message box. Errors are announced to screen readers straight away. */
+/** A short message box: a tonal block with a coloured edge. Errors are announced to screen readers straight away. */
 export function Banner({ kind, children, testID }: Props) {
   const { colors } = useTheme();
-  const accent = kind === 'error' ? colors.statusError : kind === 'success' ? colors.statusOk : colors.primary;
+  const accent = kind === 'error' ? colors.statusError : kind === 'success' ? colors.statusOk : colors.primaryText;
+  const textColor = kind === 'error' ? colors.statusErrorOnSurface : kind === 'success' ? colors.statusOkOnSurface : colors.primaryText;
   return (
     <View
       testID={testID}
@@ -21,12 +22,12 @@ export function Banner({ kind, children, testID }: Props) {
       style={{
         padding: spacing.md,
         borderRadius: radius.md,
-        borderWidth: 1,
-        borderColor: accent,
-        backgroundColor: colors.surface,
+        borderLeftWidth: 4,
+        borderLeftColor: accent,
+        backgroundColor: colors.surface2,
       }}
     >
-      <AppText variant="small" style={{ color: accent, fontWeight: '600' }}>
+      <AppText variant="small" style={{ color: textColor, fontWeight: '600' }}>
         {children}
       </AppText>
     </View>

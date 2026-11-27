@@ -1,4 +1,5 @@
 import { ActivityIndicator, Pressable, Text } from 'react-native';
+import { fontFamily } from '../theme/fonts';
 import { fontSize, radius, spacing } from '../theme/tokens';
 import { useTheme } from '../theme/ThemeProvider';
 
@@ -14,9 +15,9 @@ interface Props {
 export function Button({ label, onPress, variant = 'primary', loading = false, disabled = false, testID }: Props) {
   const { colors } = useTheme();
   const inactive = disabled || loading;
-  const background = variant === 'primary' ? colors.primary : variant === 'secondary' ? colors.surface : 'transparent';
-  const textColor = variant === 'primary' ? colors.onPrimary : colors.primary;
-  const borderColor = variant === 'secondary' ? colors.border : 'transparent';
+  // Flat tonal fills (no borders): primary = forest, secondary = sand, ghost = text only.
+  const background = variant === 'primary' ? colors.primary : variant === 'secondary' ? colors.surface2 : 'transparent';
+  const textColor = variant === 'primary' ? colors.onPrimary : variant === 'secondary' ? colors.textPrimary : colors.primary;
 
   return (
     <Pressable
@@ -31,8 +32,6 @@ export function Button({ label, onPress, variant = 'primary', loading = false, d
         minHeight: 48, // comfortable touch target
         paddingHorizontal: spacing.md,
         borderRadius: radius.md,
-        borderWidth: 1,
-        borderColor,
         backgroundColor: background,
         alignItems: 'center',
         justifyContent: 'center',
@@ -42,7 +41,7 @@ export function Button({ label, onPress, variant = 'primary', loading = false, d
       })}
     >
       {loading && <ActivityIndicator color={textColor} />}
-      <Text style={{ color: textColor, fontSize: fontSize.body, fontWeight: '600' }}>{label}</Text>
+      <Text style={{ color: textColor, fontSize: fontSize.body, fontWeight: '700', fontFamily: fontFamily.body }}>{label}</Text>
     </Pressable>
   );
 }

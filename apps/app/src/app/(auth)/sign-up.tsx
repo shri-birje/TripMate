@@ -6,9 +6,9 @@ import { AppText } from '../../components/AppText';
 import { Banner } from '../../components/Banner';
 import { Button } from '../../components/Button';
 import { Card } from '../../components/Card';
-import { Screen } from '../../components/Screen';
 import { TextField } from '../../components/TextField';
 import { useAuth } from '../../features/auth/AuthProvider';
+import { AuthShell } from '../../features/auth/AuthShell';
 import { spacing } from '../../theme/tokens';
 
 export default function SignUpScreen() {
@@ -43,12 +43,7 @@ export default function SignUpScreen() {
 
   if (confirmationSentTo) {
     return (
-      <Screen>
-        <View style={{ marginTop: spacing.xl }}>
-          <AppText variant="title" tone="brand">
-            Check your email
-          </AppText>
-        </View>
+      <AuthShell title="Check your email" subtitle="One more step to finish creating your account.">
         <Card>
           <Banner kind="success" testID="confirm-sent">
             Almost there! We sent a confirmation link.
@@ -61,19 +56,12 @@ export default function SignUpScreen() {
           </AppText>
           <Button label="Go to sign in" onPress={() => router.replace('/sign-in')} />
         </Card>
-      </Screen>
+      </AuthShell>
     );
   }
 
   return (
-    <Screen>
-      <View style={{ marginTop: spacing.xl, gap: spacing.xs }}>
-        <AppText variant="title" tone="brand">
-          Create your account
-        </AppText>
-        <AppText tone="secondary">Plan trips and split costs with your friends.</AppText>
-      </View>
-
+    <AuthShell title="Create your account" subtitle="Plan trips and split costs with your friends.">
       <Card>
         {formError && <Banner kind="error" testID="form-error">{formError}</Banner>}
         <TextField
@@ -125,6 +113,6 @@ export default function SignUpScreen() {
           </AppText>
         </Link>
       </View>
-    </Screen>
+    </AuthShell>
   );
 }

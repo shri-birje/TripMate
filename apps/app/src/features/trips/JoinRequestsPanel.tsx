@@ -5,7 +5,8 @@ import { AppText } from '../../components/AppText';
 import { Banner } from '../../components/Banner';
 import { Button } from '../../components/Button';
 import { ConfirmDialog } from '../../components/ConfirmDialog';
-import { spacing } from '../../theme/tokens';
+import { useTheme } from '../../theme/ThemeProvider';
+import { radius, spacing } from '../../theme/tokens';
 import { useDecideJoinRequest, useJoinRequests } from './tripInviteApi';
 import { TripInviteError } from './tripInviteService';
 
@@ -27,6 +28,7 @@ type Pending = { request: JoinRequest; approve: boolean };
  * more, the friend's place still free) at the moment of approval.
  */
 export function JoinRequestsPanel({ details, userId, reload }: Props) {
+  const { colors } = useTheme();
   const canDecide = canManagePeople(details, userId);
   const requests = useJoinRequests(details.trip.id, canDecide);
   const decide = useDecideJoinRequest(details.trip.id);
@@ -83,7 +85,7 @@ export function JoinRequestsPanel({ details, userId, reload }: Props) {
   const question = pending ? (pending.approve ? approveQuestion(pending.request) : rejectQuestion(pending.request)) : { title: '', message: '' };
 
   return (
-    <View style={{ gap: spacing.xs }} testID="requests-section">
+    <View style={{ gap: spacing.xs, padding: spacing.md, borderRadius: radius.md, backgroundColor: colors.surface2 }} testID="requests-section">
       {notice && (
         <Banner kind="success" testID="requests-notice">
           {notice}

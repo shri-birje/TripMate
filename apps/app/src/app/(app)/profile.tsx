@@ -1,25 +1,22 @@
-import { Link } from 'expo-router';
+import { useRouter } from 'expo-router';
 import { useEffect, useRef, useState } from 'react';
-import { View } from 'react-native';
-import { SUPPORTED_CURRENCIES, type CurrencyCode, type Profile, type ThemePreference } from '@tripmate/core';
+import { Pressable, View } from 'react-native';
+import { SUPPORTED_CURRENCIES, type CurrencyCode, type Profile } from '@tripmate/core';
 import { AppText } from '../../components/AppText';
 import { Banner } from '../../components/Banner';
 import { Button } from '../../components/Button';
+import { Avatar } from '../../components/Avatar';
 import { Card } from '../../components/Card';
+import { Icon } from '../../components/Icon';
 import { Screen } from '../../components/Screen';
 import { SegmentedControl } from '../../components/SegmentedControl';
 import { TextField } from '../../components/TextField';
 import { useAuth } from '../../features/auth/AuthProvider';
 import { useProfile, useUpdateProfileDetails } from '../../features/profile/profileApi';
 import { ProfileError } from '../../features/profile/profileService';
-import { useChangeTheme } from '../../features/profile/themeSync';
+import { useTheme } from '../../theme/ThemeProvider';
 import { spacing } from '../../theme/tokens';
 
-const THEME_OPTIONS: { value: ThemePreference; label: string }[] = [
-  { value: 'light', label: 'Light' },
-  { value: 'dark', label: 'Dark' },
-  { value: 'system', label: 'System' },
-];
 const CURRENCY_OPTIONS = SUPPORTED_CURRENCIES.map((c) => ({ value: c, label: c }));
 
 interface Form {
@@ -37,17 +34,16 @@ const formFrom = (p: Profile): Form => ({
 });
 
 export default function ProfileScreen() {
-  const { state, signOut } = useAuth();
+  const router = useRouter();
+  const { colors } = useTheme();
+  const { state } = useAuth();
   const { data: profile, isPending, error, refetch } = useProfile();
   const update = useUpdateProfileDetails();
-  const theme = useChangeTheme();
 
   const [form, setForm] = useState<Form | null>(null);
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
   const [formError, setFormError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
-  const [signOutError, setSignOutError] = useState<string | null>(null);
-  const [signingOut, setSigningOut] = useState(false);
 
   // Fill the form once when a profile first arrives (and again only if a different account's profile loads),
   // so a background refresh can never overwrite what the person is typing.
@@ -85,27 +81,30 @@ export default function ProfileScreen() {
     }
   }
 
-  async function doSignOut() {
-    setSigningOut(true);
-    setSignOutError(null);
-    const result = await signOut();
-    if (!result.ok) {
-      setSignOutError(result.message);
-      setSigningOut(false);
-    }
-    // On success the route guard moves the person to sign-in.
-  }
-
   return (
     <Screen>
-      <View style={{ marginTop: spacing.md, gap: spacing.xs }}>
-        <Link href="/" accessibilityRole="link">
-          <AppText tone="brand" style={{ fontWeight: '600' }}>
-            ← Home
-          </AppText>
-        </Link>
-        <AppText variant="title">Profile and settings</AppText>
+      <View style={{ marginTop: spacing.sm, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
+        <AppText variant="title">Profile</AppText>
+        <Pressable
+          testID="open-settings"
+          onPress={() => router.push('/settings')}
+          role="link"
+          aria-label="Settings"
+          style={({ pressed }) => ({ width: 44, height: 44, marginRight: -8, alignItems: 'center', justifyContent: 'center', opacity: pressed ? 0.6 : 1 })}
+        >
+          <Icon name="gear" color={colors.textPrimary} size={28} />
+        </Pressable>
       </View>
+
+      {profile && (
+        <View style={{ alignItems: 'center', gap: spacing.xs, paddingVertical: spacing.sm }}>
+          <Avatar name={profile.displayName} size={76} testID="profile-avatar" />
+          <AppText variant="heading" testID="profile-heading-name">{profile.displayName}</AppText>
+          <AppText variant="small" tone="secondary" testID="profile-email">
+            {state.status === 'signedIn' ? (state.email ?? '') : ''}
+          </AppText>
+        </View>
+      )}
 
       {isPending && <AppText tone="secondary" testID="profile-loading">Loading your profile…</AppText>}
 
@@ -159,26 +158,6 @@ export default function ProfileScreen() {
         </Card>
       )}
 
-      <Card>
-        <AppText variant="heading">Appearance</AppText>
-        <SegmentedControl label="Theme" testIDPrefix="theme" options={THEME_OPTIONS} value={theme.preference} onChange={theme.change} />
-        <AppText variant="small" tone="secondary">
-          Light is the default. System follows your device&apos;s setting.
-        </AppText>
-        {theme.saveError && <Banner kind="error" testID="theme-error">{theme.saveError}</Banner>}
-      </Card>
-
-      <Card>
-        <AppText variant="heading">Account</AppText>
-        <View style={{ gap: spacing.xs }}>
-          <AppText variant="small" tone="secondary">
-            Signed in as
-          </AppText>
-          <AppText testID="account-email">{state.status === 'signedIn' ? (state.email ?? 'your account') : ''}</AppText>
-        </View>
-        {signOutError && <Banner kind="error" testID="signout-error">{signOutError}</Banner>}
-        <Button testID="sign-out" label="Sign out" variant="secondary" onPress={doSignOut} loading={signingOut} />
-      </Card>
     </Screen>
   );
 }

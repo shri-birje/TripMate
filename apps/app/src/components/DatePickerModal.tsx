@@ -16,6 +16,7 @@ import { todayIso } from '../lib/today';
 import { useTheme } from '../theme/ThemeProvider';
 import { fontSize, radius, spacing } from '../theme/tokens';
 import { AppText } from './AppText';
+import { SurfaceContext } from './Surface';
 import { Button } from './Button';
 
 interface Props {
@@ -84,6 +85,7 @@ export function DatePickerModal({ visible, title, selectedIso, minIso = null, ma
 
   return (
     <Modal visible={visible} transparent animationType="fade" onRequestClose={onClose}>
+      <SurfaceContext.Provider value="surface">
       {/* The dimmed backdrop is the one colour that is not a theme token: it must darken whatever is behind it in both themes. */}
       <View style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.5)', alignItems: 'center', justifyContent: 'center', padding: spacing.md }}>
         <View
@@ -96,8 +98,6 @@ export function DatePickerModal({ visible, title, selectedIso, minIso = null, ma
             maxWidth: 360,
             maxHeight: '96%',
             borderRadius: radius.lg,
-            borderWidth: 1,
-            borderColor: colors.border,
             backgroundColor: colors.surface,
           }}
         >
@@ -152,7 +152,7 @@ export function DatePickerModal({ visible, title, selectedIso, minIso = null, ma
                           justifyContent: 'center',
                           borderRadius: radius.md,
                           borderWidth: isToday && !selected ? 1 : 0,
-                          borderColor: colors.primary,
+                          borderColor: colors.primaryText,
                           backgroundColor: selected ? colors.primary : 'transparent',
                           opacity: blocked ? 0.35 : 1,
                         }}
@@ -184,6 +184,7 @@ export function DatePickerModal({ visible, title, selectedIso, minIso = null, ma
           </ScrollView>
         </View>
       </View>
+      </SurfaceContext.Provider>
     </Modal>
   );
 }

@@ -8,6 +8,7 @@ import { Button } from '../../../../components/Button';
 import { Card } from '../../../../components/Card';
 import { ConfirmDialog } from '../../../../components/ConfirmDialog';
 import { Screen } from '../../../../components/Screen';
+import { TripScene, sceneFor } from '../../../../components/TripScene';
 import { useUserId } from '../../../../features/auth/AuthProvider';
 import { ExpensesCard } from '../../../../features/trips/ExpensesCard';
 import { PeopleCard } from '../../../../features/trips/PeopleCard';
@@ -17,8 +18,7 @@ import { useSetTripArchived } from '../../../../features/trips/tripEditApi';
 import { TripEditError } from '../../../../features/trips/tripEditService';
 import { formatMoney } from '../../../../lib/format';
 import { todayIso } from '../../../../lib/today';
-import { useTheme } from '../../../../theme/ThemeProvider';
-import { spacing } from '../../../../theme/tokens';
+import { radius, spacing } from '../../../../theme/tokens';
 
 /**
  * Trip Details: what you know about a trip you are on.
@@ -83,7 +83,6 @@ function Details({ details, reload }: { details: TripDetails; reload: () => void
   const { trip, lengthDays } = details;
   const router = useRouter();
   const userId = useUserId();
-  const { colors } = useTheme();
   // "Today" and the trip's dates are both plain calendar days, so this comparison has no time-zone surprises.
   const phase = tripPhase(trip.startDate, trip.endDate, todayIso());
   const isAdmin = isTripAdmin(details, userId);
@@ -134,6 +133,7 @@ function Details({ details, reload }: { details: TripDetails; reload: () => void
 
   return (
     <>
+      <TripScene kind={sceneFor(trip.id, `${trip.destination} ${trip.name}`)} height={150} radiusAll={radius.lg} />
       <View style={{ gap: spacing.sm }}>
         <AppText variant="title" testID="trip-title">
           {trip.name}

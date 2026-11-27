@@ -1,33 +1,45 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react';
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { StyleSheet, useColorScheme, View } from 'react-native';
-import { DEFAULT_THEME_PREFERENCE, type ThemePreference } from '@tripmate/core';
-import { loadThemePreference, resolveScheme, saveThemePreference, type Scheme, type SimpleStore } from './scheme';
+import { DEFAULT_SCHEME, loadDeviceScheme, normalizeScheme, saveDeviceScheme, type Scheme, type SimpleStore } from './scheme';
 import { darkColors, lightColors, type ColorTokens } from './tokens';
 
 interface ThemeContextValue {
-  /** What the user chose: light, dark or system. */
-  preference: ThemePreference;
-  /** What is actually showing right now: light or dark. */
+  /** What is showing right now: light or dark. (There is no third "system" option.) */
   scheme: Scheme;
+  /** Same as `scheme`; kept so controls can read "what is selected". */
+  preference: Scheme;
   colors: ColorTokens;
-  /** Changes the theme immediately and remembers it on this device. */
-  setPreference: (preference: ThemePreference) => void;
+  /** An explicit choice: changes the theme immediately and remembers it on this device. */
+  setPreference: (scheme: Scheme) => void;
+  /**
+   * The account's saved value arrived (after sign-in). It is used only if this device has no choice of its own, and then it is
+   * remembered on the device so it stays put. Never writes to the account.
+   */
+  adoptAccountTheme: (value: unknown) => void;
 }
 
 const ThemeContext = createContext<ThemeContextValue | null>(null);
 
 export function ThemeProvider({ children, store = AsyncStorage }: { children: ReactNode; store?: SimpleStore }) {
   const systemScheme = useColorScheme();
-  const [preference, setPreferenceState] = useState<ThemePreference>(DEFAULT_THEME_PREFERENCE);
+  const [scheme, setScheme] = useState<Scheme>(DEFAULT_SCHEME);
   const [ready, setReady] = useState(false);
+  // Whether this device has a choice of its own (saved earlier, or made in this session). A ref: it never needs to redraw anything.
+  const deviceChoice = useRef(false);
+  const systemRef = useRef(systemScheme);
+  systemRef.current = systemScheme;
 
-  // Read the saved choice once at start-up.
+  // Read the saved choice once at start-up. A legacy "system" value becomes Light or Dark here and is saved back as such.
   useEffect(() => {
     let alive = true;
-    void loadThemePreference(store).then((saved) => {
+    void loadDeviceScheme(store, systemRef.current).then((saved) => {
       if (!alive) return;
-      setPreferenceState(saved);
+      if (saved) {
+        deviceChoice.current = true;
+        setScheme(saved);
+        void saveDeviceScheme(store, saved);
+      }
       setReady(true);
     });
     return () => {
@@ -36,16 +48,31 @@ export function ThemeProvider({ children, store = AsyncStorage }: { children: Re
   }, [store]);
 
   const setPreference = useCallback(
-    (next: ThemePreference) => {
-      setPreferenceState(next);
-      void saveThemePreference(store, next);
+    (next: Scheme) => {
+      deviceChoice.current = true;
+      setScheme(next);
+      void saveDeviceScheme(store, next);
     },
     [store],
   );
 
-  const scheme = resolveScheme(preference, systemScheme);
+  const adoptAccountTheme = useCallback(
+    (value: unknown) => {
+      if (deviceChoice.current) return; // this device's explicit choice takes precedence
+      const next = normalizeScheme(value, systemRef.current);
+      if (!next) return;
+      deviceChoice.current = true; // once established it is kept through sign-out and refresh
+      setScheme(next);
+      void saveDeviceScheme(store, next);
+    },
+    [store],
+  );
+
   const colors = scheme === 'dark' ? darkColors : lightColors;
-  const value = useMemo(() => ({ preference, scheme, colors, setPreference }), [preference, scheme, colors, setPreference]);
+  const value = useMemo(
+    () => ({ preference: scheme, scheme, colors, setPreference, adoptAccountTheme }),
+    [scheme, colors, setPreference, adoptAccountTheme],
+  );
 
   // Wait for the saved choice before drawing anything, so a Dark-mode user never sees a flash of Light.
   if (!ready) return <View style={[StyleSheet.absoluteFill, { backgroundColor: lightColors.background }]} />;

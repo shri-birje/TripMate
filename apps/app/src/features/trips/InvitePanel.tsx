@@ -8,7 +8,7 @@ import { Button } from '../../components/Button';
 import { ConfirmDialog } from '../../components/ConfirmDialog';
 import { SegmentedControl } from '../../components/SegmentedControl';
 import { useTheme } from '../../theme/ThemeProvider';
-import { spacing } from '../../theme/tokens';
+import { radius, spacing } from '../../theme/tokens';
 import { useCopyGeneralLink, useCreateInvite, useRevokeInvite, useTripInvites } from './tripInviteApi';
 import { TripInviteError } from './tripInviteService';
 
@@ -53,6 +53,8 @@ export function InvitePanel({ details, userId, claimFor, onClaimDone }: Props) {
   const [cancelling, setCancelling] = useState<{ invite: Invite; label: string } | null>(null);
   const [error, setError] = useState<TripInviteError | null>(null);
   const [dialogError, setDialogError] = useState<string | null>(null);
+  const [generalToken, setGeneralToken] = useState<string | null>(null);
+  const [tokenState, setTokenState] = useState<'idle' | 'loading' | 'failed'>('idle');
 
   // Choosing "Invite to claim this spot" on a friend opens the panel for that friend.
   useEffect(() => {
@@ -66,15 +68,44 @@ export function InvitePanel({ details, userId, claimFor, onClaimDone }: Props) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [claimFor?.id]);
 
-  if (!canInvite) return null;
-
-  const created = create.data ?? null;
-  const link = created ? linkFor(created.token) : null;
-  const now = Date.now();
   const all = invites.data ?? [];
   const general = currentGeneralInvite(all);
   const generalLive = general !== null && general.status === 'active';
+  const generalId = generalLive ? general.id : null;
+
+  // The reusable link's address is kept in this component's memory only, just long enough to show and copy it. It is never stored, logged or cached.
+  // It is dropped whenever the link is revoked, expires or is replaced, when this person stops being an admin, and when the screen closes.
+  const previousGeneralId = useRef<string | null>(null);
+  useEffect(() => {
+    const before = previousGeneralId.current;
+    previousGeneralId.current = generalId;
+    // Keep the address just handed over by "Create link" while its row arrives (null -> id); drop it in every other case.
+    if (!canInvite || generalId === null || (before !== null && before !== generalId)) {
+      setGeneralToken(null);
+      setTokenState('idle');
+    }
+  }, [generalId, canInvite]);
+  useEffect(() => {
+    if (canInvite && general && generalLive && general.copyable && generalToken === null && tokenState === 'idle') loadGeneralToken();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [canInvite, generalId, generalToken, tokenState, general?.copyable]);
+  // A link that was just made: close the options once the panel for it can show.
+  useEffect(() => {
+    if (generalLive && !claimFor && create.isSuccess) {
+      create.reset();
+      setOpen(false);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [generalLive, create.isSuccess]);
+
+  if (!canInvite) return null;
+
+  const created = claimFor ? (create.data ?? null) : null; // only a friend's single-use link is shown in the show-once panel
+  const link = created ? linkFor(created.token) : null;
+  const generalMaking = !claimFor && create.isSuccess && !generalLive;
+  const now = Date.now();
   const claimInvites = all.filter((i) => i.status === 'active' && i.claimName !== null);
+  const generalUrl = generalToken ? linkFor(generalToken) : null;
 
   function submit() {
     if (busy.current) return;
@@ -84,41 +115,43 @@ export function InvitePanel({ details, userId, claimFor, onClaimDone }: Props) {
     create.mutate(
       { tripId: trip.id, options: { hours: Number(expiry), claimMemberId: claimFor?.id ?? null } },
       {
-        onSuccess: () => setShowActive(true), // so the new link is easy to find
+        onSuccess: (made) => {
+          if (claimFor) setShowActive(true); // so the new friend link is easy to find
+          else setGeneralToken(made.token); // the general link goes straight into its panel
+        },
         onError: (e) => setError(e),
         onSettled: () => { busy.current = false; },
       },
     );
   }
 
-  /** Copy link on the live general link: asks the database for the same link again, copies it, then forgets it. */
-  function copyGeneralLink() {
-    if (busy.current) return;
-    busy.current = true;
-    setError(null);
-    setCopy('idle');
+  /** Fetches the SAME reusable link again (the database gives it only to an active admin) so it can be shown in the panel. Never makes a new one. */
+  function loadGeneralToken() {
+    setTokenState('loading');
     copyGeneral.mutate(undefined, {
-      onSuccess: async (got) => {
-        try {
-          if (!got) setCopy('failed');
-          else {
-            const text = linkFor(got.token);
-            if (Platform.OS === 'web' && typeof navigator !== 'undefined' && navigator.clipboard) await navigator.clipboard.writeText(text);
-            else await Share.share({ message: text });
-            setCopy('copied');
-          }
-        } catch {
-          setCopy('failed');
-        } finally {
-          copyGeneral.reset(); // the token is dropped from memory
-          busy.current = false;
-        }
+      onSuccess: (got) => {
+        if (got) {
+          setGeneralToken(got.token);
+          setTokenState('idle');
+        } else setTokenState('failed');
+        copyGeneral.reset(); // the secret is dropped from the mutation cache
       },
-      onError: (e) => {
-        busy.current = false;
-        setError(e);
+      onError: () => {
+        setTokenState('failed');
+        copyGeneral.reset();
       },
     });
+  }
+
+  async function copyGeneralUrl() {
+    if (!generalUrl) return;
+    try {
+      if (Platform.OS === 'web' && typeof navigator !== 'undefined' && navigator.clipboard) await navigator.clipboard.writeText(generalUrl);
+      else await Share.share({ message: generalUrl });
+      setCopy('copied');
+    } catch {
+      setCopy('failed');
+    }
   }
 
   function finish() {
@@ -167,56 +200,107 @@ export function InvitePanel({ details, userId, claimFor, onClaimDone }: Props) {
   const cancellingGeneral = cancelling !== null && cancelling.invite.claimName === null;
 
   return (
-    <View style={{ gap: spacing.sm }} testID="invite-section">
+    <View style={{ gap: spacing.sm, padding: spacing.md, borderRadius: radius.md, backgroundColor: colors.surface2 }} testID="invite-section">
       <AppText variant="heading">Invite people</AppText>
       <AppText variant="small" tone="secondary" testID="invite-approval-note">
         Anyone with the invitation link can ask to join. Nobody joins until an admin approves their request.
       </AppText>
 
       {general && generalLive && (
-        <View style={{ gap: spacing.xs }} testID="invite-general">
-          <AppText variant="small" tone="secondary" testID={`invite-created-at-${general.id}`}>
-            {createdLabel(general.createdAt)}
-          </AppText>
+        <View style={{ gap: spacing.sm, padding: spacing.md, borderRadius: 12, borderLeftWidth: 4, borderLeftColor: colors.primary, backgroundColor: colors.surface }} testID="invite-general">
+          <View style={{ flexDirection: 'row', alignItems: 'center', gap: spacing.sm }}>
+            <View style={{ backgroundColor: colors.surface, borderRadius: 999, paddingHorizontal: spacing.sm + 2, paddingVertical: 2 }}>
+              <AppText variant="small" tone="ok" style={{ fontWeight: '700' }} testID="invite-status">
+                Active
+              </AppText>
+            </View>
+            <AppText variant="small" tone="secondary" testID={`invite-created-at-${general.id}`} style={{ flex: 1 }}>
+              {createdLabel(general.createdAt)}
+            </AppText>
+          </View>
           <AppText variant="small" testID={`invite-summary-${general.id}`}>
             {inviteSummary(general, now)}
           </AppText>
           {general.copyable ? (
             <>
-              <Button testID="invite-copy-link" label={Platform.OS === 'web' ? 'Copy link' : 'Share link'} loading={copyGeneral.isPending} onPress={copyGeneralLink} />
-              {copy === 'copied' && !created && (
+              {generalUrl && (
+                <View style={{ padding: spacing.sm + 2, borderRadius: 8, backgroundColor: colors.surface2 }}>
+                  <AppText selectable testID="invite-link" style={{ fontSize: 13, ...(Platform.OS === 'web' ? ({ wordBreak: 'break-all' } as object) : null) }}>
+                    {generalUrl}
+                  </AppText>
+                </View>
+              )}
+              {!generalUrl && tokenState !== 'failed' && (
+                <AppText variant="small" tone="secondary" testID="invite-link-loading">
+                  Loading the link…
+                </AppText>
+              )}
+              {!generalUrl && tokenState === 'failed' && (
+                <View style={{ gap: spacing.xs }}>
+                  <AppText variant="small" tone="error" testID="invite-link-failed">
+                    Couldn&apos;t load the link. Check your connection and try again.
+                  </AppText>
+                  <Button testID="invite-link-retry" label="Try again" variant="secondary" onPress={loadGeneralToken} />
+                </View>
+              )}
+              <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: spacing.sm }}>
+                <View style={{ flexGrow: 1, flexBasis: 140 }}>
+                  <Button testID="invite-copy-link" label={Platform.OS === 'web' ? 'Copy link' : 'Share link'} disabled={!generalUrl} onPress={() => void copyGeneralUrl()} />
+                </View>
+                <View style={{ flexGrow: 1, flexBasis: 140 }}>
+                  <Button
+                    testID={`invite-revoke-${general.id}`}
+                    label="Revoke link"
+                    variant="secondary"
+                    disabled={revoke.isPending}
+                    onPress={() => {
+                      setDialogError(null);
+                      setCancelling({ invite: general, label: `${createdLabel(general.createdAt)} · ${inviteSummary(general, now)}` });
+                    }}
+                  />
+                </View>
+              </View>
+              {copy === 'copied' && (
                 <AppText variant="small" tone="ok" testID="invite-copied">
                   Link copied.
                 </AppText>
               )}
-              {copy === 'failed' && !created && (
+              {copy === 'failed' && (
                 <AppText variant="small" tone="error" testID="invite-copy-failed">
-                  Couldn&apos;t copy the link. Reload and try again.
+                  Couldn&apos;t copy automatically. Select the link above and copy it.
                 </AppText>
               )}
               <AppText variant="small" tone="secondary" testID="invite-copy-note">
-                Copy link gives you this same link every time. Revoke link to end it; you can then make a new one.
+                Anyone with this link only sends a request: an admin approves each one. Revoke the link to end it; you can then make a new one.
               </AppText>
             </>
           ) : (
-            <AppText variant="small" tone="secondary" testID="invite-legacy-note">
-              This link was made before links could be copied again, so it can&apos;t be copied. Revoke it and create a new link to get one you can copy any time.
-            </AppText>
+            <>
+              <AppText variant="small" tone="secondary" testID="invite-legacy-note">
+                This link was made before links could be copied again, so it can&apos;t be copied. Revoke it and create a new link to get one you can copy any time.
+              </AppText>
+              <Button
+                testID={`invite-revoke-${general.id}`}
+                label="Revoke link"
+                variant="secondary"
+                disabled={revoke.isPending}
+                onPress={() => {
+                  setDialogError(null);
+                  setCancelling({ invite: general, label: `${createdLabel(general.createdAt)} · ${inviteSummary(general, now)}` });
+                }}
+              />
+            </>
           )}
-          <Button
-            testID={`invite-revoke-${general.id}`}
-            label="Revoke link"
-            variant="secondary"
-            disabled={revoke.isPending}
-            onPress={() => {
-              setDialogError(null);
-              setCancelling({ invite: general, label: `${createdLabel(general.createdAt)} · ${inviteSummary(general, now)}` });
-            }}
-          />
         </View>
       )}
 
-      {!open && !created && !generalLive && (
+      {generalMaking && (
+        <AppText variant="small" tone="secondary" testID="invite-making">
+          Link created. Loading…
+        </AppText>
+      )}
+
+      {!open && !created && !generalLive && !generalMaking && (
         <View style={{ gap: spacing.xs }}>
           {general && general.status === 'expired' && (
             <AppText variant="small" tone="secondary" testID="invite-expired-note">
@@ -227,7 +311,7 @@ export function InvitePanel({ details, userId, claimFor, onClaimDone }: Props) {
         </View>
       )}
 
-      {open && !created && (
+      {open && !created && !generalMaking && (
         <View style={{ gap: spacing.sm }} testID="invite-options">
           {claimFor ? (
             <AppText testID="invite-claim-note">{`This link is for ${claimFor.displayName}. When they open it and ask to join, an admin approves, and ${claimFor.displayName}'s place on the trip becomes their own account, with everything already recorded for them.`}</AppText>
@@ -258,7 +342,7 @@ export function InvitePanel({ details, userId, claimFor, onClaimDone }: Props) {
       )}
 
       {created && link && (
-        <View style={{ gap: spacing.sm, padding: spacing.md, borderRadius: 12, borderWidth: 1, borderColor: colors.primary }} testID="invite-created">
+        <View style={{ gap: spacing.sm, padding: spacing.md, borderRadius: 12, borderLeftWidth: 4, borderLeftColor: colors.primary, backgroundColor: colors.surface2 }} testID="invite-created">
           <AppText variant="small" tone="brand" style={{ fontWeight: '600' }} testID="invite-once-warning">
             {claimFor
               ? `This link is shown only once. Copy it now and send it only to ${claimFor.displayName}.`

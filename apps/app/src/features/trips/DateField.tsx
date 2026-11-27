@@ -87,7 +87,7 @@ export function DateField({ label, value, onChangeText, error, helper, placehold
             hitSlop={6}
             style={{ minHeight: 46, minWidth: 46, alignItems: 'center', justifyContent: 'center', paddingHorizontal: spacing.sm }}
           >
-            <CalendarIcon color={colors.primary} />
+            <CalendarIcon color={colors.primaryText} />
           </Pressable>
         }
       />

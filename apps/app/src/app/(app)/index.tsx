@@ -1,47 +1,78 @@
 import { useRouter } from 'expo-router';
 import { useMemo, useState } from 'react';
 import { Pressable, View } from 'react-native';
-import { archivedTrips, groupTripsByPhase } from '@tripmate/core';
+import { groupTripsByPhase, type Trip } from '@tripmate/core';
 import { AppText } from '../../components/AppText';
 import { Banner } from '../../components/Banner';
 import { Button } from '../../components/Button';
 import { Card } from '../../components/Card';
-import { Screen } from '../../components/Screen';
+import { Icon } from '../../components/Icon';
+import { FadeSwap, Screen } from '../../components/Screen';
+import { UnderlineTabs } from '../../components/UnderlineTabs';
 import { useProfile } from '../../features/profile/profileApi';
 import { TripCard } from '../../features/trips/TripCard';
 import { useTrips } from '../../features/trips/tripApi';
+import { useLayoutMode } from '../../lib/useLayoutMode';
 import { todayIso } from '../../lib/today';
-import { spacing } from '../../theme/tokens';
+import { useTheme } from '../../theme/ThemeProvider';
+import { radius, spacing } from '../../theme/tokens';
+
+type Phase = 'completed' | 'ongoing' | 'upcoming';
+// Completed | Ongoing | Upcoming: Ongoing sits in the middle and is selected first.
+const TABS: { value: Phase; label: string }[] = [
+  { value: 'completed', label: 'Completed' },
+  { value: 'ongoing', label: 'Ongoing' },
+  { value: 'upcoming', label: 'Upcoming' },
+];
+const EMPTY: Record<Phase, { title: string; hint: string }> = {
+  ongoing: { title: 'Nothing under way right now', hint: 'Trips whose dates include today appear here.' },
+  upcoming: { title: 'No trips planned yet', hint: 'Trips that start later appear here.' },
+  completed: { title: 'No finished trips yet', hint: 'Trips whose end date has passed appear here.' },
+};
 
 /**
- * Home: a greeting and the person's trips, grouped Ongoing / Upcoming / Completed.
- * (The full Home design - balances, recent activity - grows as those features arrive.)
+ * Home: a greeting, a search shortcut, and the person's trips by status. The status tabs read Completed | Ongoing | Upcoming
+ * (Ongoing selected first). Archived trips live on their own screen (bottom navigation), so they never appear here.
  */
 export default function HomeScreen() {
   const router = useRouter();
+  const { colors } = useTheme();
+  const mode = useLayoutMode();
   const { data: profile, isPending: profileLoading } = useProfile();
   const { data: trips, isPending, error, refetch, isFetching } = useTrips();
   const firstName = profile?.displayName.split(' ')[0];
+  const [phase, setPhase] = useState<Phase>('ongoing');
 
   const groups = useMemo(() => (trips ? groupTripsByPhase(trips, todayIso()) : null), [trips]);
   const visibleCount = groups ? groups.ongoing.length + groups.upcoming.length + groups.completed.length : 0;
-  // Archived trips are kept apart from the three active groups. The count is the archived trips the database
-  // actually returned for THIS person (it never includes trips they cannot access).
-  const archived = useMemo(() => (trips ? archivedTrips(trips) : []), [trips]);
-  const [showArchived, setShowArchived] = useState(false);
+  const shown: Trip[] = groups ? groups[phase] : [];
   const newTrip = () => router.push('/trips/new');
   const openTrip = (tripId: string) => router.push(`/trips/${tripId}`);
 
   return (
     <Screen>
-      <View style={{ marginTop: spacing.lg, gap: spacing.xs }}>
-        <AppText variant="small" tone="secondary">
+      <View style={{ marginTop: spacing.sm, gap: spacing.xs }}>
+        <AppText variant="eyebrow" tone="accent">
           TripMate
         </AppText>
         <AppText variant="title" testID="greeting">
           {profileLoading ? 'Welcome' : `Hello, ${firstName ?? 'traveller'}`}
         </AppText>
       </View>
+
+      {/* The search field is a shortcut to the Search screen. */}
+      <Pressable
+        testID="home-search"
+        onPress={() => router.navigate('/search')}
+        role="button"
+        aria-label="Search your trips"
+        style={{ minHeight: 52, flexDirection: 'row', alignItems: 'center', gap: spacing.sm + 2, paddingHorizontal: spacing.md, borderRadius: radius.md, backgroundColor: colors.surface }}
+      >
+        <Icon name="search" color={colors.textSecondaryOnSurface} size={22} />
+        <AppText tone="secondary" style={{ color: colors.textSecondaryOnSurface }}>
+          Search trips
+        </AppText>
+      </Pressable>
 
       {isPending && (
         <AppText tone="secondary" testID="trips-loading">
@@ -70,59 +101,33 @@ export default function HomeScreen() {
 
       {groups && visibleCount > 0 && (
         <>
-          <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: spacing.md }}>
-            <AppText variant="heading">Your trips</AppText>
-            <View style={{ minWidth: 120 }}>
-              <Button testID="create-trip" label="New trip" onPress={newTrip} />
+          <UnderlineTabs
+            label="Trip status"
+            testIDPrefix="status"
+            options={TABS.map((t) => ({ ...t, accessibilityLabel: `${t.label}, ${groups[t.value].length}` }))}
+            value={phase}
+            onChange={setPhase}
+          />
+          <FadeSwap contentKey={phase}>
+            <View testID={`section-${phase}`} style={mode === 'desktop' ? { gap: spacing.md, flexDirection: 'row', flexWrap: 'wrap' } : { gap: spacing.md }}>
+              {shown.length === 0 ? (
+                <Card>
+                  <AppText variant="heading" testID={`empty-${phase}`}>
+                    {EMPTY[phase].title}
+                  </AppText>
+                  <AppText tone="secondary">{EMPTY[phase].hint}</AppText>
+                </Card>
+              ) : (
+                shown.map((t) => (
+                  <View key={t.id} style={mode === 'desktop' ? { width: '48.5%' } : undefined}>
+                    <TripCard trip={t} onPress={() => openTrip(t.id)} />
+                  </View>
+                ))
+              )}
             </View>
-          </View>
-          <Section title="Ongoing" trips={groups.ongoing} onOpen={openTrip} />
-          <Section title="Upcoming" trips={groups.upcoming} onOpen={openTrip} />
-          <Section title="Completed" trips={groups.completed} onOpen={openTrip} />
+          </FadeSwap>
         </>
       )}
-
-      {archived.length > 0 && (
-        <View style={{ gap: spacing.sm }} testID="section-archived">
-          <Pressable
-            testID="archived-toggle"
-            onPress={() => setShowArchived((v) => !v)}
-            role="button"
-            aria-expanded={showArchived}
-            aria-label={`Archived trips, ${archived.length}. ${showArchived ? 'Hide' : 'Show'}`}
-            style={{ minHeight: 44, justifyContent: 'center' }}
-          >
-            <AppText variant="small" tone="secondary" style={{ fontWeight: '600' }}>
-              {`${showArchived ? '▾' : '▸'} Archived (${archived.length})`}
-            </AppText>
-          </Pressable>
-          {showArchived && archived.map((t) => <TripCard key={t.id} trip={t} onPress={() => openTrip(t.id)} />)}
-        </View>
-      )}
-
-      <Button testID="open-profile" variant="secondary" label="Profile and settings" onPress={() => router.push('/profile')} />
     </Screen>
-  );
-}
-
-function Section({
-  title,
-  trips,
-  onOpen,
-}: {
-  title: string;
-  trips: ReturnType<typeof groupTripsByPhase>['ongoing'];
-  onOpen: (tripId: string) => void;
-}) {
-  if (trips.length === 0) return null;
-  return (
-    <View style={{ gap: spacing.sm }} testID={`section-${title.toLowerCase()}`}>
-      <AppText variant="small" tone="secondary" style={{ fontWeight: '600' }}>
-        {`${title} (${trips.length})`}
-      </AppText>
-      {trips.map((t) => (
-        <TripCard key={t.id} trip={t} onPress={() => onOpen(t.id)} />
-      ))}
-    </View>
   );
 }

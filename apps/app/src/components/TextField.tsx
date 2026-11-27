@@ -1,8 +1,11 @@
 import { useState, type ReactNode } from 'react';
 import { Pressable, Text, TextInput, View, type TextInputProps } from 'react-native';
+import { fontFamily } from '../theme/fonts';
 import { fontSize, radius, spacing } from '../theme/tokens';
 import { useTheme } from '../theme/ThemeProvider';
 import { AppText } from './AppText';
+import { useSurface } from './Surface';
+import { reportFieldBlur, reportFieldFocus } from '../lib/keyboardNav';
 
 interface Props
   extends Pick<
@@ -36,6 +39,8 @@ interface Props
 export function TextField({ label, error, helper, placeholder, secret = false, testID, trailing, ...input }: Props) {
   const { colors } = useTheme();
   const [revealed, setRevealed] = useState(false);
+  const [focused, setFocused] = useState(false);
+  const onSurface = useSurface() === 'surface';
 
   return (
     <View style={{ gap: spacing.xs }}>
@@ -48,9 +53,10 @@ export function TextField({ label, error, helper, placeholder, secret = false, t
           alignItems: 'center',
           minHeight: 48,
           borderRadius: radius.md,
-          borderWidth: 1,
-          borderColor: error ? colors.statusError : colors.border,
-          backgroundColor: colors.surface,
+          // Flat tonal field: no outline, except a clear error ring (an error must not rely on text alone).
+          borderWidth: error || focused ? 2 : 0,
+          borderColor: error ? colors.statusError : colors.primaryText,
+          backgroundColor: onSurface ? colors.surface2 : colors.surface,
         }}
       >
         <TextInput
@@ -58,9 +64,17 @@ export function TextField({ label, error, helper, placeholder, secret = false, t
           testID={testID}
           accessibilityLabel={label}
           placeholder={placeholder}
-          placeholderTextColor={colors.textSecondary}
+          placeholderTextColor={onSurface ? colors.textSecondaryOnSurface : colors.textSecondary}
           secureTextEntry={secret && !revealed}
           autoCorrect={false}
+          onFocus={() => {
+            setFocused(true);
+            reportFieldFocus();
+          }}
+          onBlur={() => {
+            setFocused(false);
+            reportFieldBlur();
+          }}
           style={{
             flex: 1,
             minHeight: input.multiline ? 96 : 46,
@@ -69,6 +83,9 @@ export function TextField({ label, error, helper, placeholder, secret = false, t
             textAlignVertical: input.multiline ? 'top' : 'center',
             color: colors.textPrimary,
             fontSize: fontSize.body,
+            fontFamily: fontFamily.body,
+            // the focus ring is drawn on the field around the input, so the browser's own outline is switched off
+            ...({ outlineStyle: 'none' } as object),
           }}
         />
         {trailing}
@@ -80,7 +97,7 @@ export function TextField({ label, error, helper, placeholder, secret = false, t
             hitSlop={8}
             style={{ paddingHorizontal: spacing.md, minHeight: 46, justifyContent: 'center' }}
           >
-            <Text style={{ color: colors.primary, fontWeight: '600', fontSize: fontSize.small }}>{revealed ? 'Hide' : 'Show'}</Text>
+            <Text style={{ color: colors.primaryText, fontWeight: '600', fontSize: fontSize.small }}>{revealed ? 'Hide' : 'Show'}</Text>
           </Pressable>
         )}
       </View>

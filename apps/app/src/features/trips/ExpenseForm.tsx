@@ -22,6 +22,7 @@ import { Banner } from '../../components/Banner';
 import { Button } from '../../components/Button';
 import { Card } from '../../components/Card';
 import { CheckRow } from '../../components/CheckRow';
+import { Reveal } from '../../components/Reveal';
 import { SegmentedControl } from '../../components/SegmentedControl';
 import { NumericField } from '../../components/NumericField';
 import { TextField } from '../../components/TextField';
@@ -232,6 +233,7 @@ export function ExpenseForm({ details, categories, categoriesLoading, initial, s
             <View key={m.id}>
               <CheckRow testID={`expense-participant-${m.id}`} label={m.displayName} note={m.isGuest ? 'Guest' : undefined} checked={sharing} onToggle={() => setValues(toggleParticipant(values, m.id, memberOrder))} />
               {sharing && values.splitMethod !== 'equal' && (
+                <Reveal key={values.splitMethod}>
                 <NumericField
                   kind={values.splitMethod === 'exact' ? 'money' : values.splitMethod === 'percentage' ? 'percent' : 'shares'}
                   testID={`expense-split-value-${m.id}`}
@@ -240,6 +242,7 @@ export function ExpenseForm({ details, categories, categoriesLoading, initial, s
                   onChangeText={(v) => set('splitValues', { ...values.splitValues, [m.id]: v })}
                   placeholder={values.splitMethod === 'shares' ? '1' : '0'}
                 />
+                </Reveal>
               )}
             </View>
           );

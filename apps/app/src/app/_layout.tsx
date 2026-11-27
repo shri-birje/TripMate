@@ -2,6 +2,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { Stack } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
 import { useState } from 'react';
+import { Platform } from 'react-native';
 import { LoadingScreen, SetupScreen } from '../components/StatusScreens';
 import { AuthProvider, useAuth } from '../features/auth/AuthProvider';
 import { ThemeProfileSync } from '../features/profile/themeSync';
@@ -28,6 +29,8 @@ export default function RootLayout() {
     </QueryClientProvider>
   );
 }
+
+const SIGNED_OUT_HOME = Platform.OS === 'web' ? '/welcome' : '/sign-in';
 
 /**
  * PROTECTED ROUTES.
@@ -56,15 +59,21 @@ function RouteGuard() {
       <StatusBar style={scheme === 'dark' ? 'light' : 'dark'} />
       <Stack screenOptions={{ headerShown: false, contentStyle: { backgroundColor: colors.background } }}>
         {/* Signed out + trying to open an (app) screen  -> go to sign-in */}
-        <Stack.Protected guard={signedIn} redirectTo="/sign-in">
+        {/* (on the web, a signed-out visitor to the root address lands on the public website; phones go straight to sign-in) */}
+        <Stack.Protected guard={signedIn} redirectTo={SIGNED_OUT_HOME}>
           <Stack.Screen name="(app)" />
         </Stack.Protected>
         {/* Signed in + trying to open a sign-in/sign-up screen -> go home (or back to the invitation they were opening) */}
         <Stack.Protected guard={!signedIn} redirectTo={waitingInvite ? `/join/${waitingInvite}` : '/'}>
           <Stack.Screen name="(auth)" />
         </Stack.Protected>
-        {/* Invitation links: open to everyone */}
+        {/* The public website: only for people who are signed out; a signed-in person is sent to the app, never back here */}
+        <Stack.Protected guard={!signedIn} redirectTo="/">
+          <Stack.Screen name="(site)" />
+        </Stack.Protected>
+        {/* Invitation links and the About/Contact/Privacy/Terms/Help placeholder pages: open to everyone */}
         <Stack.Screen name="join/[token]" />
+        <Stack.Screen name="info/[page]" />
       </Stack>
     </>
   );

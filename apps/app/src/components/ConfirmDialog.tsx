@@ -2,6 +2,7 @@ import { Modal, View } from 'react-native';
 import { radius, spacing } from '../theme/tokens';
 import { useTheme } from '../theme/ThemeProvider';
 import { AppText } from './AppText';
+import { SurfaceContext } from './Surface';
 import { Banner } from './Banner';
 import { Button } from './Button';
 
@@ -27,6 +28,7 @@ export function ConfirmDialog({ visible, title, message, confirmLabel, cancelLab
   const { colors } = useTheme();
   return (
     <Modal visible={visible} transparent animationType="fade" onRequestClose={busy ? () => {} : onCancel}>
+      <SurfaceContext.Provider value="surface">
       {/* The dimmed backdrop is the one colour that is not a theme token: it must darken whatever is behind it in both themes. */}
       <View style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.5)', alignItems: 'center', justifyContent: 'center', padding: spacing.lg }}>
         <View
@@ -40,8 +42,6 @@ export function ConfirmDialog({ visible, title, message, confirmLabel, cancelLab
             gap: spacing.md,
             padding: spacing.lg,
             borderRadius: radius.lg,
-            borderWidth: 1,
-            borderColor: colors.border,
             backgroundColor: colors.surface,
           }}
         >
@@ -60,6 +60,7 @@ export function ConfirmDialog({ visible, title, message, confirmLabel, cancelLab
           </View>
         </View>
       </View>
+      </SurfaceContext.Provider>
     </Modal>
   );
 }

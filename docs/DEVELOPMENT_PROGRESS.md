@@ -17,7 +17,7 @@ Rule: a feature is **Complete** only when it works **and has been tested**. "Cod
 | M4 — Invites + guest claim | ✅ Delivered within M3.5 (ADR-055 to ADR-062) |
 | M5 — Expenses + split types | ✅ **Complete locally (Checkpoints 1 to 6; input validation refinement approved 2026-11-25).** Migrations #8 to #11 are written; the live check on 2026-11-25 shows all of them present (0 failures, 0 warnings). Not committed. **Not ready for public deployment: ADR-054 rate limiting is still outstanding.** See the Checkpoint 6 section. |
 | M6 — Balances + settlement plan | ✅ **Complete locally (close-out 2026-11-26; ADR-065).** Display-only suggested payments in the Balances tab. No database or migration change. Not committed. |
-| M7 — Repayment lifecycle | Not started |
+| M7 — Repayment tracking | 🟡 **Checkpoint 1 complete (ADR-066 approved). Checkpoint 2 (database) applied live by you and verified. Checkpoint 3 (core ledger and services) BUILT AND TESTED LOCALLY, nothing committed. Checkpoints 4 to 6 not started.** Full design: `docs/M7_REPAYMENTS_DESIGN.md`. |
 | M8 — Dashboard, activity feed, basic budgets | Not started |
 | M9 — Web layouts, dark mode, polish | Not started |
 | M10 — Hardening + live deployment | Not started |
@@ -1270,3 +1270,117 @@ Today `create_invite` builds the token inside the database, stores **only its SH
 - **Results:** type-checks clean; core 645, app 324 pass; scenarios P (48) and K (91) pass. Scenario M and the database suite were not repeated (no shared or database change since their last passes).
 - **Known limitations:** minimum guaranteed only up to 20 people with a balance; the plan can change when expenses change (stated in the UI); display only, no repayment recording (M7); 21 to 50 people not guaranteed minimal; phone performance measured by you on a real device, not by automated tests.
 - **Release blockers (separate, not M6):** ADR-054 rate limiting (not implemented, mandatory before public deployment); production hosting and security hardening (M10); live Step 16 and signed-in walkthroughs of M5/M6 on the real project.
+
+
+## M7 — Repayment tracking (plan, Checkpoint 1, revision 4; architecture approved; implementation not started)
+
+**Full design:** [`docs/M7_REPAYMENTS_DESIGN.md`](M7_REPAYMENTS_DESIGN.md). Decision record: ADR-066, **approved as architecture** after the consistency review in design section 20.
+
+**Final decision status (2026-11-26).**
+- **Approved (13):** D1 (four states), D2 (no repayment created already confirmed), D3 (overpayment refused; global pending reservations; recheck at confirmation), D4 (archived trips: no new items, open items resolvable), D5 (leaving and removal refused while pending items exist; resolution order approved), D6 (strict guest proxy rules), D8 (every active member can read), D9 (in-app list and badge), D10 (any eligible payer may repay any eligible receiver within capacity), D11 (`from_suggestion` and attachments dropped), D12 (no automatic expiry), D13 (Option B: two-party acknowledged reversal with a restricted two-admin override, 14-day clock with reminder evidence, single-admin fallback), D14 (optional note, 200 characters).
+- **Deferred (1):** D7 (UPI handoff and UPI id visibility; no migration #13). Push notifications are also deferred under D9.
+- **Open decisions:** none.
+- **Accepted limitation (ADR-047):** an unreachable account holder with a non-zero balance cannot be removed through an admin override.
+
+**Implementation checks (done 2026-11-26):** no deleted-account marker exists, so `counterparty_account_inaccessible` is **deferred (V1)**: approved as a concept, not executable in M7, and not reachable under the D6 and D13 rules. `remove_member` and `leave_trip` are the only deactivating writers; the pending guard is a trigger covering every path; balance-function callers need no design change. **Approved in revision 4.2:** R4a (guest participant representation) and R4b (guest counterparty representation); `requested_for` (the represented party; immutable; never a third member); the authenticated actor and the represented participant are both recorded. **Remaining ambiguity (section 20.4):** a guest counterparty with no eligible proxy has no executable route.
+
+**Balance rule (approved):** `net = expense_net + confirmed_sent − confirmed_received`, excluding applied reversals. M1 is unchanged and unused by M7. Pending, rejected, cancelled and unapplied reversal items never change balances; the M6 plan uses confirmed balances only and shows pending items beside it.
+
+**Checkpoints:** 2 database (migration #12: three tables, state and reversal machines, helpers, the balance split, the pending-item guard, ten functions, database tests; no app code); 3 core ledger module and services (no screens); 4 screens; 5 browser and regression; 6 close-out. Checkpoint 2 starts only on your go-ahead. ADR-054 rate limiting is not part of M7 and remains mandatory before public deployment.
+
+**Checkpoint 2 (2026-11-26) BUILT AND TESTED LOCALLY: the repayment database (migration #12 NOT applied live; nothing committed).** No application code, no UI, no UPI, no notifications, no rate limiting. M1 and migrations #1 to #11 are unchanged.
+- **Migration #12 (`supabase/migrations/20261126000000_repayments.sql`):** three tables (`repayments`, `repayment_reversals`, `repayment_events`), row-level security (active members read; nobody writes directly), four repayment states only, ten callable functions (`create_repayment`, `confirm_repayment`, `reject_repayment`, `cancel_repayment`, `request_reversal`, `respond_reversal`, `withdraw_reversal`, `remind_reversal`, `propose_override`, `decide_override`), sixteen internal helpers and trigger functions, `member_net_minor` replaced (same signature and privileges; now the M5 expense net plus confirmed, unreversed repayments), `trip_member_balances` recreated with `sent_minor` and `received_minor`, and a guard on leaving and removal (`repayment_pending`).
+- **Rules enforced twice (function and trigger, and in places a third time):** pending repayments reserve capacity globally per payer and per receiver and never change a balance; capacity is rechecked at confirmation; archived trips refuse recording, reminders, reversal requests and override proposals but allow resolving open items; strict guest-proxy rules R1 to R4b; no admin acts on both sides; `requested_for` is one of the two parties and immutable; the only executable override category is `counterparty_unresponsive` (14 days, two reminders, a second independent admin who is not a participant and not the proposer); `counterparty_account_inaccessible` does not appear in any constraint, function or test of success.
+- **Tests:** `supabase/tests/repayments.test.ts` (65 tests); the four existing allow-list tests updated with the ten new function names. Full database suite: **540 tests pass** (12 files; 475 existing plus the 65 new). **Mutation checks: 26 deliberate breaks of the critical authorization, capacity, state-transition, balance and override rules, all caught** (two survivors in the first pass led to a stronger test and a second-layer mutation; the migration was restored byte for byte after every run).
+- **Live probe:** `scripts/verify-supabase.ts` now probes the ten functions, the helpers and the three tables; against the live project (migration #12 not applied) it reports 0 failures and 17 warnings, all "not applied yet".
+- **Apply later:** `docs/SUPABASE_SETUP.md` Step 17 (run the file in the SQL Editor, safe to re-run; read-only checks a to g).
+- **Deviations and additions (all recorded in design section 22):** `request_reversal` takes an optional `p_requested_for`; two extra trigger-level codes; an audit-consistency trigger on events; the reversal "apply" step writes its own event; the test "a proxy who becomes eligible between proposal and approval blocks the override" is not applicable under V1 and was replaced by an approval-time re-evaluation test.
+- **Known limitations:** PGlite runs one session, so real parallel races are not produced locally (lock order is checked structurally and by mutation; a real two-session race check is a manual step for Checkpoint 6); a guest counterparty with no eligible proxy has no resolution path (accepted); a mistaken repayment involving someone who left cannot be corrected (Rule I-1); ADR-054 rate limiting is still not implemented.
+
+**Checkpoint 3 (2026-11-26) BUILT AND TESTED LOCALLY: the core ledger and the services. No screens, no UPI, no notifications, no migration, no live change, nothing committed.**
+- **Core ledger (`packages/core/src/repaymentLedger.ts`):** `computeLedgerBalances` = M1 `computeBalances` called with NO repayments (the expense part, unchanged) plus confirmed, unreversed repayments. Pending, rejected and cancelled repayments and every reversal that is not applied change nothing. Typed `RepaymentLedgerError` codes for inconsistent records. `previewRepaymentCapacity` is a preview of the database's rule, never an authority. M1 `balances.ts` and its legacy repayment path are untouched.
+- **Types and argument builders (`packages/core/src/repayment.ts`):** domain types, strict row readers (a list is returned whole or refused), the ten argument builders (their parameter names are checked against migration #12 by a test), early friendly checks, and the three identities kept apart (authenticated actor, represented participant, counterparty).
+- **Balance type (`expense.ts`, additive):** `sentMinor` and `receivedMinor` are optional, so M5 consumers and rows from before migration #12 map as before.
+- **Services (`apps/app/src/features/trips/repaymentService.ts`):** the ten writes and the reads; typed `RepaymentError` with fixed sentences and no raw database text; `outcomeUnknown` for connection problems; the database's refusal words mapped one by one; the "most that can be recorded" figure read from the detail.
+- **Queries (`repaymentQueries.ts`):** per-user, per-trip keys; after every write (successful or refused) the repayments, reversals, the affected histories and the BALANCES are refreshed. `repayment_pending` also maps in the member service.
+- **Tests:** core `repaymentLedger.test.ts` (31: every state, edge cases, multiple repayments and reversals, 1,500 seeded ledgers checked for zero-sum, safe integers, and agreement with M1 used as an independent check) and `repayment.test.ts` (17: strict readers, identities, early checks, and an argument-name check against migration #12); app `repaymentService.test.ts` (59: argument mapping, identity, the error map, retries, reads) and `repaymentQueries.test.ts` (13: keys, invalidation after every write, duplicate and retry behaviour).
+- **Results:** core 693 pass; app 396 pass; API 17 pass; type-checks clean for core, app and API. Database suite not rerun (no database change).
+- **Mutation checks (ledger):** 6 of 8 caught. The two survivors are equivalent: removing the explicit safe-integer test changes nothing because the `money()` wrapper refuses the same value with the same code, and the final zero-sum assertion is defensive (the expense total is already checked and every repayment moves an amount between two members).
+- **Deviations:** none from the design. One addition: `repayment_pending` is mapped in the member service (the database already raised it since migration #12).
+- **Known limitations:** the balances an app shows are the database's (the ledger module is a reference and a preview, not what is displayed); the capacity preview can only be as current as the balances it is given; the two-session race check is still a manual Checkpoint 6 step.
+
+## UI redesign: Concept A "Field Journal" (implemented locally; nothing committed; M7 Checkpoint 4 still paused)
+
+**Scope:** presentation only. No change to services, hooks, queries, core logic, migrations #1-#12, the database, RLS, M5 expenses, M6 settlement maths or the M7 repayment code, and no new dependency (`package.json` files untouched by this work).
+
+| Area | What changed |
+|---|---|
+| Tokens (`theme/tokens.ts`, `fonts.ts`, `motion.ts`) | Approved light and dark palettes; `surface2`, `wood`, `ocean`; accessible `…OnSurface` companions; system serif headings, Segoe UI / system sans body; radii 12 / 18 / 28; motion durations |
+| Components | `AppText` (serif headings, surface-aware colour), flat tonal `Card` / `Button` / `Banner` / `TextField` (focus ring), `SegmentedControl` with a sliding indicator (180 ms), `UnderlineTabs` (220 ms), `Reveal` (180 ms fade and expand), `PressableScale` (98 %), `Icon`, `TripScene` (illustrations), `AppNav` (bottom bar and side rail) |
+| Mobile | Home (search shortcut, Completed / Ongoing / Upcoming tabs, Ongoing centred and first), image-led trip cards, new Search, Archived and Settings screens, Profile with a gear, Create Trip button inside the bar |
+| Balances | "My Suggested Payments" (deeper panel, forest edge, "Only you") and "Everyone's Payments" ("Whole group") are now separate surfaces; the text, numbers and `planSettlement` are unchanged |
+| Website | `/welcome` landing page (hero, six supported features, how it works, previews, closing call to action, footer), placeholder `/info/<page>` pages, signed-in desktop web dashboard with side navigation |
+| Guard | Signed-out web visitors go to `/welcome`, phones to sign-in; signed-in visitors never see `/welcome` |
+
+**Tests:** app unit tests 413 (was 396; new: navigation, layout mode, name search, scene picker, palette contrast and approved values), core 693, api 17; type-check clean in all workspaces; browser run `npm run ui:check`: the existing scenarios were updated only where the design moved a control (theme and sign-out to Settings, Archived to its own screen, one status at a time on Home, the public website instead of sign-in when signed out, capitals in status labels, new colours) and a new scenario Q covers the website, navigation, tabs, Search, Archived, Create, Profile, Settings, Dark, reduced motion, tablet and desktop widths.
+
+**Known limits:** checked in the browser (react-native-web) only; the native Android and iOS builds were not run here (type-checked only). The destination pictures are illustrations chosen from the destination words, not photographs. About / Contact / Privacy / Terms / Help are placeholders until real content is supplied. ADR-054 (rate limiting) is still required before public deployment, and a public website raises its priority.
+
+
+## UI refinements after the Concept A review (implemented locally; nothing committed; M7 Checkpoint 4 still paused)
+
+Neutral dark theme (#101010 / #1C1C1C / #272727; forest-green fills, sage text/indicators via the new `primaryText` token); contrast fixes (CheckRow notes, You/Guest tags); desktop sidebar with Profile (avatar and name) anchored at the bottom; Light/Dark/System switch on the public website (same theme preference as the app; an account's saved choice replaces a device choice at sign-in); split-screen website sign-in and sign-up (native keeps its mobile layout) with the shared footer; information pages open to signed-in users (links in Settings); phone-frame previews with consistent sample data; day-wise expenses (`groupExpensesByDay`, `tripDayNumber` in core, UTC calendar arithmetic, no schema change); bottom navigation hides while the native keyboard is open. Profile photos: proposal only (`PROFILE_PHOTO_PROPOSAL.md`), awaiting approval. Database, migrations, services and settlement/expense logic untouched.
+
+## UI Phase 3: layout, insights, themes and interaction (implemented locally; nothing committed; M7 Checkpoint 4 still paused)
+
+**Scope:** presentation only. No change to migrations #1-#12, the database, Storage, RLS, auth, M1 balances, M5 expense writes, M6 `planSettlement` or the M7 ledger/services, and no new dependency. Profile photos, ADR-054 rate limiting and M7 Checkpoint 4 remain deferred.
+
+| Area | What changed |
+|---|---|
+| Appearance | Light/Dark only everywhere (Settings, landing header, information pages). Legacy `system` values resolve to Light/Dark. Device choice beats the account at sign-in; the account fills in only when the device has none; explicit changes update the account once. Auth pages no longer carry a theme switch. Two-state switch with a sliding indicator (220 ms, instant with reduced motion). New cog, sun and moon icons. |
+| Website | The footer is its own full-width band (deeper tonal surface plus a hairline), distinct from the branding panel and the page, on landing, Login, Sign Up and information pages. |
+| Expenses | Day cards are collapsed by default and open and close independently with a 220 ms height animation; each expense row has a category icon. Open state survives data refreshes and resets per trip. |
+| Balances | Member cards (avatar, name, You/Guest, status, amount, paid/share), "My Suggested Payments" as direction cards, "Group settlement plan" payments as one card each. Figures and colours unchanged. |
+| Insights | New third tab: summary, horizontal bar chart and donut with legend, one muted palette shared by both, readable text for every figure, works on archived trips, zero writes. Core: `expenseInsights.ts`. |
+| People and invitations | People as member cards with role/You/Guest tags and an overflow control; Add a friend, Join requests and the invitation link as separate blocks; one unified invitation-link panel. |
+| Keyboard | Android: bar hides on focus instead of waiting for `keyboardDidShow`; iOS unchanged. |
+
+**Needs real-device checking:** the keyboard behaviour (Android and iOS) and the new icons at native pixel densities. Browser simulation cannot prove either.
+
+## UI final corrections and complete expense retrieval (implemented locally; nothing committed; M7 Checkpoint 4 still paused)
+
+- **Settings icon:** the gear is now eight short square teeth around an outlined round body with a clear centre hole (no bars through the middle, so it no longer resembles the sun). No filled circle behind it; 28 px icon in a 44 px labelled target at the top right of Profile. The sun and moon icons are unchanged.
+- **Expense retrieval:** `listExpenses` read each table in one request, which Supabase caps at 1,000 rows, so a trip over that size (up to the supported 2,000 expenses, with several payer and share rows each) could be cut short without warning. It now reads `expenses`, `expense_payers` and `expense_splits` page by page (1,000 rows per request, `range`) with a unique order (expenses: day, recorded time, id, newest first; payers and shares: expense id, member id). Every page asks for the exact total. Paging ends only when the rows collected equal that total. If the total changes between pages, a row repeats, or a page comes back empty early, the whole read starts again (up to three rounds, then a plain error); a failed page fails the whole read; a missing total fails the read. The existing join check (every expense has payers and shares that add up) still runs on the complete data. No partial list is ever returned, so the Expenses tab, day totals, counts, Insights, bars and donut either show complete figures or an error with Try again. Query keys, caching, invalidation, loading and error states are unchanged; no page numbers or Load more.
+- **Consumers affected:** the Expenses tab, the trip page's Expenses card, Insights, and any screen that finds one expense (`getExpense` uses the same list). **Not affected:** `trip_member_balances` (the official balances) adds up the ledger inside the database and returns one row per member, so the row cap does not touch it and it was not modified. Nothing in the database, migrations, M1, M6 or M7 changed.
+- **Tests:** app 459 unit tests (new paging tests: empty, one, exactly one page, 1,001, 2,000, a server that returns shorter pages, order and no overlap, later-page failure, total change, repeated row, early empty page, missing total, deleted excluded); core 732 (a 2,000-expense Insights total check). Browser scenario T (1,200-expense trip: pages at rows 0 and 1000, counts, day totals, Insights total equal to the active total, balances still from the function, later-page failure shows errors and no partial totals, Try again works). Scenarios M, N, O, P, R, S, T re-run and passing after the change.
+- **Honest limits:** the paging is proven against a fake that behaves like PostgREST (offset/limit, exact count); it has not been run against the live database. Offset paging reads are not one snapshot: changes during a read are detected (total moved, repeated row, short page, mismatching sums) and cause a re-read, which is detection, not isolation. Native keyboard behaviour still needs real Android and iOS verification.
+
+## UI redesign close-out (documentation only; nothing committed; M7 Checkpoint 4 still paused)
+
+**Completed (development):**
+- Separate mobile and website experiences; mobile bottom navigation; desktop sidebar with Profile at the bottom.
+- Public landing page and split-screen sign-in and sign-up (narrow single column on phones).
+- Light and neutral Dark themes; Light/Dark only (legacy "system" resolved).
+- Theme persistence across authentication: a device choice wins; the account fills in only when the device has none.
+- Animated two-state appearance control; footer as a separate band.
+- Collapsible day-wise expense cards with category icons.
+- Redesigned Balances (member cards, My Suggested Payments, group settlement plan).
+- Insights tab with bar and donut charts (read-only, presentation only).
+- Organised member cards and a unified invitation-link panel.
+- Settings icon replacement (gear), pending the owner's visual check.
+- Keyboard navigation improvements (Android hides the bar on focus; iOS unchanged).
+- Complete paginated expense retrieval (1,000 rows per request, unique ordering, exact-total checks, no partial results).
+
+**Production-readiness items (pending, not done):**
+1. **Consistent expense snapshot.** Expense reads use offset pagination across several requests, which does not guarantee one database snapshot. Changes that keep the row total unchanged may not always be detected by the current retry and consistency checks. Needs evaluation before public deployment (options include a single bounded read, a snapshot-capable function, or a database-side aggregation); none is implemented and no migration was made.
+2. **Live Supabase verification.** Pagination has been tested only against the simulated API, not against live Supabase with a large expense dataset.
+
+**Still pending:**
+- Real Android and iOS keyboard verification (browser and unit tests cannot prove the native flicker is gone).
+- Live Supabase pagination verification with a large dataset.
+- Consistent expense snapshot evaluation (above).
+- Profile-photo feature and its architecture approval (proposal in docs/PROFILE_PHOTO_PROPOSAL.md; migration #13, Storage policies and dependencies need approval).
+- ADR-054 rate limiting (required before public deployment).
+- Real legal, privacy and contact content (the information pages are placeholders).
+- M7 Checkpoint 4 and subsequent checkpoints.
+- Production deployment requirements.
